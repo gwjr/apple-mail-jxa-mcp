@@ -40,9 +40,10 @@ function listResources(): McpResource[] {
     { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
     // Accounts
     { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' },
-    // Rules and Signatures
+    // Rules, Signatures, Settings
     { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
-    { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' }
+    { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' },
+    { uri: 'mail://settings', name: 'Settings', description: 'Mail.app preferences' }
   ];
 
   const spec = specifierFromURI('mail://accounts');
@@ -294,6 +295,18 @@ const resourceTemplates: McpResourceTemplate[] = [
     uriTemplate: 'mail://signatures/{name}',
     name: 'Signature by Name',
     description: 'Single signature by name. Returns: name, content (lazy)'
+  },
+
+  // --- Settings ---
+  {
+    uriTemplate: 'mail://settings',
+    name: 'Settings',
+    description: 'Mail.app preferences: fonts, colors, behavior, composing options'
+  },
+  {
+    uriTemplate: 'mail://settings/{property}',
+    name: 'Setting Property',
+    description: 'Individual setting value (e.g., mail://settings/fetchInterval)'
   }
 ];
 

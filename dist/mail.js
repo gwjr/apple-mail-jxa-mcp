@@ -1479,6 +1479,46 @@ function parseEmailAddress(raw) {
 // Apple Mail Schema Definitions
 // ============================================================================
 // ============================================================================
+// Settings Schema (app-level preferences)
+// ============================================================================
+const SettingsBase = {
+    // App info
+    name: accessor('name'),
+    version: accessor('version'),
+    frontmost: accessor('frontmost'),
+    // Behavior
+    alwaysBccMyself: accessor('alwaysBccMyself'),
+    alwaysCcMyself: accessor('alwaysCcMyself'),
+    downloadHtmlAttachments: accessor('downloadHtmlAttachments'),
+    fetchInterval: accessor('fetchInterval'),
+    expandGroupAddresses: accessor('expandGroupAddresses'),
+    // Composing
+    defaultMessageFormat: accessor('defaultMessageFormat'),
+    chooseSignatureWhenComposing: accessor('chooseSignatureWhenComposing'),
+    quoteOriginalMessage: accessor('quoteOriginalMessage'),
+    sameReplyFormat: accessor('sameReplyFormat'),
+    includeAllOriginalMessageText: accessor('includeAllOriginalMessageText'),
+    // Display
+    highlightSelectedConversation: accessor('highlightSelectedConversation'),
+    colorQuotedText: accessor('colorQuotedText'),
+    levelOneQuotingColor: accessor('levelOneQuotingColor'),
+    levelTwoQuotingColor: accessor('levelTwoQuotingColor'),
+    levelThreeQuotingColor: accessor('levelThreeQuotingColor'),
+    // Fonts
+    messageFont: accessor('messageFont'),
+    messageFontSize: accessor('messageFontSize'),
+    messageListFont: accessor('messageListFont'),
+    messageListFontSize: accessor('messageListFontSize'),
+    useFixedWidthFont: accessor('useFixedWidthFont'),
+    fixedWidthFont: accessor('fixedWidthFont'),
+    fixedWidthFontSize: accessor('fixedWidthFontSize'),
+    // Sounds
+    newMailSound: accessor('newMailSound'),
+    shouldPlayOtherMailSounds: accessor('shouldPlayOtherMailSounds'),
+    // Spelling
+    checkSpellingWhileTyping: accessor('checkSpellingWhileTyping'),
+};
+// ============================================================================
 // Rule Condition Schema
 // ============================================================================
 const RuleConditionBase = {
@@ -1600,6 +1640,7 @@ const MailAppBase = {
 // ============================================================================
 // Create Derived Types
 // ============================================================================
+const Settings = createDerived(SettingsBase, 'Settings');
 const RuleCondition = createDerived(RuleConditionBase, 'RuleCondition');
 const Rule = createDerived(RuleBase, 'Rule');
 const Signature = createDerived(SignatureBase, 'Signature');
@@ -1649,6 +1690,35 @@ function createStandardMailboxSpecifier(uri, jxaMailbox) {
     }
     return spec;
 }
+// Helper to create settings specifier (singleton, not a collection)
+function createSettingsSpecifier(uri, jxaApp) {
+    const spec = {
+        _isSpecifier: true,
+        uri,
+        resolve() {
+            return tryResolve(() => Settings.fromJXA(jxaApp, uri), uri);
+        },
+        fix() {
+            return { ok: true, value: spec }; // Settings is a singleton, already stable
+        }
+    };
+    // Add properties from SettingsBase as navigable specifiers
+    for (const [key, descriptor] of Object.entries(SettingsBase)) {
+        if ('_accessor' in descriptor) {
+            Object.defineProperty(spec, key, {
+                get() {
+                    const jxaName = descriptor._jxaName;
+                    return scalarSpecifier(`${uri}/${key}`, () => {
+                        const value = jxaApp[jxaName]();
+                        return value == null ? '' : value;
+                    });
+                },
+                enumerable: true
+            });
+        }
+    }
+    return spec;
+}
 // Lazily initialized app specifier
 let _mailApp = null;
 function getMailApp() {
@@ -1676,6 +1746,13 @@ function getMailApp() {
                 enumerable: true
             });
         }
+        // Add settings specifier (app-level preferences)
+        Object.defineProperty(app, 'settings', {
+            get() {
+                return createSettingsSpecifier('mail://settings', jxa);
+            },
+            enumerable: true
+        });
         _mailApp = app;
     }
     return _mailApp;
@@ -1815,9 +1892,10 @@ function listResources() {
         { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
         // Accounts
         { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' },
-        // Rules and Signatures
+        // Rules, Signatures, Settings
         { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
-        { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' }
+        { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' },
+        { uri: 'mail://settings', name: 'Settings', description: 'Mail.app preferences' }
     ];
     const spec = specifierFromURI('mail://accounts');
     if (spec.ok) {
@@ -2056,6 +2134,17 @@ const resourceTemplates = [
         uriTemplate: 'mail://signatures/{name}',
         name: 'Signature by Name',
         description: 'Single signature by name. Returns: name, content (lazy)'
+    },
+    // --- Settings ---
+    {
+        uriTemplate: 'mail://settings',
+        name: 'Settings',
+        description: 'Mail.app preferences: fonts, colors, behavior, composing options'
+    },
+    {
+        uriTemplate: 'mail://settings/{property}',
+        name: 'Setting Property',
+        description: 'Individual setting value (e.g., mail://settings/fetchInterval)'
     }
 ];
 // Export for JXA

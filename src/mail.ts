@@ -34,6 +34,48 @@ function parseEmailAddress(raw: string): ParsedEmailAddress {
 // ============================================================================
 
 // ============================================================================
+// Settings Schema (app-level preferences)
+// ============================================================================
+
+const SettingsBase = {
+  // App info
+  name: accessor<string, 'name'>('name'),
+  version: accessor<string, 'version'>('version'),
+  frontmost: accessor<boolean, 'frontmost'>('frontmost'),
+  // Behavior
+  alwaysBccMyself: accessor<boolean, 'alwaysBccMyself'>('alwaysBccMyself'),
+  alwaysCcMyself: accessor<boolean, 'alwaysCcMyself'>('alwaysCcMyself'),
+  downloadHtmlAttachments: accessor<boolean, 'downloadHtmlAttachments'>('downloadHtmlAttachments'),
+  fetchInterval: accessor<number, 'fetchInterval'>('fetchInterval'),
+  expandGroupAddresses: accessor<boolean, 'expandGroupAddresses'>('expandGroupAddresses'),
+  // Composing
+  defaultMessageFormat: accessor<string, 'defaultMessageFormat'>('defaultMessageFormat'),
+  chooseSignatureWhenComposing: accessor<boolean, 'chooseSignatureWhenComposing'>('chooseSignatureWhenComposing'),
+  quoteOriginalMessage: accessor<boolean, 'quoteOriginalMessage'>('quoteOriginalMessage'),
+  sameReplyFormat: accessor<boolean, 'sameReplyFormat'>('sameReplyFormat'),
+  includeAllOriginalMessageText: accessor<boolean, 'includeAllOriginalMessageText'>('includeAllOriginalMessageText'),
+  // Display
+  highlightSelectedConversation: accessor<boolean, 'highlightSelectedConversation'>('highlightSelectedConversation'),
+  colorQuotedText: accessor<boolean, 'colorQuotedText'>('colorQuotedText'),
+  levelOneQuotingColor: accessor<string, 'levelOneQuotingColor'>('levelOneQuotingColor'),
+  levelTwoQuotingColor: accessor<string, 'levelTwoQuotingColor'>('levelTwoQuotingColor'),
+  levelThreeQuotingColor: accessor<string, 'levelThreeQuotingColor'>('levelThreeQuotingColor'),
+  // Fonts
+  messageFont: accessor<string, 'messageFont'>('messageFont'),
+  messageFontSize: accessor<number, 'messageFontSize'>('messageFontSize'),
+  messageListFont: accessor<string, 'messageListFont'>('messageListFont'),
+  messageListFontSize: accessor<number, 'messageListFontSize'>('messageListFontSize'),
+  useFixedWidthFont: accessor<boolean, 'useFixedWidthFont'>('useFixedWidthFont'),
+  fixedWidthFont: accessor<string, 'fixedWidthFont'>('fixedWidthFont'),
+  fixedWidthFontSize: accessor<number, 'fixedWidthFontSize'>('fixedWidthFontSize'),
+  // Sounds
+  newMailSound: accessor<string, 'newMailSound'>('newMailSound'),
+  shouldPlayOtherMailSounds: accessor<boolean, 'shouldPlayOtherMailSounds'>('shouldPlayOtherMailSounds'),
+  // Spelling
+  checkSpellingWhileTyping: accessor<boolean, 'checkSpellingWhileTyping'>('checkSpellingWhileTyping'),
+} as const;
+
+// ============================================================================
 // Rule Condition Schema
 // ============================================================================
 
@@ -158,6 +200,7 @@ const MailAppBase = {
 // Create Derived Types
 // ============================================================================
 
+const Settings = createDerived(SettingsBase, 'Settings');
 const RuleCondition = createDerived(RuleConditionBase, 'RuleCondition');
 const Rule = createDerived(RuleBase, 'Rule');
 const Signature = createDerived(SignatureBase, 'Signature');
@@ -171,6 +214,7 @@ const Account = createDerived(AccountBase, 'Account');
 // Type Aliases for Export
 // ============================================================================
 
+type Settings = InstanceType<typeof Settings>;
 type RuleCondition = InstanceType<typeof RuleCondition>;
 type Rule = InstanceType<typeof Rule>;
 type Signature = InstanceType<typeof Signature>;
@@ -236,6 +280,38 @@ function createStandardMailboxSpecifier(
   return spec;
 }
 
+// Helper to create settings specifier (singleton, not a collection)
+function createSettingsSpecifier(uri: string, jxaApp: any): any {
+  const spec: any = {
+    _isSpecifier: true,
+    uri,
+    resolve(): Result<any> {
+      return tryResolve(() => Settings.fromJXA(jxaApp, uri), uri);
+    },
+    fix(): Result<any> {
+      return { ok: true, value: spec };  // Settings is a singleton, already stable
+    }
+  };
+
+  // Add properties from SettingsBase as navigable specifiers
+  for (const [key, descriptor] of Object.entries(SettingsBase)) {
+    if ('_accessor' in (descriptor as any)) {
+      Object.defineProperty(spec, key, {
+        get() {
+          const jxaName = (descriptor as any)._jxaName;
+          return scalarSpecifier(`${uri}/${key}`, () => {
+            const value = jxaApp[jxaName]();
+            return value == null ? '' : value;
+          });
+        },
+        enumerable: true
+      });
+    }
+  }
+
+  return spec;
+}
+
 // Lazily initialized app specifier
 let _mailApp: any = null;
 function getMailApp() {
@@ -265,6 +341,14 @@ function getMailApp() {
         enumerable: true
       });
     }
+
+    // Add settings specifier (app-level preferences)
+    Object.defineProperty(app, 'settings', {
+      get() {
+        return createSettingsSpecifier('mail://settings', jxa);
+      },
+      enumerable: true
+    });
 
     _mailApp = app;
   }
