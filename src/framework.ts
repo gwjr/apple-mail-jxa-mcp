@@ -194,6 +194,28 @@ type JXAComputed<T> = {
   readonly _compute: (jxa: any) => T;
 };
 
+// Read-write descriptors
+type JXAMutator<T, JXAName extends string> = {
+  readonly _mutator: true;
+  readonly _type: T;
+  readonly _jxaName: JXAName;
+};
+
+type JXALazyMutator<T, JXAName extends string> = {
+  readonly _lazyMutator: true;
+  readonly _type: T;
+  readonly _jxaName: JXAName;
+};
+
+type JXAMutableCollection<ElementBase, JXAName extends string, Addressing extends readonly AddressingMode[]> = {
+  readonly _mutableCollection: true;
+  readonly _elementBase: ElementBase;
+  readonly _jxaName: JXAName;
+  readonly _addressing: Addressing;
+  readonly _canCreate: boolean;
+  readonly _canDelete: boolean;
+};
+
 type AddressingMode = 'name' | 'index' | 'id';
 
 // ============================================================================
@@ -243,6 +265,43 @@ function computed<T>(
   };
 }
 
+// Read-write helper functions
+function mutator<T, JXAName extends string>(
+  jxaName: JXAName
+): JXAMutator<T, JXAName> {
+  return {
+    _mutator: true,
+    _type: undefined as any as T,
+    _jxaName: jxaName
+  };
+}
+
+function lazyMutator<T, JXAName extends string>(
+  jxaName: JXAName
+): JXALazyMutator<T, JXAName> {
+  return {
+    _lazyMutator: true,
+    _type: undefined as any as T,
+    _jxaName: jxaName
+  };
+}
+
+function mutableCollection<ElementBase, JXAName extends string, Addressing extends readonly AddressingMode[]>(
+  jxaName: JXAName,
+  elementBase: ElementBase,
+  addressing: Addressing,
+  opts?: { canCreate?: boolean; canDelete?: boolean }
+): JXAMutableCollection<ElementBase, JXAName, Addressing> {
+  return {
+    _mutableCollection: true,
+    _elementBase: elementBase,
+    _jxaName: jxaName,
+    _addressing: addressing,
+    _canCreate: opts?.canCreate ?? false,
+    _canDelete: opts?.canDelete ?? false
+  };
+}
+
 // ============================================================================
 // Type-Level Transformations
 // ============================================================================
@@ -251,7 +310,10 @@ function computed<T>(
 type Lower<A> =
   A extends JXAAccessor<infer T, any> ? T :
   A extends JXALazyAccessor<infer T, any> ? Specifier<T> :  // lazy stays as specifier
+  A extends JXAMutator<infer T, any> ? T :  // mutator lowers to value (setter via specifier)
+  A extends JXALazyMutator<infer T, any> ? MutableScalarSpecifier<T> :  // lazy mutator stays as mutable specifier
   A extends JXACollection<infer ElementBase, any, any> ? CollectionSpecifier<Derived<ElementBase>> :
+  A extends JXAMutableCollection<infer ElementBase, any, any> ? MutableCollectionSpecifier<Derived<ElementBase>> :
   A extends JXAComputed<infer T> ? T :
   A;
 
@@ -349,6 +411,17 @@ type CollectionSpecifier<T, A = IndexAddressable<T>> = {
   expand(props: ExpandSpec): CollectionSpecifier<T, A>;
 } & A;
 
+// Mutable scalar specifier - adds set() method
+type MutableScalarSpecifier<T> = Specifier<T> & {
+  set(value: T): Result<void>;
+};
+
+// Mutable collection specifier - adds create() and delete() methods
+type MutableCollectionSpecifier<T, A = IndexAddressable<T>> = CollectionSpecifier<T, A> & {
+  create(properties: Partial<T>): Result<Specifier<T>>;
+  delete(uri: string): Result<void>;
+};
+
 // ============================================================================
 // Runtime Implementation Factory
 // ============================================================================
@@ -378,8 +451,14 @@ function createDerived<Base extends Record<string, any>>(
           this._defineAccessorProperty(key, descriptor);
         } else if (this._isLazyAccessor(descriptor)) {
           this._defineLazyAccessorProperty(key, descriptor);
+        } else if (this._isMutator(descriptor)) {
+          this._defineMutatorProperty(key, descriptor);
+        } else if (this._isLazyMutator(descriptor)) {
+          this._defineLazyMutatorProperty(key, descriptor);
         } else if (this._isCollection(descriptor)) {
           this._defineCollectionProperty(key, descriptor);
+        } else if (this._isMutableCollection(descriptor)) {
+          this._defineMutableCollectionProperty(key, descriptor);
         } else if (this._isComputed(descriptor)) {
           this._defineComputedProperty(key, descriptor);
         }
@@ -394,8 +473,20 @@ function createDerived<Base extends Record<string, any>>(
       return desc && desc._lazyAccessor === true;
     }
 
+    private _isMutator(desc: any): desc is JXAMutator<any, any> {
+      return desc && desc._mutator === true;
+    }
+
+    private _isLazyMutator(desc: any): desc is JXALazyMutator<any, any> {
+      return desc && desc._lazyMutator === true;
+    }
+
     private _isCollection(desc: any): desc is JXACollection<any, any, any> {
       return desc && desc._collection === true;
+    }
+
+    private _isMutableCollection(desc: any): desc is JXAMutableCollection<any, any, any> {
+      return desc && desc._mutableCollection === true;
     }
 
     private _isComputed(desc: any): desc is JXAComputed<any> {
@@ -447,6 +538,60 @@ function createDerived<Base extends Record<string, any>>(
       });
     }
 
+    private _defineMutatorProperty(key: string, descriptor: JXAMutator<any, any>) {
+      // Mutator: eager read, same as accessor (setter available via specifier)
+      Object.defineProperty(this, key, {
+        get() {
+          const value = this._jxa[descriptor._jxaName]();
+          return this._convertValue(value);
+        },
+        enumerable: true
+      });
+    }
+
+    private _defineLazyMutatorProperty(key: string, descriptor: JXALazyMutator<any, any>) {
+      const self = this;
+      Object.defineProperty(this, key, {
+        get() {
+          const uri = self._uri
+            ? `${self._uri}/${key}`
+            : `${typeName.toLowerCase()}://.../${key}`;
+          return mutableScalarSpecifier(
+            uri,
+            () => {
+              const value = self._jxa[descriptor._jxaName]();
+              return self._convertValue(value);
+            },
+            (newValue: any) => {
+              self._jxa[descriptor._jxaName].set(newValue);
+            }
+          );
+        },
+        enumerable: true
+      });
+    }
+
+    private _defineMutableCollectionProperty(key: string, descriptor: JXAMutableCollection<any, any, any>) {
+      const self = this;
+      Object.defineProperty(this, key, {
+        get() {
+          const jxaCollection = self._jxa[descriptor._jxaName];
+          const base = self._uri || `${typeName.toLowerCase()}://`;
+          const uri = base.endsWith('://') ? `${base}${key}` : `${base}/${key}`;
+          return createMutableCollectionSpecifier(
+            uri,
+            jxaCollection,
+            descriptor._elementBase,
+            descriptor._addressing,
+            typeName + '_' + key,
+            descriptor._canCreate,
+            descriptor._canDelete
+          );
+        },
+        enumerable: true
+      });
+    }
+
     private _defineComputedProperty(key: string, descriptor: JXAComputed<any>) {
       const self = this;
       Object.defineProperty(this, key, {
@@ -486,6 +631,28 @@ function scalarSpecifier<T>(uri: string, getValue: () => T): Specifier<T> {
   return spec as Specifier<T>;
 }
 
+// Helper for mutable scalar specifiers
+function mutableScalarSpecifier<T>(
+  uri: string,
+  getValue: () => T,
+  setValue: (value: T) => void
+): MutableScalarSpecifier<T> {
+  const spec: any = {
+    _isSpecifier: true as const,
+    uri,
+    resolve(): Result<T> {
+      return tryResolve(getValue, uri);
+    },
+    fix(): Result<MutableScalarSpecifier<T>> {
+      return { ok: true, value: spec }; // Scalars can't be improved
+    },
+    set(newValue: T): Result<void> {
+      return tryResolve(() => { setValue(newValue); }, `${uri}:set`);
+    }
+  };
+  return spec as MutableScalarSpecifier<T>;
+}
+
 // Element specifier factory
 function createElementSpecifier<Base extends Record<string, any>>(
   uri: string,
@@ -504,6 +671,7 @@ function createElementSpecifier<Base extends Record<string, any>>(
 
   const spec: any = {
     _isSpecifier: true as const,
+    _jxa: jxa,  // Expose JXA object for mutation operations (delete, etc.)
     uri,
 
     resolve(): Result<Derived<Base>> {
@@ -589,6 +757,24 @@ function createElementSpecifier<Base extends Record<string, any>>(
         },
         enumerable: true
       });
+    } else if ('_mutator' in (descriptor as any) || '_lazyMutator' in (descriptor as any)) {
+      // Mutators lift to MutableScalarSpecifier<T> on a Specifier
+      Object.defineProperty(spec, key, {
+        get() {
+          const jxaName = (descriptor as any)._jxaName;
+          return mutableScalarSpecifier(
+            `${uri}/${key}`,
+            () => {
+              const value = jxa[jxaName]();
+              return value == null ? '' : value;
+            },
+            (newValue: any) => {
+              jxa[jxaName].set(newValue);
+            }
+          );
+        },
+        enumerable: true
+      });
     } else if ('_collection' in (descriptor as any)) {
       Object.defineProperty(spec, key, {
         get() {
@@ -599,6 +785,22 @@ function createElementSpecifier<Base extends Record<string, any>>(
             desc._elementBase,
             desc._addressing,
             typeName + '_' + key
+          );
+        },
+        enumerable: true
+      });
+    } else if ('_mutableCollection' in (descriptor as any)) {
+      Object.defineProperty(spec, key, {
+        get() {
+          const desc = descriptor as JXAMutableCollection<any, any, any>;
+          return createMutableCollectionSpecifier(
+            `${uri}/${key}`,
+            jxa[desc._jxaName],
+            desc._elementBase,
+            desc._addressing,
+            typeName + '_' + key,
+            desc._canCreate,
+            desc._canDelete
           );
         },
         enumerable: true
@@ -833,6 +1035,150 @@ function createCollectionSpecifier<
   };
 
   return spec as CollectionSpecifier<Derived<ElementBase>, AddressingFromModes<Derived<ElementBase>, typeof addressing>>;
+}
+
+// Mutable collection specifier factory
+function createMutableCollectionSpecifier<
+  ElementBase extends Record<string, any>,
+  Modes extends readonly AddressingMode[]
+>(
+  uri: string,
+  jxaCollection: any,
+  elementBase: ElementBase,
+  addressing: Modes,
+  typeName: string,
+  canCreate: boolean,
+  canDelete: boolean,
+  sortSpec?: SortSpec<any>,
+  jsFilter?: WhoseFilter<any>,
+  pagination?: PaginationSpec,
+  expand?: ExpandSpec
+): MutableCollectionSpecifier<Derived<ElementBase>, AddressingFromModes<Derived<ElementBase>, Modes>> {
+
+  // Start with regular collection specifier - need to copy all properties
+  const baseSpec = createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, pagination, expand);
+
+  const spec: any = {
+    ...baseSpec,
+
+    // Override methods to return mutable specifiers
+    whose(filter: WhoseFilter<Derived<ElementBase>>): MutableCollectionSpecifier<Derived<ElementBase>, any> {
+      const filteredUri = `${uri}?${encodeFilter(filter)}`;
+      try {
+        // Try JXA whose
+        const jxaFilter: any = {};
+        for (const [key, predicate] of Object.entries(filter)) {
+          const descriptor = elementBase[key];
+          if (!descriptor || !('_jxaName' in descriptor)) {
+            throw new Error(`Unknown property: ${key}`);
+          }
+          const jxaName = descriptor._jxaName;
+          const pred = predicate as any;
+          if ('equals' in pred) jxaFilter[jxaName] = pred.equals;
+          else if ('contains' in pred) jxaFilter[jxaName] = { _contains: pred.contains };
+          else if ('startsWith' in pred) jxaFilter[jxaName] = { _beginsWith: pred.startsWith };
+          else if ('greaterThan' in pred) jxaFilter[jxaName] = { _greaterThan: pred.greaterThan };
+          else if ('lessThan' in pred) jxaFilter[jxaName] = { _lessThan: pred.lessThan };
+        }
+        const filteredJXA = jxaCollection.whose(jxaFilter);
+        void filteredJXA.length;
+        return createMutableCollectionSpecifier(filteredUri, filteredJXA, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, undefined, pagination, expand);
+      } catch {
+        return createMutableCollectionSpecifier(filteredUri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, filter, pagination, expand);
+      }
+    },
+
+    sortBy(newSortSpec: SortSpec<Derived<ElementBase>>): MutableCollectionSpecifier<Derived<ElementBase>, any> {
+      const sep = uri.includes('?') ? '&' : '?';
+      const sortedUri = `${uri}${sep}sort=${String(newSortSpec.by)}.${newSortSpec.direction || 'asc'}`;
+      return createMutableCollectionSpecifier(sortedUri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, newSortSpec, jsFilter, pagination, expand);
+    },
+
+    paginate(newPagination: PaginationSpec): MutableCollectionSpecifier<Derived<ElementBase>, any> {
+      const parts: string[] = [];
+      if (newPagination.limit !== undefined) parts.push(`limit=${newPagination.limit}`);
+      if (newPagination.offset !== undefined) parts.push(`offset=${newPagination.offset}`);
+      const sep = uri.includes('?') ? '&' : '?';
+      const paginatedUri = parts.length > 0 ? `${uri}${sep}${parts.join('&')}` : uri;
+      return createMutableCollectionSpecifier(paginatedUri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, jsFilter, newPagination, expand);
+    },
+
+    expand(newExpand: ExpandSpec): MutableCollectionSpecifier<Derived<ElementBase>, any> {
+      const sep = uri.includes('?') ? '&' : '?';
+      const expandUri = `${uri}${sep}expand=${newExpand.join(',')}`;
+      return createMutableCollectionSpecifier(expandUri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, jsFilter, pagination, newExpand);
+    }
+  };
+
+  // Add create method if allowed
+  if (canCreate) {
+    spec.create = function(properties: Partial<Derived<ElementBase>>): Result<Specifier<Derived<ElementBase>>> {
+      return tryResolve(() => {
+        // Convert properties to JXA property names
+        const jxaProps: any = {};
+        for (const [key, value] of Object.entries(properties)) {
+          const descriptor = elementBase[key];
+          if (descriptor && '_jxaName' in descriptor) {
+            jxaProps[(descriptor as any)._jxaName] = value;
+          } else {
+            jxaProps[key] = value;
+          }
+        }
+
+        // JXA make
+        const newJXA = jxaCollection.make({
+          new: typeName.split('_').pop()?.toLowerCase() || typeName.toLowerCase(),
+          withProperties: jxaProps
+        });
+
+        // Determine the best identifier for the new element (stability order: id > name > index)
+        let newUri: string;
+        try {
+          const id = newJXA.id();
+          if (id) {
+            newUri = `${uri.split('?')[0]}/${id}`;
+          } else {
+            throw new Error('No id');
+          }
+        } catch {
+          try {
+            const name = newJXA.name();
+            if (name) {
+              newUri = `${uri.split('?')[0]}/${encodeURIComponent(name)}`;
+            } else {
+              throw new Error('No name');
+            }
+          } catch {
+            // Fall back to index
+            const len = typeof jxaCollection === 'function' ? jxaCollection().length : jxaCollection.length;
+            newUri = `${uri.split('?')[0]}[${len - 1}]`;
+          }
+        }
+
+        return createElementSpecifier(newUri, newJXA, elementBase, typeName, addressing);
+      }, `${uri}:create`);
+    };
+  }
+
+  // Add delete method if allowed
+  if (canDelete) {
+    spec.delete = function(itemUri: string): Result<void> {
+      return tryResolve(() => {
+        const itemSpec = specifierFromURI(itemUri);
+        if (!itemSpec.ok) {
+          throw new Error(itemSpec.error);
+        }
+        // Access the JXA object from the specifier and call delete
+        if ((itemSpec.value as any)._jxa) {
+          (itemSpec.value as any)._jxa.delete();
+        } else {
+          throw new Error(`Cannot delete: unable to access JXA object for ${itemUri}`);
+        }
+      }, `${itemUri}:delete`);
+    };
+  }
+
+  return spec as MutableCollectionSpecifier<Derived<ElementBase>, AddressingFromModes<Derived<ElementBase>, Modes>>;
 }
 
 // ============================================================================

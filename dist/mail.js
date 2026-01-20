@@ -718,6 +718,31 @@ function computed(compute) {
         _compute: compute
     };
 }
+// Read-write helper functions
+function mutator(jxaName) {
+    return {
+        _mutator: true,
+        _type: undefined,
+        _jxaName: jxaName
+    };
+}
+function lazyMutator(jxaName) {
+    return {
+        _lazyMutator: true,
+        _type: undefined,
+        _jxaName: jxaName
+    };
+}
+function mutableCollection(jxaName, elementBase, addressing, opts) {
+    return {
+        _mutableCollection: true,
+        _elementBase: elementBase,
+        _jxaName: jxaName,
+        _addressing: addressing,
+        _canCreate: opts?.canCreate ?? false,
+        _canDelete: opts?.canDelete ?? false
+    };
+}
 // ============================================================================
 // Runtime Implementation Factory
 // ============================================================================
@@ -741,8 +766,17 @@ function createDerived(schema, typeName) {
                 else if (this._isLazyAccessor(descriptor)) {
                     this._defineLazyAccessorProperty(key, descriptor);
                 }
+                else if (this._isMutator(descriptor)) {
+                    this._defineMutatorProperty(key, descriptor);
+                }
+                else if (this._isLazyMutator(descriptor)) {
+                    this._defineLazyMutatorProperty(key, descriptor);
+                }
                 else if (this._isCollection(descriptor)) {
                     this._defineCollectionProperty(key, descriptor);
+                }
+                else if (this._isMutableCollection(descriptor)) {
+                    this._defineMutableCollectionProperty(key, descriptor);
                 }
                 else if (this._isComputed(descriptor)) {
                     this._defineComputedProperty(key, descriptor);
@@ -755,8 +789,17 @@ function createDerived(schema, typeName) {
         _isLazyAccessor(desc) {
             return desc && desc._lazyAccessor === true;
         }
+        _isMutator(desc) {
+            return desc && desc._mutator === true;
+        }
+        _isLazyMutator(desc) {
+            return desc && desc._lazyMutator === true;
+        }
         _isCollection(desc) {
             return desc && desc._collection === true;
+        }
+        _isMutableCollection(desc) {
+            return desc && desc._mutableCollection === true;
         }
         _isComputed(desc) {
             return desc && desc._computed === true;
@@ -797,6 +840,45 @@ function createDerived(schema, typeName) {
                 enumerable: true
             });
         }
+        _defineMutatorProperty(key, descriptor) {
+            // Mutator: eager read, same as accessor (setter available via specifier)
+            Object.defineProperty(this, key, {
+                get() {
+                    const value = this._jxa[descriptor._jxaName]();
+                    return this._convertValue(value);
+                },
+                enumerable: true
+            });
+        }
+        _defineLazyMutatorProperty(key, descriptor) {
+            const self = this;
+            Object.defineProperty(this, key, {
+                get() {
+                    const uri = self._uri
+                        ? `${self._uri}/${key}`
+                        : `${typeName.toLowerCase()}://.../${key}`;
+                    return mutableScalarSpecifier(uri, () => {
+                        const value = self._jxa[descriptor._jxaName]();
+                        return self._convertValue(value);
+                    }, (newValue) => {
+                        self._jxa[descriptor._jxaName].set(newValue);
+                    });
+                },
+                enumerable: true
+            });
+        }
+        _defineMutableCollectionProperty(key, descriptor) {
+            const self = this;
+            Object.defineProperty(this, key, {
+                get() {
+                    const jxaCollection = self._jxa[descriptor._jxaName];
+                    const base = self._uri || `${typeName.toLowerCase()}://`;
+                    const uri = base.endsWith('://') ? `${base}${key}` : `${base}/${key}`;
+                    return createMutableCollectionSpecifier(uri, jxaCollection, descriptor._elementBase, descriptor._addressing, typeName + '_' + key, descriptor._canCreate, descriptor._canDelete);
+                },
+                enumerable: true
+            });
+        }
         _defineComputedProperty(key, descriptor) {
             const self = this;
             Object.defineProperty(this, key, {
@@ -833,6 +915,23 @@ function scalarSpecifier(uri, getValue) {
     };
     return spec;
 }
+// Helper for mutable scalar specifiers
+function mutableScalarSpecifier(uri, getValue, setValue) {
+    const spec = {
+        _isSpecifier: true,
+        uri,
+        resolve() {
+            return tryResolve(getValue, uri);
+        },
+        fix() {
+            return { ok: true, value: spec }; // Scalars can't be improved
+        },
+        set(newValue) {
+            return tryResolve(() => { setValue(newValue); }, `${uri}:set`);
+        }
+    };
+    return spec;
+}
 // Element specifier factory
 function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
     const ElementClass = createDerived(schema, typeName);
@@ -842,6 +941,7 @@ function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
     const baseUri = baseUriMatch ? baseUriMatch[1] : uri;
     const spec = {
         _isSpecifier: true,
+        _jxa: jxa, // Expose JXA object for mutation operations (delete, etc.)
         uri,
         resolve() {
             return tryResolve(() => ElementClass.fromJXA(jxa, uri), uri);
@@ -924,11 +1024,35 @@ function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
                 enumerable: true
             });
         }
+        else if ('_mutator' in descriptor || '_lazyMutator' in descriptor) {
+            // Mutators lift to MutableScalarSpecifier<T> on a Specifier
+            Object.defineProperty(spec, key, {
+                get() {
+                    const jxaName = descriptor._jxaName;
+                    return mutableScalarSpecifier(`${uri}/${key}`, () => {
+                        const value = jxa[jxaName]();
+                        return value == null ? '' : value;
+                    }, (newValue) => {
+                        jxa[jxaName].set(newValue);
+                    });
+                },
+                enumerable: true
+            });
+        }
         else if ('_collection' in descriptor) {
             Object.defineProperty(spec, key, {
                 get() {
                     const desc = descriptor;
                     return createCollectionSpecifier(`${uri}/${key}`, jxa[desc._jxaName], desc._elementBase, desc._addressing, typeName + '_' + key);
+                },
+                enumerable: true
+            });
+        }
+        else if ('_mutableCollection' in descriptor) {
+            Object.defineProperty(spec, key, {
+                get() {
+                    const desc = descriptor;
+                    return createMutableCollectionSpecifier(`${uri}/${key}`, jxa[desc._jxaName], desc._elementBase, desc._addressing, typeName + '_' + key, desc._canCreate, desc._canDelete);
                 },
                 enumerable: true
             });
@@ -1125,6 +1249,136 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
         const expandUri = `${uri}${sep}expand=${newExpand.join(',')}`;
         return createCollectionSpecifier(expandUri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, pagination, newExpand);
     };
+    return spec;
+}
+// Mutable collection specifier factory
+function createMutableCollectionSpecifier(uri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, jsFilter, pagination, expand) {
+    // Start with regular collection specifier - need to copy all properties
+    const baseSpec = createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, pagination, expand);
+    const spec = {
+        ...baseSpec,
+        // Override methods to return mutable specifiers
+        whose(filter) {
+            const filteredUri = `${uri}?${encodeFilter(filter)}`;
+            try {
+                // Try JXA whose
+                const jxaFilter = {};
+                for (const [key, predicate] of Object.entries(filter)) {
+                    const descriptor = elementBase[key];
+                    if (!descriptor || !('_jxaName' in descriptor)) {
+                        throw new Error(`Unknown property: ${key}`);
+                    }
+                    const jxaName = descriptor._jxaName;
+                    const pred = predicate;
+                    if ('equals' in pred)
+                        jxaFilter[jxaName] = pred.equals;
+                    else if ('contains' in pred)
+                        jxaFilter[jxaName] = { _contains: pred.contains };
+                    else if ('startsWith' in pred)
+                        jxaFilter[jxaName] = { _beginsWith: pred.startsWith };
+                    else if ('greaterThan' in pred)
+                        jxaFilter[jxaName] = { _greaterThan: pred.greaterThan };
+                    else if ('lessThan' in pred)
+                        jxaFilter[jxaName] = { _lessThan: pred.lessThan };
+                }
+                const filteredJXA = jxaCollection.whose(jxaFilter);
+                void filteredJXA.length;
+                return createMutableCollectionSpecifier(filteredUri, filteredJXA, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, undefined, pagination, expand);
+            }
+            catch {
+                return createMutableCollectionSpecifier(filteredUri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, filter, pagination, expand);
+            }
+        },
+        sortBy(newSortSpec) {
+            const sep = uri.includes('?') ? '&' : '?';
+            const sortedUri = `${uri}${sep}sort=${String(newSortSpec.by)}.${newSortSpec.direction || 'asc'}`;
+            return createMutableCollectionSpecifier(sortedUri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, newSortSpec, jsFilter, pagination, expand);
+        },
+        paginate(newPagination) {
+            const parts = [];
+            if (newPagination.limit !== undefined)
+                parts.push(`limit=${newPagination.limit}`);
+            if (newPagination.offset !== undefined)
+                parts.push(`offset=${newPagination.offset}`);
+            const sep = uri.includes('?') ? '&' : '?';
+            const paginatedUri = parts.length > 0 ? `${uri}${sep}${parts.join('&')}` : uri;
+            return createMutableCollectionSpecifier(paginatedUri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, jsFilter, newPagination, expand);
+        },
+        expand(newExpand) {
+            const sep = uri.includes('?') ? '&' : '?';
+            const expandUri = `${uri}${sep}expand=${newExpand.join(',')}`;
+            return createMutableCollectionSpecifier(expandUri, jxaCollection, elementBase, addressing, typeName, canCreate, canDelete, sortSpec, jsFilter, pagination, newExpand);
+        }
+    };
+    // Add create method if allowed
+    if (canCreate) {
+        spec.create = function (properties) {
+            return tryResolve(() => {
+                // Convert properties to JXA property names
+                const jxaProps = {};
+                for (const [key, value] of Object.entries(properties)) {
+                    const descriptor = elementBase[key];
+                    if (descriptor && '_jxaName' in descriptor) {
+                        jxaProps[descriptor._jxaName] = value;
+                    }
+                    else {
+                        jxaProps[key] = value;
+                    }
+                }
+                // JXA make
+                const newJXA = jxaCollection.make({
+                    new: typeName.split('_').pop()?.toLowerCase() || typeName.toLowerCase(),
+                    withProperties: jxaProps
+                });
+                // Determine the best identifier for the new element (stability order: id > name > index)
+                let newUri;
+                try {
+                    const id = newJXA.id();
+                    if (id) {
+                        newUri = `${uri.split('?')[0]}/${id}`;
+                    }
+                    else {
+                        throw new Error('No id');
+                    }
+                }
+                catch {
+                    try {
+                        const name = newJXA.name();
+                        if (name) {
+                            newUri = `${uri.split('?')[0]}/${encodeURIComponent(name)}`;
+                        }
+                        else {
+                            throw new Error('No name');
+                        }
+                    }
+                    catch {
+                        // Fall back to index
+                        const len = typeof jxaCollection === 'function' ? jxaCollection().length : jxaCollection.length;
+                        newUri = `${uri.split('?')[0]}[${len - 1}]`;
+                    }
+                }
+                return createElementSpecifier(newUri, newJXA, elementBase, typeName, addressing);
+            }, `${uri}:create`);
+        };
+    }
+    // Add delete method if allowed
+    if (canDelete) {
+        spec.delete = function (itemUri) {
+            return tryResolve(() => {
+                const itemSpec = specifierFromURI(itemUri);
+                if (!itemSpec.ok) {
+                    throw new Error(itemSpec.error);
+                }
+                // Access the JXA object from the specifier and call delete
+                if (itemSpec.value._jxa) {
+                    itemSpec.value._jxa.delete();
+                }
+                else {
+                    throw new Error(`Cannot delete: unable to access JXA object for ${itemUri}`);
+                }
+            }, `${itemUri}:delete`);
+        };
+    }
     return spec;
 }
 // ============================================================================
