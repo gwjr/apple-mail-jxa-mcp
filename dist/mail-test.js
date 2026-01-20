@@ -1,372 +1,226 @@
 "use strict";
-/// <reference path="./types/jxa.d.ts" />
-/// <reference path="./types/mail-app.d.ts" />
 // ============================================================================
-// Declarative JXA Schema Framework
+// Schema Definition DSL - Simplified Syntax
 // ============================================================================
+// Type markers - property name defaults to JXA name
+const t = {
+    string: { _t: 'string' },
+    number: { _t: 'number' },
+    boolean: { _t: 'boolean' },
+    date: { _t: 'date' },
+    array: (elem) => ({ _t: 'array', _elem: elem }),
+};
+// Addressing markers (compile-time safe)
+const by = {
+    name: { _by: 'name' },
+    index: { _by: 'index' },
+    id: { _by: 'id' },
+};
+// Modifiers
+function lazy(type) {
+    return { ...type, _lazy: true };
+}
+function rw(type) {
+    return { ...type, _rw: true };
+}
+function jxa(type, name) {
+    return { ...type, _jxaName: name };
+}
+function collection(schema, addressing, opts) {
+    return { _coll: true, _schema: schema, _addressing: addressing, _opts: opts };
+}
+// Computed property
+function computed(fn) {
+    return { _computed: true, _fn: fn };
+}
+// Standard mailbox marker (app-level aggregate)
+function standardMailbox(jxaName) {
+    return { _stdMailbox: true, _jxaName: jxaName };
+}
+// Account-scoped mailbox marker (virtual navigation to account's standard mailbox)
+function accountScopedMailbox(jxaProperty) {
+    return { _accountMailbox: true, _jxaProperty: jxaProperty };
+}
+// Virtual namespace marker (for object-like navigation with children, e.g., settings)
+function namespace(schema, jxaProperty) {
+    return { _namespace: true, _schema: schema, _jxaProperty: jxaProperty };
+}
+// Extract addressing modes from markers
+function getAddressingModes(markers) {
+    return markers.map(m => m._by);
+}
+/// <reference path="schema.ts" />
+/// <reference path="schema.ts" />
+/// <reference path="specifier.ts" />
 // ============================================================================
-// Helpers
+// Runtime Implementation
 // ============================================================================
-function str(val) {
-    return val == null ? '' : '' + val;
+function str(value) {
+    return value == null ? '' : '' + value;
 }
 function tryResolve(fn, context) {
     try {
         return { ok: true, value: fn() };
     }
-    catch (e) {
-        return { ok: false, error: `${context}: ${e}` };
+    catch (error) {
+        return { ok: false, error: `${context}: ${error}` };
     }
 }
-// Registry of root specifier factories by scheme
-const schemeRoots = {};
-function registerScheme(scheme, root) {
-    schemeRoots[scheme] = root;
-}
-const navigationHooks = [];
-function registerNavigationHook(hook) {
-    navigationHooks.push(hook);
-}
-const completionHooks = [];
-function registerCompletionHook(hook) {
-    completionHooks.push(hook);
-}
-// Guard against recursive completion calls during error handling
-let _inErrorSuggestion = false;
-// Helper to format completion suggestions for error messages
-function suggestCompletions(partial, max = 5) {
-    if (_inErrorSuggestion)
-        return '';
-    _inErrorSuggestion = true;
-    try {
-        const completions = getCompletions(partial);
-        if (completions.length === 0)
-            return '';
-        const suggestions = completions.slice(0, max).map(c => c.label || c.value);
-        return ` Did you mean: ${suggestions.join(', ')}?`;
-    }
-    finally {
-        _inErrorSuggestion = false;
-    }
-}
-// Deserialize a URI into a specifier
-function specifierFromURI(uri) {
-    const schemeEnd = uri.indexOf('://');
-    if (schemeEnd === -1) {
-        const suggestions = suggestCompletions(uri);
-        return { ok: false, error: `Invalid URI (no scheme): ${uri}.${suggestions}` };
-    }
-    const scheme = uri.slice(0, schemeEnd);
-    let rest = uri.slice(schemeEnd + 3);
-    // Separate query string
-    let query;
-    const queryIdx = rest.indexOf('?');
-    if (queryIdx !== -1) {
-        query = rest.slice(queryIdx + 1);
-        rest = rest.slice(0, queryIdx);
-    }
-    const rootFactory = schemeRoots[scheme];
-    if (!rootFactory) {
-        const knownSchemes = Object.keys(schemeRoots);
-        const suggestion = knownSchemes.length > 0 ? ` Known schemes: ${knownSchemes.join(', ')}` : '';
-        return { ok: false, error: `Unknown scheme: ${scheme}.${suggestion}` };
-    }
-    let current = rootFactory();
-    let resolved = `${scheme}://`;
-    for (const segment of rest.split('/').filter(s => s)) {
-        const indexMatch = segment.match(/^(.+?)\[(\d+)\]$/);
-        const name = indexMatch ? indexMatch[1] : segment;
-        const index = indexMatch ? parseInt(indexMatch[2]) : undefined;
-        try {
-            // Property access or element access?
-            if (current[name] !== undefined) {
-                current = current[name];
-                resolved += (resolved.endsWith('://') ? '' : '/') + name;
-            }
-            else if (current.byName) {
-                current = current.byName(decodeURIComponent(name));
-                resolved += (resolved.endsWith('://') ? '' : '/') + name;
-            }
-            else if (current.byId) {
-                current = current.byId(decodeURIComponent(name));
-                resolved += (resolved.endsWith('://') ? '' : '/') + name;
-            }
-            else {
-                // Try navigation hooks for special paths
-                const nextUri = resolved + (resolved.endsWith('://') ? '' : '/') + name;
-                let hooked = undefined;
-                for (const hook of navigationHooks) {
-                    hooked = hook(current, name, nextUri);
-                    if (hooked !== undefined)
-                        break;
-                }
-                if (hooked !== undefined) {
-                    current = hooked;
-                    resolved = nextUri;
-                }
-                else {
-                    const partial = resolved + (resolved.endsWith('://') ? '' : '/') + name;
-                    const suggestions = suggestCompletions(partial);
-                    return { ok: false, error: `Cannot navigate to '${name}' from ${resolved}.${suggestions}` };
-                }
-            }
-            // Apply index if present
-            if (index !== undefined) {
-                if (!current.byIndex) {
-                    return { ok: false, error: `Cannot index into '${name}' at ${resolved}` };
-                }
-                current = current.byIndex(index);
-                resolved += `[${index}]`;
-            }
-        }
-        catch (e) {
-            const suggestions = suggestCompletions(resolved);
-            return { ok: false, error: `Failed at '${segment}': ${e}.${suggestions}` };
-        }
-    }
-    // Apply whose filter, sort, pagination, and expand if present
-    if (query) {
-        try {
-            const { filter, sort, pagination, expand } = parseQuery(query);
-            if (Object.keys(filter).length > 0 && current.whose) {
-                current = current.whose(filter);
-            }
-            if (sort && current.sortBy) {
-                current = current.sortBy(sort);
-            }
-            if (pagination && current.paginate) {
-                current = current.paginate(pagination);
-            }
-            if (expand && expand.length > 0 && current.expand) {
-                current = current.expand(expand);
-            }
-            resolved += '?' + query;
-        }
-        catch (e) {
-            return { ok: false, error: `Failed to apply query: ${e} (resolved: ${resolved})` };
-        }
-    }
-    return { ok: true, value: current };
-}
-// ============================================================================
-// Helper Functions for Schema Definition
-// ============================================================================
-function accessor(jxaName) {
-    return {
-        _accessor: true,
-        _type: undefined,
-        _jxaName: jxaName
-    };
-}
-function lazyAccessor(jxaName) {
-    return {
-        _lazyAccessor: true,
-        _type: undefined,
-        _jxaName: jxaName
-    };
-}
-function collection(jxaName, elementBase, addressing) {
-    return {
-        _collection: true,
-        _elementBase: elementBase,
-        _jxaName: jxaName,
-        _addressing: addressing
-    };
-}
-function computed(compute) {
-    return {
-        _computed: true,
-        _type: undefined,
-        _compute: compute
-    };
-}
-// ============================================================================
-// Runtime Implementation Factory
-// ============================================================================
-function createDerived(schema, typeName) {
-    class DerivedClass {
-        _jxa;
-        _uri;
-        constructor(_jxa, _uri) {
-            this._jxa = _jxa;
-            this._uri = _uri;
-            this._initializeProperties();
-        }
-        static fromJXA(_jxa, _uri) {
-            return new DerivedClass(_jxa, _uri);
-        }
-        _initializeProperties() {
-            for (const [key, descriptor] of Object.entries(schema)) {
-                if (this._isAccessor(descriptor)) {
-                    this._defineAccessorProperty(key, descriptor);
-                }
-                else if (this._isLazyAccessor(descriptor)) {
-                    this._defineLazyAccessorProperty(key, descriptor);
-                }
-                else if (this._isCollection(descriptor)) {
-                    this._defineCollectionProperty(key, descriptor);
-                }
-                else if (this._isComputed(descriptor)) {
-                    this._defineComputedProperty(key, descriptor);
-                }
-            }
-        }
-        _isAccessor(desc) {
-            return desc && desc._accessor === true;
-        }
-        _isLazyAccessor(desc) {
-            return desc && desc._lazyAccessor === true;
-        }
-        _isCollection(desc) {
-            return desc && desc._collection === true;
-        }
-        _isComputed(desc) {
-            return desc && desc._computed === true;
-        }
-        _defineAccessorProperty(key, descriptor) {
-            Object.defineProperty(this, key, {
-                get() {
-                    const value = this._jxa[descriptor._jxaName]();
-                    return this._convertValue(value);
-                },
-                enumerable: true
-            });
-        }
-        _defineLazyAccessorProperty(key, descriptor) {
-            const self = this;
-            Object.defineProperty(this, key, {
-                get() {
-                    const uri = self._uri
-                        ? `${self._uri}/${key}`
-                        : `${typeName.toLowerCase()}://.../${key}`;
-                    return scalarSpecifier(uri, () => {
-                        const value = self._jxa[descriptor._jxaName]();
-                        return self._convertValue(value);
-                    });
-                },
-                enumerable: true
-            });
-        }
-        _defineCollectionProperty(key, descriptor) {
-            const self = this;
-            Object.defineProperty(this, key, {
-                get() {
-                    const jxaCollection = self._jxa[descriptor._jxaName];
-                    const base = self._uri || `${typeName.toLowerCase()}://`;
-                    const uri = base.endsWith('://') ? `${base}${key}` : `${base}/${key}`;
-                    return createCollectionSpecifier(uri, jxaCollection, descriptor._elementBase, descriptor._addressing, typeName + '_' + key);
-                },
-                enumerable: true
-            });
-        }
-        _defineComputedProperty(key, descriptor) {
-            const self = this;
-            Object.defineProperty(this, key, {
-                get() {
-                    return descriptor._compute(self._jxa);
-                },
-                enumerable: true
-            });
-        }
-        _convertValue(value) {
-            if (value == null)
-                return '';
-            if (Array.isArray(value))
-                return value.map(v => this._convertValue(v));
-            return value;
-        }
-    }
-    return DerivedClass;
-}
-// ============================================================================
-// Specifier Factories
-// ============================================================================
-// Helper for scalar specifiers
-function scalarSpecifier(uri, getValue) {
+function scalarSpec(uri, getter) {
     const spec = {
         _isSpecifier: true,
         uri,
-        resolve() {
-            return tryResolve(getValue, uri);
-        },
-        fix() {
-            return { ok: true, value: spec }; // Scalars can't be improved
-        }
+        resolve: () => tryResolve(getter, uri),
+        fix: () => ({ ok: true, value: spec })
     };
     return spec;
 }
-// Element specifier factory
-function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
-    const ElementClass = createDerived(schema, typeName);
-    // Extract base URI (collection path without element reference)
-    // e.g., "mail://accounts[0]/mailboxes" from "mail://accounts[0]/mailboxes[72]"
-    const baseUriMatch = uri.match(/^(.+?)(?:\/[^\/\[]+|\[\d+\])$/);
-    const baseUri = baseUriMatch ? baseUriMatch[1] : uri;
+function mutableSpec(uri, getter, setter) {
     const spec = {
         _isSpecifier: true,
         uri,
-        resolve() {
-            return tryResolve(() => ElementClass.fromJXA(jxa, uri), uri);
-        },
-        // Returns a new specifier with the most stable URI form, respecting addressing order
+        resolve: () => tryResolve(getter, uri),
+        fix: () => ({ ok: true, value: spec }),
+        set: (value) => tryResolve(() => setter(value), `${uri}:set`)
+    };
+    return spec;
+}
+// Descriptor detection
+const isType = (descriptor) => descriptor && '_t' in descriptor;
+const isLazy = (descriptor) => descriptor && descriptor._lazy;
+const isRW = (descriptor) => descriptor && descriptor._rw;
+const isColl = (descriptor) => descriptor && descriptor._coll;
+const isComputed = (descriptor) => descriptor && descriptor._computed;
+const isStdMailbox = (descriptor) => descriptor && descriptor._stdMailbox;
+const getJxaName = (descriptor, key) => descriptor?._jxaName ?? key;
+// ============================================================================
+// createDerived - builds runtime class from schema
+// ============================================================================
+function createDerived(schema, typeName) {
+    return class {
+        _jxa;
+        _uri;
+        constructor(jxa, uri) {
+            this._jxa = jxa;
+            this._uri = uri;
+            for (const [key, descriptor] of Object.entries(schema)) {
+                const jxaName = getJxaName(descriptor, key);
+                if (isComputed(descriptor)) {
+                    Object.defineProperty(this, key, {
+                        get: () => descriptor._fn(this._jxa),
+                        enumerable: true
+                    });
+                }
+                else if (isColl(descriptor)) {
+                    const self = this;
+                    Object.defineProperty(this, key, {
+                        get() {
+                            const base = self._uri || `${typeName.toLowerCase()}://`;
+                            const collUri = base.endsWith('://') ? `${base}${key}` : `${base}/${key}`;
+                            return createCollSpec(collUri, self._jxa[jxaName], descriptor._schema, getAddressingModes(descriptor._addressing), `${typeName}_${key}`, descriptor._opts);
+                        },
+                        enumerable: true
+                    });
+                }
+                else if (isType(descriptor)) {
+                    const self = this;
+                    if (isLazy(descriptor)) {
+                        Object.defineProperty(this, key, {
+                            get() {
+                                const propUri = self._uri ? `${self._uri}/${key}` : `${typeName.toLowerCase()}://.../${key}`;
+                                if (isRW(descriptor)) {
+                                    return mutableSpec(propUri, () => convert(self._jxa[jxaName]()), (value) => self._jxa[jxaName].set(value));
+                                }
+                                return scalarSpec(propUri, () => convert(self._jxa[jxaName]()));
+                            },
+                            enumerable: true
+                        });
+                    }
+                    else {
+                        Object.defineProperty(this, key, {
+                            get() { return convert(this._jxa[jxaName]()); },
+                            enumerable: true
+                        });
+                    }
+                }
+            }
+        }
+        static fromJXA(jxa, uri) {
+            return new this(jxa, uri);
+        }
+    };
+    function convert(value) {
+        if (value == null)
+            return '';
+        if (Array.isArray(value))
+            return value.map(convert);
+        return value;
+    }
+}
+// ============================================================================
+// Element Specifier
+// ============================================================================
+function createElemSpec(uri, jxa, schema, addressing, typeName) {
+    const DerivedClass = createDerived(schema, typeName);
+    const baseMatch = uri.match(/^(.+?)(?:\/[^\/\[]+|\[\d+\])$/);
+    const baseUri = baseMatch ? baseMatch[1] : uri;
+    const spec = {
+        _isSpecifier: true,
+        _jxa: jxa,
+        uri,
+        resolve: () => tryResolve(() => DerivedClass.fromJXA(jxa, uri), uri),
         fix() {
             return tryResolve(() => {
-                if (!addressing || addressing.length === 0) {
-                    return spec; // No addressing modes, can't improve
-                }
-                // Try addressing modes in order (first non-index mode that works wins)
-                let fixedUri;
-                for (const mode of addressing) {
-                    if (fixedUri !== undefined)
-                        break;
-                    if (mode === 'id') {
-                        try {
-                            const id = jxa.id();
-                            if (id != null && id !== '') {
-                                fixedUri = `${baseUri}/${encodeURIComponent(String(id))}`;
-                            }
-                        }
-                        catch { /* ignore */ }
+                let fixedBase = baseUri;
+                if (baseUri.includes('[')) {
+                    const parentResult = specifierFromURI(baseUri);
+                    if (parentResult.ok) {
+                        const fixed = parentResult.value.fix();
+                        if (fixed.ok)
+                            fixedBase = fixed.value.uri;
                     }
-                    else if (mode === 'name') {
-                        try {
-                            const name = jxa.name();
-                            if (name != null && name !== '') {
-                                fixedUri = `${baseUri}/${encodeURIComponent(String(name))}`;
-                            }
-                        }
-                        catch { /* ignore */ }
+                }
+                if (!addressing.length) {
+                    if (fixedBase !== baseUri) {
+                        return createElemSpec(fixedBase + uri.slice(baseUri.length), jxa, schema, addressing, typeName);
                     }
-                    // 'index' doesn't provide improvement
+                    return spec;
                 }
-                if (fixedUri === undefined) {
-                    return spec; // Can't improve, return self
+                for (const mode of ['id', 'name']) {
+                    if (!addressing.includes(mode))
+                        continue;
+                    try {
+                        const value = jxa[mode]();
+                        if (value != null && value !== '') {
+                            return createElemSpec(`${fixedBase}/${encodeURIComponent(String(value))}`, jxa, schema, addressing, typeName);
+                        }
+                    }
+                    catch { }
                 }
-                // Return new specifier with fixed URI
-                return createElementSpecifier(fixedUri, jxa, schema, typeName, addressing);
+                if (fixedBase !== baseUri) {
+                    return createElemSpec(fixedBase + uri.slice(baseUri.length), jxa, schema, addressing, typeName);
+                }
+                return spec;
             }, uri);
         }
     };
-    // Add lifted property specifiers
     for (const [key, descriptor] of Object.entries(schema)) {
-        if ('_accessor' in descriptor || '_lazyAccessor' in descriptor) {
-            // Both accessor and lazyAccessor lift to Specifier<T> on a Specifier
+        const jxaName = getJxaName(descriptor, key);
+        if (isType(descriptor)) {
             Object.defineProperty(spec, key, {
                 get() {
-                    const jxaName = descriptor._jxaName;
-                    return scalarSpecifier(`${uri}/${key}`, () => {
-                        const value = jxa[jxaName]();
-                        return value == null ? '' : value;
-                    });
+                    if (isRW(descriptor)) {
+                        return mutableSpec(`${uri}/${key}`, () => jxa[jxaName]() ?? '', (value) => jxa[jxaName].set(value));
+                    }
+                    return scalarSpec(`${uri}/${key}`, () => jxa[jxaName]() ?? '');
                 },
                 enumerable: true
             });
         }
-        else if ('_collection' in descriptor) {
+        else if (isColl(descriptor)) {
             Object.defineProperty(spec, key, {
                 get() {
-                    const desc = descriptor;
-                    return createCollectionSpecifier(`${uri}/${key}`, jxa[desc._jxaName], desc._elementBase, desc._addressing, typeName + '_' + key);
+                    return createCollSpec(`${uri}/${key}`, jxa[jxaName], descriptor._schema, getAddressingModes(descriptor._addressing), `${typeName}_${key}`, descriptor._opts);
                 },
                 enumerable: true
             });
@@ -374,105 +228,92 @@ function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
     }
     return spec;
 }
-// Collection specifier factory
-function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, pagination, expand) {
-    const ElementClass = createDerived(elementBase, typeName);
+// ============================================================================
+// Collection Specifier
+// ============================================================================
+function createCollSpec(uri, jxaColl, schema, addressing, typeName, opts, sortSpec, jsFilter, pagination, expand) {
+    const DerivedClass = createDerived(schema, typeName);
+    const baseUri = uri.split('?')[0];
     const spec = {
         _isSpecifier: true,
         uri,
-        // Returns base collection specifier (strips query params)
         fix() {
-            const baseUri = uri.split('?')[0];
-            if (baseUri === uri) {
-                return { ok: true, value: spec }; // Already at base form
+            let fixedBase = baseUri;
+            if (fixedBase.includes('[')) {
+                const lastSlash = fixedBase.lastIndexOf('/');
+                const schemeEnd = fixedBase.indexOf('://') + 3;
+                if (lastSlash > schemeEnd) {
+                    const parentResult = specifierFromURI(fixedBase.slice(0, lastSlash));
+                    if (parentResult.ok) {
+                        const fixed = parentResult.value.fix();
+                        if (fixed.ok)
+                            fixedBase = fixed.value.uri + '/' + fixedBase.slice(lastSlash + 1);
+                    }
+                }
             }
-            return { ok: true, value: createCollectionSpecifier(baseUri, jxaCollection, elementBase, addressing, typeName) };
+            if (fixedBase === uri) {
+                return { ok: true, value: spec };
+            }
+            return { ok: true, value: createCollSpec(fixedBase, jxaColl, schema, addressing, typeName, opts) };
         },
         resolve() {
             return tryResolve(() => {
-                const jxaArray = typeof jxaCollection === 'function' ? jxaCollection() : jxaCollection;
-                const collectionBaseUri = uri.split('?')[0]; // Strip query params for element URIs
-                let results = jxaArray.map((jxa, i) => {
-                    // Generate the best URI for this element, respecting addressing order
-                    // The first mode in the array that works is used (e.g., ['name', 'index', 'id'] prefers name)
-                    let elementUri = undefined;
-                    for (const mode of addressing) {
-                        if (elementUri !== undefined)
-                            break;
-                        if (mode === 'id') {
-                            try {
-                                const id = jxa.id();
-                                if (id != null && id !== '') {
-                                    elementUri = `${collectionBaseUri}/${encodeURIComponent(String(id))}`;
-                                }
-                            }
-                            catch { /* ignore */ }
-                        }
-                        else if (mode === 'name') {
-                            try {
-                                const name = jxa.name();
-                                if (name != null && name !== '') {
-                                    elementUri = `${collectionBaseUri}/${encodeURIComponent(String(name))}`;
-                                }
-                            }
-                            catch { /* ignore */ }
-                        }
-                        // 'index' is handled as fallback below
+                const array = typeof jxaColl === 'function' ? jxaColl() : jxaColl;
+                let results = array.map((jxaItem, index) => {
+                    const itemUri = `${baseUri}[${index}]`;
+                    const elemSpec = createElemSpec(itemUri, jxaItem, schema, addressing, typeName);
+                    const resolved = elemSpec.resolve();
+                    if (!resolved.ok)
+                        return DerivedClass.fromJXA(jxaItem, itemUri);
+                    const fixed = elemSpec.fix();
+                    if (fixed.ok && fixed.value.uri !== itemUri) {
+                        resolved.value._ref = fixed.value.uri;
                     }
-                    // Fall back to index if no better addressing available
-                    if (elementUri === undefined) {
-                        elementUri = `${collectionBaseUri}[${i}]`;
-                    }
-                    return ElementClass.fromJXA(jxa, elementUri);
+                    return resolved.value;
                 });
-                // Apply JS filter if specified
-                if (jsFilter && Object.keys(jsFilter).length > 0) {
+                if (jsFilter && Object.keys(jsFilter).length) {
                     results = results.filter((item) => {
                         for (const [key, predicate] of Object.entries(jsFilter)) {
-                            const val = item[key];
+                            const value = item[key];
                             const pred = predicate;
-                            if ('contains' in pred && typeof val === 'string' && !val.includes(pred.contains))
+                            if ('contains' in pred && typeof value === 'string' && !value.includes(pred.contains))
                                 return false;
-                            if ('startsWith' in pred && typeof val === 'string' && !val.startsWith(pred.startsWith))
+                            if ('startsWith' in pred && typeof value === 'string' && !value.startsWith(pred.startsWith))
                                 return false;
-                            if ('greaterThan' in pred && !(val > pred.greaterThan))
+                            if ('greaterThan' in pred && !(value > pred.greaterThan))
                                 return false;
-                            if ('lessThan' in pred && !(val < pred.lessThan))
+                            if ('lessThan' in pred && !(value < pred.lessThan))
                                 return false;
-                            if ('equals' in pred && val !== pred.equals)
+                            if ('equals' in pred && value !== pred.equals)
                                 return false;
                         }
                         return true;
                     });
                 }
-                // Apply sort if specified
                 if (sortSpec) {
                     results.sort((a, b) => {
                         const aVal = a[sortSpec.by];
                         const bVal = b[sortSpec.by];
-                        const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
-                        return sortSpec.direction === 'desc' ? -cmp : cmp;
+                        const comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+                        return sortSpec.direction === 'desc' ? -comparison : comparison;
                     });
                 }
-                // Apply pagination if specified
                 if (pagination) {
                     const start = pagination.offset || 0;
                     const end = pagination.limit !== undefined ? start + pagination.limit : undefined;
                     results = results.slice(start, end);
                 }
-                // Apply expand if specified - resolve lazy specifiers
-                if (expand && expand.length > 0) {
+                if (expand?.length) {
                     results = results.map((item) => {
-                        // Create a shallow copy with all values resolved
                         const expanded = {};
                         for (const key of Object.keys(item)) {
-                            const val = item[key];
-                            if (expand.includes(key) && val && val._isSpecifier && typeof val.resolve === 'function') {
-                                const resolved = val.resolve();
-                                expanded[key] = resolved.ok ? resolved.value : val;
+                            const value = item[key];
+                            if (expand.includes(key) && value?._isSpecifier && typeof value.resolve === 'function') {
+                                const resolved = value.resolve();
+                                expanded[key] = resolved.ok ? resolved.value : value;
                             }
                             else {
-                                expanded[key] = val;
+                                expanded[key] = value;
                             }
                         }
                         return expanded;
@@ -482,114 +323,874 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
             }, uri);
         }
     };
-    // Get base URI without query string for element URIs
-    const baseUri = uri.split('?')[0];
-    // Add addressing methods
     if (addressing.includes('index')) {
-        spec.byIndex = function (i) {
-            return createElementSpecifier(`${baseUri}[${i}]`, jxaCollection.at(i), elementBase, typeName, addressing);
-        };
+        spec.byIndex = (index) => createElemSpec(`${baseUri}[${index}]`, jxaColl.at(index), schema, addressing, typeName);
     }
     if (addressing.includes('name')) {
-        spec.byName = function (name) {
-            return createElementSpecifier(`${baseUri}/${encodeURIComponent(name)}`, jxaCollection.byName(name), elementBase, typeName, addressing);
-        };
+        spec.byName = (name) => createElemSpec(`${baseUri}/${encodeURIComponent(name)}`, jxaColl.byName(name), schema, addressing, typeName);
     }
     if (addressing.includes('id')) {
-        spec.byId = function (id) {
-            return createElementSpecifier(`${baseUri}/${id}`, jxaCollection.byId(id), elementBase, typeName, addressing);
-        };
+        spec.byId = (id) => createElemSpec(`${baseUri}/${id}`, jxaColl.byId(id), schema, addressing, typeName);
     }
-    // Add whose filtering
-    spec.whose = function (filter) {
-        const filteredUri = `${uri}?${encodeFilter(filter)}`;
-        // Build JXA whose clause
+    spec.whose = (filter) => {
+        const filterUri = `${uri}?${encodeFilter(filter)}`;
         const jxaFilter = {};
         for (const [key, predicate] of Object.entries(filter)) {
-            const descriptor = elementBase[key];
-            if (!descriptor || !('_jxaName' in descriptor)) {
-                throw new Error(`Unknown property: ${key}`);
-            }
-            const jxaName = descriptor._jxaName;
+            const jxaName = getJxaName(schema[key], key);
             const pred = predicate;
-            if ('equals' in pred) {
+            if ('equals' in pred)
                 jxaFilter[jxaName] = pred.equals;
-            }
-            else if ('contains' in pred) {
+            else if ('contains' in pred)
                 jxaFilter[jxaName] = { _contains: pred.contains };
-            }
-            else if ('startsWith' in pred) {
+            else if ('startsWith' in pred)
                 jxaFilter[jxaName] = { _beginsWith: pred.startsWith };
-            }
-            else if ('greaterThan' in pred) {
+            else if ('greaterThan' in pred)
                 jxaFilter[jxaName] = { _greaterThan: pred.greaterThan };
-            }
-            else if ('lessThan' in pred) {
+            else if ('lessThan' in pred)
                 jxaFilter[jxaName] = { _lessThan: pred.lessThan };
-            }
         }
-        // Try JXA whose first, fall back to JS filter
         try {
-            const filteredJXA = jxaCollection.whose(jxaFilter);
-            // Test if it works by accessing length (triggers evaluation)
-            void filteredJXA.length;
-            return createCollectionSpecifier(filteredUri, filteredJXA, elementBase, addressing, typeName, sortSpec, undefined, pagination, expand);
+            const filtered = jxaColl.whose(jxaFilter);
+            void filtered.length;
+            return createCollSpec(filterUri, filtered, schema, addressing, typeName, opts, sortSpec, undefined, pagination, expand);
         }
         catch {
-            // JXA filter failed, use JS post-filter
-            return createCollectionSpecifier(filteredUri, jxaCollection, elementBase, addressing, typeName, sortSpec, filter, pagination, expand);
+            return createCollSpec(filterUri, jxaColl, schema, addressing, typeName, opts, sortSpec, filter, pagination, expand);
         }
     };
-    // Add sortBy
-    spec.sortBy = function (newSortSpec) {
+    spec.sortBy = (sort) => {
         const sep = uri.includes('?') ? '&' : '?';
-        const sortedUri = `${uri}${sep}sort=${String(newSortSpec.by)}.${newSortSpec.direction || 'asc'}`;
-        return createCollectionSpecifier(sortedUri, jxaCollection, elementBase, addressing, typeName, newSortSpec, jsFilter, pagination, expand);
+        return createCollSpec(`${uri}${sep}sort=${String(sort.by)}.${sort.direction || 'asc'}`, jxaColl, schema, addressing, typeName, opts, sort, jsFilter, pagination, expand);
     };
-    // Add paginate
-    spec.paginate = function (newPagination) {
+    spec.paginate = (page) => {
         const parts = [];
-        if (newPagination.limit !== undefined)
-            parts.push(`limit=${newPagination.limit}`);
-        if (newPagination.offset !== undefined)
-            parts.push(`offset=${newPagination.offset}`);
+        if (page.limit !== undefined)
+            parts.push(`limit=${page.limit}`);
+        if (page.offset !== undefined)
+            parts.push(`offset=${page.offset}`);
         const sep = uri.includes('?') ? '&' : '?';
-        const paginatedUri = parts.length > 0 ? `${uri}${sep}${parts.join('&')}` : uri;
-        return createCollectionSpecifier(paginatedUri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, newPagination, expand);
+        const newUri = parts.length ? `${uri}${sep}${parts.join('&')}` : uri;
+        return createCollSpec(newUri, jxaColl, schema, addressing, typeName, opts, sortSpec, jsFilter, page, expand);
     };
-    // Add expand
-    spec.expand = function (newExpand) {
+    spec.expand = (expandProps) => {
         const sep = uri.includes('?') ? '&' : '?';
-        const expandUri = `${uri}${sep}expand=${newExpand.join(',')}`;
-        return createCollectionSpecifier(expandUri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, pagination, newExpand);
+        return createCollSpec(`${uri}${sep}expand=${expandProps.join(',')}`, jxaColl, schema, addressing, typeName, opts, sortSpec, jsFilter, pagination, expandProps);
     };
+    if (opts?.create) {
+        spec.create = (props) => tryResolve(() => {
+            const jxaProps = {};
+            for (const [key, value] of Object.entries(props)) {
+                jxaProps[getJxaName(schema[key], key)] = value;
+            }
+            const newItem = jxaColl.make({
+                new: typeName.split('_').pop()?.toLowerCase() || typeName.toLowerCase(),
+                withProperties: jxaProps
+            });
+            let newUri;
+            try {
+                const id = newItem.id();
+                newUri = id ? `${baseUri}/${id}` : (() => { throw 0; })();
+            }
+            catch {
+                try {
+                    const name = newItem.name();
+                    newUri = name ? `${baseUri}/${encodeURIComponent(name)}` : (() => { throw 0; })();
+                }
+                catch {
+                    newUri = `${baseUri}[${(typeof jxaColl === 'function' ? jxaColl() : jxaColl).length - 1}]`;
+                }
+            }
+            return createElemSpec(newUri, newItem, schema, addressing, typeName);
+        }, `${uri}:create`);
+    }
+    if (opts?.delete) {
+        spec.delete = (itemUri) => tryResolve(() => {
+            const itemSpec = specifierFromURI(itemUri);
+            if (!itemSpec.ok)
+                throw new Error(itemSpec.error);
+            if (itemSpec.value._jxa) {
+                itemSpec.value._jxa.delete();
+            }
+            else {
+                throw new Error(`Cannot delete: ${itemUri}`);
+            }
+        }, `${itemUri}:delete`);
+    }
     return spec;
 }
+/// <reference path="schema.ts" />
+// Query operators valid for each type
+const validOperators = {
+    string: ['equals', 'contains', 'startsWith'],
+    number: ['equals', 'gt', 'lt'],
+    boolean: ['equals'],
+    date: ['equals', 'gt', 'lt'],
+    array: ['equals'],
+};
 // ============================================================================
-// Filter Encoding/Decoding
+// Factory Functions
 // ============================================================================
-function encodeFilter(filter) {
-    const parts = [];
-    for (const [key, predicate] of Object.entries(filter)) {
-        const pred = predicate;
-        if ('equals' in pred) {
-            parts.push(`${key}=${encodeURIComponent(String(pred.equals))}`);
-        }
-        else if ('contains' in pred) {
-            parts.push(`${key}.contains=${encodeURIComponent(pred.contains)}`);
-        }
-        else if ('startsWith' in pred) {
-            parts.push(`${key}.startsWith=${encodeURIComponent(pred.startsWith)}`);
-        }
-        else if ('greaterThan' in pred) {
-            parts.push(`${key}.gt=${pred.greaterThan}`);
-        }
-        else if ('lessThan' in pred) {
-            parts.push(`${key}.lt=${pred.lessThan}`);
+const route = {
+    property(valueType, opts) {
+        return { _property: true, valueType, ...opts };
+    },
+    computed(fn, jxaName) {
+        return { _computed: true, computeFn: fn, jxaName };
+    },
+    collection(elementSchema, addressing, opts) {
+        return { _collection: true, elementSchema, addressing, ...opts };
+    },
+    virtualProp(jxaProperty, targetSchema, accountScoped) {
+        return { _virtualProp: true, jxaProperty, targetSchema, accountScoped };
+    },
+    virtualCtx(targetSchema) {
+        return { _virtualCtx: true, targetSchema };
+    },
+    root() {
+        return { _root: true };
+    }
+};
+// Type guards for discriminating entry types
+function isPropertyEntry(entry) {
+    return '_property' in entry;
+}
+function isComputedEntry(entry) {
+    return '_computed' in entry;
+}
+function isCollectionEntry(entry) {
+    return '_collection' in entry;
+}
+function isVirtualPropEntry(entry) {
+    return '_virtualProp' in entry;
+}
+function isVirtualCtxEntry(entry) {
+    return '_virtualCtx' in entry;
+}
+function isVirtualEntry(entry) {
+    return '_virtualProp' in entry || '_virtualCtx' in entry;
+}
+function isRootEntry(entry) {
+    return '_root' in entry;
+}
+// Get descriptive type string for external consumers
+function getEntryType(entry) {
+    if (isRootEntry(entry))
+        return 'root';
+    if (isCollectionEntry(entry))
+        return 'collection';
+    if (isPropertyEntry(entry))
+        return 'property';
+    if (isComputedEntry(entry))
+        return 'computed';
+    if (isVirtualEntry(entry))
+        return 'virtual';
+    return 'unknown';
+}
+// ============================================================================
+// Route Table Compiler
+// ============================================================================
+function compileRoutes(schema, scheme, namedSchemas) {
+    const schemaRegistry = {};
+    // Register named schemas provided by caller
+    if (namedSchemas) {
+        for (const [name, s] of Object.entries(namedSchemas)) {
+            schemaRegistry[name] = s;
         }
     }
-    return parts.join('&');
+    // Register schemas as they're encountered
+    function registerSchema(s, name) {
+        if (s && !schemaRegistry[name]) {
+            schemaRegistry[name] = s;
+        }
+    }
+    // Compile a schema into a route node
+    function compileSchema(s, name) {
+        registerSchema(s, name);
+        const children = {};
+        for (const [key, descriptor] of Object.entries(s)) {
+            if (!descriptor)
+                continue;
+            const desc = descriptor;
+            // Collection
+            if ('_coll' in desc) {
+                const elementSchemaName = getSchemaName(desc._schema, key);
+                registerSchema(desc._schema, elementSchemaName);
+                children[key] = {
+                    entry: route.collection({ _ref: elementSchemaName }, getAddressingModes(desc._addressing), { jxaName: desc._jxaName, mutable: desc._opts }),
+                    children: {},
+                };
+                continue;
+            }
+            // Computed property
+            if ('_computed' in desc) {
+                children[key] = {
+                    entry: route.computed(desc._fn, desc._jxaName),
+                    children: {},
+                };
+                continue;
+            }
+            // Standard mailbox (app-level virtual)
+            if ('_stdMailbox' in desc) {
+                children[key] = {
+                    entry: route.virtualProp(desc._jxaName, { _ref: 'StandardMailbox' }),
+                    children: {},
+                };
+                continue;
+            }
+            // Account-scoped mailbox (virtual)
+            if ('_accountMailbox' in desc) {
+                children[key] = {
+                    entry: route.virtualProp(desc._jxaProperty, { _ref: 'Mailbox' }, true),
+                    children: {},
+                };
+                continue;
+            }
+            // Namespace marker (object-like navigation with children)
+            if ('_namespace' in desc) {
+                const namespaceSchemaName = getSchemaName(desc._schema, key);
+                registerSchema(desc._schema, namespaceSchemaName);
+                if (desc._jxaProperty) {
+                    children[key] = {
+                        entry: route.virtualProp(desc._jxaProperty, { _ref: namespaceSchemaName }),
+                        children: {},
+                    };
+                }
+                else {
+                    children[key] = {
+                        entry: route.virtualCtx({ _ref: namespaceSchemaName }),
+                        children: {},
+                    };
+                }
+                continue;
+            }
+            // Type marker (property)
+            if ('_t' in desc) {
+                children[key] = {
+                    entry: route.property(mapType(desc._t, desc), {
+                        jxaName: desc._jxaName,
+                        lazy: desc._lazy,
+                        rw: desc._rw,
+                    }),
+                    children: {},
+                };
+                continue;
+            }
+        }
+        return {
+            entry: route.root(),
+            children,
+        };
+    }
+    function mapType(t, desc) {
+        if (t === 'array')
+            return 'array';
+        return t;
+    }
+    function getSchemaName(schema, fallback) {
+        // Try to find a unique identifier for the schema
+        // Use the schema object reference to check if already registered
+        for (const [name, registered] of Object.entries(schemaRegistry)) {
+            if (registered === schema)
+                return name;
+        }
+        return fallback;
+    }
+    const root = compileSchema(schema, 'Root');
+    return { scheme, root, schemaRegistry };
 }
+// ============================================================================
+// Route Node Resolution (handles schema refs)
+// ============================================================================
+function getRouteChildren(node, table) {
+    const entry = node.entry;
+    // For collections, get children from element schema
+    if (isCollectionEntry(entry)) {
+        const schemaRef = entry.elementSchema;
+        if ('_ref' in schemaRef) {
+            const schema = table.schemaRegistry[schemaRef._ref];
+            if (schema) {
+                return compileSchemaChildren(schema, table);
+            }
+        }
+    }
+    // For virtual entries, get children from target schema
+    if (isVirtualEntry(entry)) {
+        const schemaRef = entry.targetSchema;
+        if ('_ref' in schemaRef) {
+            const schema = table.schemaRegistry[schemaRef._ref];
+            if (schema) {
+                return compileSchemaChildren(schema, table);
+            }
+        }
+    }
+    return node.children;
+}
+function compileSchemaChildren(schema, table) {
+    const children = {};
+    for (const [key, descriptor] of Object.entries(schema)) {
+        if (!descriptor)
+            continue;
+        const desc = descriptor;
+        // Collection
+        if ('_coll' in desc) {
+            const elementSchemaName = findSchemaName(desc._schema, table) || key;
+            children[key] = {
+                entry: route.collection({ _ref: elementSchemaName }, getAddressingModes(desc._addressing), { jxaName: desc._jxaName, mutable: desc._opts }),
+                children: {},
+            };
+            continue;
+        }
+        // Computed
+        if ('_computed' in desc) {
+            children[key] = {
+                entry: route.computed(desc._fn, desc._jxaName),
+                children: {},
+            };
+            continue;
+        }
+        // Standard mailbox
+        if ('_stdMailbox' in desc) {
+            children[key] = {
+                entry: route.virtualProp(desc._jxaName, { _ref: 'StandardMailbox' }),
+                children: {},
+            };
+            continue;
+        }
+        // Account-scoped mailbox
+        if ('_accountMailbox' in desc) {
+            children[key] = {
+                entry: route.virtualProp(desc._jxaProperty, { _ref: 'Mailbox' }, true),
+                children: {},
+            };
+            continue;
+        }
+        // Namespace marker
+        if ('_namespace' in desc) {
+            const namespaceSchemaName = findSchemaName(desc._schema, table) || key;
+            if (desc._jxaProperty) {
+                children[key] = {
+                    entry: route.virtualProp(desc._jxaProperty, { _ref: namespaceSchemaName }),
+                    children: {},
+                };
+            }
+            else {
+                children[key] = {
+                    entry: route.virtualCtx({ _ref: namespaceSchemaName }),
+                    children: {},
+                };
+            }
+            continue;
+        }
+        // Property
+        if ('_t' in desc) {
+            children[key] = {
+                entry: route.property(desc._t === 'array' ? 'array' : desc._t, { jxaName: desc._jxaName, lazy: desc._lazy, rw: desc._rw }),
+                children: {},
+            };
+            continue;
+        }
+    }
+    return children;
+}
+function findSchemaName(schema, table) {
+    for (const [name, registered] of Object.entries(table.schemaRegistry)) {
+        if (registered === schema)
+            return name;
+    }
+    return undefined;
+}
+// ============================================================================
+// URI Parsing with Route Table
+// ============================================================================
+function parseURIWithRoutes(uri, routes) {
+    // Parse scheme
+    const schemeEnd = uri.indexOf('://');
+    if (schemeEnd === -1) {
+        return {
+            ok: false,
+            error: `Invalid URI (no scheme): ${uri}`,
+            pathSoFar: '',
+            failedSegment: uri,
+            availableOptions: [routes.scheme],
+        };
+    }
+    const scheme = uri.slice(0, schemeEnd);
+    if (scheme !== routes.scheme) {
+        return {
+            ok: false,
+            error: `Unknown scheme: ${scheme}. Expected: ${routes.scheme}`,
+            pathSoFar: '',
+            failedSegment: scheme,
+            availableOptions: [routes.scheme],
+        };
+    }
+    let rest = uri.slice(schemeEnd + 3);
+    // Split query string
+    let queryString;
+    const queryIdx = rest.indexOf('?');
+    if (queryIdx !== -1) {
+        queryString = rest.slice(queryIdx + 1);
+        rest = rest.slice(0, queryIdx);
+    }
+    // Handle root URI
+    if (!rest || rest === '') {
+        return {
+            ok: true,
+            type: 'root',
+            segments: [],
+            depth: 0,
+            route: routes.root,
+            queryValid: true,
+        };
+    }
+    // Parse path segments
+    const rawSegments = rest.split('/').filter(s => s);
+    const parsedSegments = [];
+    let currentNode = routes.root;
+    let pathSoFar = `${scheme}://`;
+    let depth = 0;
+    for (let i = 0; i < rawSegments.length; i++) {
+        const segment = rawSegments[i];
+        depth++;
+        // Check for index addressing: name[index]
+        const indexMatch = segment.match(/^(.+?)\[(-?\d+)\]$/);
+        const name = indexMatch ? indexMatch[1] : segment;
+        const index = indexMatch ? parseInt(indexMatch[2]) : undefined;
+        // Get available children at current level
+        const children = isRootEntry(currentNode.entry)
+            ? currentNode.children
+            : getRouteChildren(currentNode, routes);
+        // Check if navigating into a collection element
+        if (isCollectionEntry(currentNode.entry)) {
+            // This segment addresses an element in the collection
+            const addressing = currentNode.entry.addressing;
+            // Determine addressing type
+            if (index !== undefined) {
+                // name[index] - but for collections, name should match collection name (already consumed)
+                // This is actually a direct index like [0]
+                return {
+                    ok: false,
+                    error: `Unexpected segment '${segment}' - collection already being addressed`,
+                    pathSoFar,
+                    failedSegment: segment,
+                    availableOptions: Object.keys(children),
+                };
+            }
+            // Check if segment matches a child property (not an element address)
+            if (children[name]) {
+                currentNode = children[name];
+                parsedSegments.push({ name });
+                pathSoFar += (pathSoFar.endsWith('://') ? '' : '/') + name;
+                // Handle index on the child (e.g., mailboxes/INBOX/messages[0])
+                if (indexMatch) {
+                    // This shouldn't happen - index should be on collection, not child
+                    return {
+                        ok: false,
+                        error: `Cannot use index on '${name}'`,
+                        pathSoFar,
+                        failedSegment: segment,
+                        availableOptions: [],
+                    };
+                }
+                continue;
+            }
+            // Segment addresses an element by name or id
+            let addressingType = 'name';
+            if (addressing.includes('name')) {
+                addressingType = 'name';
+            }
+            else if (addressing.includes('id')) {
+                addressingType = 'id';
+            }
+            else {
+                return {
+                    ok: false,
+                    error: `Collection does not support name or id addressing, use index: [0]`,
+                    pathSoFar,
+                    failedSegment: segment,
+                    availableOptions: ['[index]'],
+                };
+            }
+            parsedSegments.push({
+                name,
+                addressing: { type: addressingType, value: decodeURIComponent(name) },
+            });
+            pathSoFar += (pathSoFar.endsWith('://') ? '' : '/') + segment;
+            // Stay at collection level but now we're addressing an element
+            // Children are from the element schema
+            continue;
+        }
+        // Look up child route
+        const childNode = children[name];
+        if (!childNode) {
+            return {
+                ok: false,
+                error: `Unknown segment '${name}' at ${pathSoFar}`,
+                pathSoFar,
+                failedSegment: name,
+                availableOptions: Object.keys(children),
+            };
+        }
+        currentNode = childNode;
+        parsedSegments.push({ name });
+        pathSoFar += (pathSoFar.endsWith('://') ? '' : '/') + name;
+        // Handle index addressing on collections
+        if (index !== undefined) {
+            if (!isCollectionEntry(currentNode.entry)) {
+                return {
+                    ok: false,
+                    error: `Cannot use index on non-collection '${name}'`,
+                    pathSoFar,
+                    failedSegment: segment,
+                    availableOptions: [],
+                };
+            }
+            if (!currentNode.entry.addressing.includes('index')) {
+                return {
+                    ok: false,
+                    error: `Collection '${name}' does not support index addressing`,
+                    pathSoFar,
+                    failedSegment: segment,
+                    availableOptions: [],
+                };
+            }
+            parsedSegments.push({
+                name: `[${index}]`,
+                addressing: { type: 'index', value: index },
+            });
+            pathSoFar += `[${index}]`;
+            depth++;
+        }
+    }
+    // Parse and validate query string
+    let query;
+    let queryValid = true;
+    let queryError;
+    if (queryString) {
+        const queryResult = parseAndValidateQuery(queryString, currentNode, routes);
+        query = queryResult.query;
+        queryValid = queryResult.valid;
+        queryError = queryResult.error;
+    }
+    return {
+        ok: true,
+        type: getEntryType(currentNode.entry),
+        segments: parsedSegments,
+        depth,
+        route: currentNode,
+        query,
+        queryValid,
+        queryError,
+    };
+}
+// ============================================================================
+// Query Parsing and Validation
+// ============================================================================
+function parseAndValidateQuery(queryString, currentNode, routes) {
+    const query = { filter: {} };
+    let valid = true;
+    let error;
+    // Get the schema for the current node to validate fields
+    let fieldTypes = {};
+    if (isCollectionEntry(currentNode.entry)) {
+        const schemaRef = currentNode.entry.elementSchema;
+        if ('_ref' in schemaRef) {
+            const schema = routes.schemaRegistry[schemaRef._ref];
+            if (schema) {
+                fieldTypes = extractFieldTypes(schema);
+            }
+        }
+    }
+    for (const part of queryString.split('&')) {
+        const eqIdx = part.indexOf('=');
+        if (eqIdx === -1)
+            continue;
+        const key = part.slice(0, eqIdx);
+        const value = part.slice(eqIdx + 1);
+        // Standard params
+        if (key === 'sort') {
+            const [by, direction] = value.split('.');
+            query.sort = { by, direction: direction || 'asc' };
+            continue;
+        }
+        if (key === 'limit') {
+            query.pagination = query.pagination || {};
+            query.pagination.limit = Number(value);
+            continue;
+        }
+        if (key === 'offset') {
+            query.pagination = query.pagination || {};
+            query.pagination.offset = Number(value);
+            continue;
+        }
+        if (key === 'expand') {
+            query.expand = value.split(',').map(s => decodeURIComponent(s.trim()));
+            continue;
+        }
+        // Filter params
+        const dotIdx = key.lastIndexOf('.');
+        if (dotIdx === -1) {
+            // Simple equals: ?name=value
+            query.filter[key] = { equals: decodeURIComponent(value) };
+        }
+        else {
+            const prop = key.slice(0, dotIdx);
+            const op = key.slice(dotIdx + 1);
+            // Validate operator against field type
+            const fieldType = fieldTypes[prop];
+            if (fieldType) {
+                const validOps = validOperators[fieldType];
+                const normalizedOp = normalizeOperator(op);
+                if (!validOps.includes(normalizedOp)) {
+                    valid = false;
+                    error = `${op} operator not valid for ${fieldType} field`;
+                }
+            }
+            // Parse the filter
+            if (op === 'contains')
+                query.filter[prop] = { contains: decodeURIComponent(value) };
+            else if (op === 'startsWith')
+                query.filter[prop] = { startsWith: decodeURIComponent(value) };
+            else if (op === 'gt')
+                query.filter[prop] = { greaterThan: Number(value) };
+            else if (op === 'lt')
+                query.filter[prop] = { lessThan: Number(value) };
+        }
+    }
+    return { query, valid, error };
+}
+function normalizeOperator(op) {
+    if (op === 'gt')
+        return 'gt';
+    if (op === 'lt')
+        return 'lt';
+    return op;
+}
+function extractFieldTypes(schema) {
+    const types = {};
+    for (const [key, descriptor] of Object.entries(schema)) {
+        if (!descriptor)
+            continue;
+        const desc = descriptor;
+        if ('_t' in desc) {
+            types[key] = desc._t === 'array' ? 'array' : desc._t;
+        }
+    }
+    return types;
+}
+// ============================================================================
+// Completion Support
+// ============================================================================
+function getRouteCompletions(partial, routes) {
+    const completions = [];
+    // Parse scheme
+    const schemeMatch = partial.match(/^([^:]*)(:\/?\/?)?(.*)?$/);
+    if (!schemeMatch)
+        return [];
+    const [, schemePartial, schemeSep, pathPart] = schemeMatch;
+    // Suggest schemes
+    if (!schemeSep || schemeSep !== '://') {
+        if (routes.scheme.startsWith(schemePartial)) {
+            completions.push({ value: `${routes.scheme}://`, label: routes.scheme, description: 'Scheme' });
+        }
+        return completions;
+    }
+    const path = pathPart || '';
+    // Check if in query string
+    const queryIdx = path.indexOf('?');
+    if (queryIdx !== -1) {
+        return getRouteQueryCompletions(routes.scheme, path.slice(0, queryIdx), path.slice(queryIdx + 1), routes);
+    }
+    // Path completion
+    return getRoutePathCompletions(routes.scheme, path, routes);
+}
+function getRoutePathCompletions(scheme, path, routes) {
+    const completions = [];
+    // Split path to find partial segment
+    const segments = path.split('/');
+    const partialSegment = segments.pop() || '';
+    const completePath = segments.join('/');
+    // Parse parent path
+    const parentUri = `${scheme}://${completePath}`;
+    const parentResult = parseURIWithRoutes(parentUri, routes);
+    if (!parentResult.ok)
+        return [];
+    const parentNode = parentResult.route;
+    const children = isRootEntry(parentNode.entry)
+        ? parentNode.children
+        : getRouteChildren(parentNode, routes);
+    // Suggest matching children
+    for (const [name, node] of Object.entries(children)) {
+        if (!name.toLowerCase().startsWith(partialSegment.toLowerCase()))
+            continue;
+        const entry = node.entry;
+        let description;
+        let suffix = '';
+        if (isCollectionEntry(entry)) {
+            suffix = '/';
+            description = 'Collection';
+        }
+        else if (isVirtualEntry(entry)) {
+            suffix = '/';
+            description = 'Mailbox';
+        }
+        else if (isPropertyEntry(entry)) {
+            description = `${entry.valueType} property`;
+        }
+        else if (isComputedEntry(entry)) {
+            description = 'Computed property';
+        }
+        else {
+            description = 'Entry';
+        }
+        completions.push({
+            value: name + suffix,
+            label: name,
+            description,
+        });
+    }
+    // If at a collection, suggest addressing options
+    if (isCollectionEntry(parentNode.entry)) {
+        if (parentNode.entry.addressing.includes('index')) {
+            completions.push({ value: '[0]', label: '[index]', description: 'Access by index' });
+        }
+        completions.push({ value: '?', label: '?', description: 'Add filter/sort/pagination' });
+    }
+    return completions;
+}
+function getRouteQueryCompletions(scheme, basePath, query, routes) {
+    const completions = [];
+    const parseResult = parseURIWithRoutes(`${scheme}://${basePath}`, routes);
+    if (!parseResult.ok || !isCollectionEntry(parseResult.route.entry))
+        return [];
+    const schemaRef = parseResult.route.entry.elementSchema;
+    let fieldTypes = {};
+    if ('_ref' in schemaRef) {
+        const schema = routes.schemaRegistry[schemaRef._ref];
+        if (schema) {
+            fieldTypes = extractFieldTypes(schema);
+        }
+    }
+    const params = query.split('&');
+    const lastParam = params[params.length - 1] || '';
+    // Standard params
+    if (!lastParam.includes('=') || lastParam === '') {
+        if ('sort'.startsWith(lastParam))
+            completions.push({ value: 'sort=', label: 'sort', description: 'Sort results' });
+        if ('limit'.startsWith(lastParam))
+            completions.push({ value: 'limit=', label: 'limit', description: 'Limit count' });
+        if ('offset'.startsWith(lastParam))
+            completions.push({ value: 'offset=', label: 'offset', description: 'Skip N' });
+        if ('expand'.startsWith(lastParam))
+            completions.push({ value: 'expand=', label: 'expand', description: 'Expand lazy props' });
+    }
+    // Property filters
+    if (!lastParam.includes('=') && !lastParam.includes('.')) {
+        for (const [key, type] of Object.entries(fieldTypes)) {
+            if (key.startsWith(lastParam)) {
+                completions.push({ value: `${key}=`, label: key, description: `Filter by ${key} (${type})` });
+            }
+        }
+    }
+    // Operator completion
+    const dotMatch = lastParam.match(/^(\w+)\.(\w*)$/);
+    if (dotMatch) {
+        const [, prop, opPartial] = dotMatch;
+        const fieldType = fieldTypes[prop];
+        const ops = fieldType ? validOperators[fieldType] : ['contains', 'startsWith', 'gt', 'lt'];
+        for (const op of ops) {
+            const displayOp = op === 'greaterThan' ? 'gt' : op === 'lessThan' ? 'lt' : op;
+            if (displayOp.startsWith(opPartial)) {
+                completions.push({ value: `${prop}.${displayOp}=`, label: displayOp, description: `${op} operator` });
+            }
+        }
+    }
+    // Sort completion
+    if (lastParam.startsWith('sort=')) {
+        const sortVal = lastParam.slice(5);
+        if (!sortVal.includes('.')) {
+            for (const key of Object.keys(fieldTypes)) {
+                if (key.startsWith(sortVal)) {
+                    completions.push({ value: `sort=${key}.`, label: key, description: `Sort by ${key}` });
+                }
+            }
+        }
+        else {
+            const [prop] = sortVal.split('.');
+            const dir = sortVal.split('.')[1] || '';
+            if ('asc'.startsWith(dir))
+                completions.push({ value: `sort=${prop}.asc`, label: 'asc', description: 'Ascending' });
+            if ('desc'.startsWith(dir))
+                completions.push({ value: `sort=${prop}.desc`, label: 'desc', description: 'Descending' });
+        }
+    }
+    return completions;
+}
+// ============================================================================
+// Exports
+// ============================================================================
+globalThis.compileRoutes = compileRoutes;
+globalThis.parseURIWithRoutes = parseURIWithRoutes;
+globalThis.getRouteCompletions = getRouteCompletions;
+globalThis.getRouteChildren = getRouteChildren;
+globalThis.validOperators = validOperators;
+/// <reference path="schema.ts" />
+/// <reference path="specifier.ts" />
+/// <reference path="runtime.ts" />
+/// <reference path="routes.ts" />
+const schemeRegistry = {};
+function registerScheme(scheme, root, schema, namedSchemas) {
+    schemeRegistry[scheme] = {
+        root,
+        schema,
+        routes: compileRoutes(schema, scheme, namedSchemas),
+    };
+}
+// Legacy accessor for completions (read-only)
+const schemeRoots = new Proxy({}, {
+    get: (_target, prop) => schemeRegistry[prop]?.root,
+    ownKeys: () => Object.keys(schemeRegistry),
+    getOwnPropertyDescriptor: (_target, prop) => schemeRegistry[prop] ? { configurable: true, enumerable: true } : undefined,
+});
+// ============================================================================
+// Route Table Access
+// ============================================================================
+function getRoutesForScheme(scheme) {
+    return schemeRegistry[scheme]?.routes;
+}
+function formatAvailableOptions(options, max = 10) {
+    if (options.length === 0)
+        return '';
+    const shown = options.slice(0, max);
+    const more = options.length > max ? `, ... (${options.length - max} more)` : '';
+    return ` Available: ${shown.join(', ')}${more}`;
+}
+// ============================================================================
+// Error Suggestion Helper (Route-Table Based)
+// ============================================================================
+function suggestCompletions(partial, max = 5) {
+    // Extract scheme
+    const schemeEnd = partial.indexOf('://');
+    if (schemeEnd === -1)
+        return '';
+    const scheme = partial.slice(0, schemeEnd);
+    const routes = getRoutesForScheme(scheme);
+    if (routes) {
+        // Use route-based completions
+        const completions = getRouteCompletions(partial, routes);
+        if (!completions.length)
+            return '';
+        return ` Did you mean: ${completions.slice(0, max).map(c => c.label || c.value).join(', ')}?`;
+    }
+    // Fall back to legacy completion probing
+    const completions = getCompletions(partial);
+    if (!completions.length)
+        return '';
+    return ` Did you mean: ${completions.slice(0, max).map(c => c.label || c.value).join(', ')}?`;
+}
+// ============================================================================
+// Query Parsing and Filter Encoding
+// ============================================================================
 function parseQuery(query) {
     const result = { filter: {} };
     for (const part of query.split('&')) {
@@ -598,13 +1199,11 @@ function parseQuery(query) {
             continue;
         const key = part.slice(0, eqIdx);
         const value = part.slice(eqIdx + 1);
-        // Handle sort parameter
         if (key === 'sort') {
             const [by, direction] = value.split('.');
             result.sort = { by, direction: direction || 'asc' };
             continue;
         }
-        // Handle pagination parameters
         if (key === 'limit') {
             result.pagination = result.pagination || {};
             result.pagination.limit = Number(value);
@@ -615,12 +1214,10 @@ function parseQuery(query) {
             result.pagination.offset = Number(value);
             continue;
         }
-        // Handle expand parameter (comma-separated list of properties)
         if (key === 'expand') {
             result.expand = value.split(',').map(s => decodeURIComponent(s.trim()));
             continue;
         }
-        // Handle filter parameters
         const dotIdx = key.lastIndexOf('.');
         if (dotIdx === -1) {
             result.filter[key] = { equals: decodeURIComponent(value) };
@@ -628,23 +1225,221 @@ function parseQuery(query) {
         else {
             const prop = key.slice(0, dotIdx);
             const op = key.slice(dotIdx + 1);
-            if (op === 'contains') {
+            if (op === 'contains')
                 result.filter[prop] = { contains: decodeURIComponent(value) };
-            }
-            else if (op === 'startsWith') {
+            else if (op === 'startsWith')
                 result.filter[prop] = { startsWith: decodeURIComponent(value) };
-            }
-            else if (op === 'gt') {
+            else if (op === 'gt')
                 result.filter[prop] = { greaterThan: Number(value) };
-            }
-            else if (op === 'lt') {
+            else if (op === 'lt')
                 result.filter[prop] = { lessThan: Number(value) };
-            }
         }
     }
     return result;
 }
-// Get completions for a partial URI - purely by inspecting live specifier objects
+function encodeFilter(filter) {
+    const parts = [];
+    for (const [key, predicate] of Object.entries(filter)) {
+        const pred = predicate;
+        if ('equals' in pred)
+            parts.push(`${key}=${encodeURIComponent(String(pred.equals))}`);
+        else if ('contains' in pred)
+            parts.push(`${key}.contains=${encodeURIComponent(pred.contains)}`);
+        else if ('startsWith' in pred)
+            parts.push(`${key}.startsWith=${encodeURIComponent(pred.startsWith)}`);
+        else if ('greaterThan' in pred)
+            parts.push(`${key}.gt=${pred.greaterThan}`);
+        else if ('lessThan' in pred)
+            parts.push(`${key}.lt=${pred.lessThan}`);
+    }
+    return parts.join('&');
+}
+// ============================================================================
+// URI Deserialization (Route-Table Based)
+// ============================================================================
+function specifierFromURI(uri) {
+    const schemeEnd = uri.indexOf('://');
+    if (schemeEnd === -1) {
+        return { ok: false, error: `Invalid URI (no scheme): ${uri}` };
+    }
+    const scheme = uri.slice(0, schemeEnd);
+    const registration = schemeRegistry[scheme];
+    if (!registration) {
+        const knownSchemes = Object.keys(schemeRegistry);
+        const suggestion = knownSchemes.length ? ` Known schemes: ${knownSchemes.join(', ')}` : '';
+        return { ok: false, error: `Unknown scheme: ${scheme}.${suggestion}` };
+    }
+    return specifierFromURIWithRoutes(uri, scheme, registration, registration.routes);
+}
+// Route-table based URI resolution
+function specifierFromURIWithRoutes(uri, scheme, registration, routes) {
+    // Parse and validate URI structure against route table
+    const parseResult = parseURIWithRoutes(uri, routes);
+    if (!parseResult.ok) {
+        // Format error with available options
+        const availableStr = formatAvailableOptions(parseResult.availableOptions);
+        return {
+            ok: false,
+            error: `Unknown segment '${parseResult.failedSegment}' at ${parseResult.pathSoFar}.${availableStr}`
+        };
+    }
+    // Query validation
+    if (!parseResult.queryValid && parseResult.queryError) {
+        return { ok: false, error: `Invalid query: ${parseResult.queryError}` };
+    }
+    // Now execute navigation using validated route info
+    let current = registration.root();
+    let resolved = `${scheme}://`;
+    // Split path for navigation
+    let rest = uri.slice(scheme.length + 3);
+    const queryIdx = rest.indexOf('?');
+    const query = queryIdx !== -1 ? rest.slice(queryIdx + 1) : undefined;
+    if (queryIdx !== -1)
+        rest = rest.slice(0, queryIdx);
+    // Navigate using route-guided path
+    let currentRoute = routes.root;
+    for (const segment of rest.split('/').filter(s => s)) {
+        const indexMatch = segment.match(/^(.+?)\[(-?\d+)\]$/);
+        const name = indexMatch ? indexMatch[1] : segment;
+        const index = indexMatch ? parseInt(indexMatch[2]) : undefined;
+        try {
+            // Get route children to determine navigation type
+            const children = isRootEntry(currentRoute.entry)
+                ? currentRoute.children
+                : getRouteChildren(currentRoute, routes);
+            const childRoute = children[name];
+            if (childRoute) {
+                // Navigate using route-guided navigation
+                const entry = childRoute.entry;
+                if (isVirtualEntry(entry)) {
+                    // Virtual navigation (standard mailboxes, settings, etc.)
+                    const newUri = resolved + (resolved.endsWith('://') ? '' : '/') + name;
+                    const jxaApp = Application('Mail');
+                    const targetSchema = routes.schemaRegistry[entry.targetSchema._ref];
+                    if (isVirtualPropEntry(entry)) {
+                        if (entry.accountScoped) {
+                            // Account-scoped mailbox - need special handling
+                            current = navigateAccountMailbox(current, entry, newUri);
+                        }
+                        else {
+                            // Navigation via JXA property
+                            const jxaProp = jxaApp[entry.jxaProperty];
+                            const jxaObj = typeof jxaProp === 'function' ? jxaProp() : jxaProp;
+                            current = createSchemaSpecifier(newUri, jxaObj, targetSchema, entry.targetSchema._ref);
+                        }
+                    }
+                    else {
+                        // useSelf: use the current context (e.g., app itself for settings)
+                        current = createSchemaSpecifier(newUri, jxaApp, targetSchema, entry.targetSchema._ref);
+                    }
+                    currentRoute = childRoute;
+                    resolved += (resolved.endsWith('://') ? '' : '/') + name;
+                }
+                else if (current[name] !== undefined) {
+                    // Direct property navigation
+                    current = current[name];
+                    currentRoute = childRoute;
+                    resolved += (resolved.endsWith('://') ? '' : '/') + name;
+                }
+                else {
+                    // Should not happen if route table is correct
+                    return { ok: false, error: `Route exists but navigation failed for '${name}' at ${resolved}` };
+                }
+            }
+            else if (isCollectionEntry(currentRoute.entry)) {
+                // Addressing into a collection element by name/id
+                if (current.byName) {
+                    current = current.byName(decodeURIComponent(name));
+                }
+                else if (current.byId) {
+                    current = current.byId(decodeURIComponent(name));
+                }
+                else {
+                    return { ok: false, error: `Cannot address collection by name/id at ${resolved}` };
+                }
+                resolved += (resolved.endsWith('://') ? '' : '/') + name;
+                // Stay at collection level for children lookup
+            }
+            else {
+                // No route match - should have been caught by parseURIWithRoutes
+                const availableStr = formatAvailableOptions(Object.keys(children));
+                return { ok: false, error: `Cannot navigate to '${name}' from ${resolved}.${availableStr}` };
+            }
+            // Handle index addressing
+            if (index !== undefined) {
+                if (!current.byIndex) {
+                    return { ok: false, error: `Cannot index into '${name}' at ${resolved}` };
+                }
+                current = current.byIndex(index);
+                resolved += `[${index}]`;
+            }
+        }
+        catch (error) {
+            return { ok: false, error: `Failed at '${segment}': ${error}` };
+        }
+    }
+    // Apply query parameters
+    if (query) {
+        try {
+            const { filter, sort, pagination, expand } = parseQuery(query);
+            if (Object.keys(filter).length > 0 && current.whose)
+                current = current.whose(filter);
+            if (sort && current.sortBy)
+                current = current.sortBy(sort);
+            if (pagination && current.paginate)
+                current = current.paginate(pagination);
+            if (expand?.length && current.expand)
+                current = current.expand(expand);
+        }
+        catch (error) {
+            return { ok: false, error: `Failed to apply query: ${error}` };
+        }
+    }
+    return { ok: true, value: current };
+}
+// Navigate to account-scoped mailbox
+function navigateAccountMailbox(parent, entry, uri) {
+    try {
+        const parentResult = parent.resolve();
+        if (!parentResult.ok) {
+            throw new Error('Failed to resolve parent account');
+        }
+        const accountId = parentResult.value.id;
+        if (!accountId) {
+            throw new Error('Account has no ID');
+        }
+        const jxa = Application('Mail');
+        const appMailbox = jxa[entry.jxaProperty]();
+        const accountMailbox = appMailbox.mailboxes().find((m) => {
+            try {
+                return m.account().id() === accountId;
+            }
+            catch {
+                return false;
+            }
+        });
+        if (!accountMailbox) {
+            throw new Error(`No ${entry.jxaProperty} mailbox found for account`);
+        }
+        return createSchemaSpecifier(uri, accountMailbox, MailboxSchema, 'Mailbox');
+    }
+    catch (error) {
+        throw new Error(`Failed to navigate to account mailbox: ${error}`);
+    }
+}
+/// <reference path="../framework/schema.ts" />
+/// <reference path="../framework/specifier.ts" />
+/// <reference path="../framework/runtime.ts" />
+/// <reference path="../framework/uri.ts" />
+/// <reference path="../framework/routes.ts" />
+// ============================================================================
+// URI Completions Support
+// Autocomplete functionality for partial URIs
+// Route-table based for fast, schema-driven completions
+// ============================================================================
+// ============================================================================
+// Main Completion Entry Point
+// ============================================================================
 function getCompletions(partial) {
     // Parse scheme
     const schemeMatch = partial.match(/^([^:]*)(:\/?\/?)?(.*)?$/);
@@ -659,497 +1454,372 @@ function getCompletions(partial) {
     }
     const scheme = schemePartial;
     const path = pathPart || '';
+    const routes = getRoutesForScheme(scheme);
+    if (!routes)
+        return [];
     // Check if we're in a query string
     const queryIdx = path.indexOf('?');
     if (queryIdx !== -1) {
-        return getQueryCompletions(scheme, path.slice(0, queryIdx), path.slice(queryIdx + 1));
+        return getRouteQueryCompletions(scheme, path.slice(0, queryIdx), path.slice(queryIdx + 1), routes);
     }
-    // Path completion
-    return getPathCompletions(scheme, path);
+    return getRouteBasedPathCompletions(scheme, path, routes);
 }
-function getPathCompletions(scheme, path) {
+// ============================================================================
+// Route-Table Based Path Completions
+// ============================================================================
+function getRouteBasedPathCompletions(scheme, path, routes) {
     const completions = [];
-    // Split path and find the partial segment being typed
+    // Split path to find partial segment
     const segments = path.split('/');
     const partialSegment = segments.pop() || '';
     const completePath = segments.join('/');
-    // Resolve the parent specifier
+    // Parse parent path to find current route node
     const parentUri = `${scheme}://${completePath}`;
-    const parentResult = specifierFromURI(parentUri);
-    if (!parentResult.ok)
+    const parseResult = parseURIWithRoutes(parentUri, routes);
+    if (!parseResult.ok)
         return [];
-    const parent = parentResult.value;
-    // Check if partial matches a property exactly - if so, navigate into it
-    if (partialSegment && parent[partialSegment] !== undefined) {
-        const child = parent[partialSegment];
-        // If it's a collection, suggest addressing
-        if (isCollection(child)) {
-            return getCollectionCompletions(child, '');
+    const currentNode = parseResult.route;
+    // Get children from route table
+    const children = isRootEntry(currentNode.entry)
+        ? currentNode.children
+        : getRouteChildren(currentNode, routes);
+    // Add matching route children
+    for (const [name, node] of Object.entries(children)) {
+        if (!name.toLowerCase().startsWith(partialSegment.toLowerCase()))
+            continue;
+        const entry = node.entry;
+        let description;
+        let suffix = '';
+        if (isCollectionEntry(entry)) {
+            suffix = '/';
+            description = 'Collection';
         }
-        // If it's a navigable specifier, suggest its properties
-        if (child._isSpecifier) {
-            return getPropertyCompletions(child, '');
+        else if (isVirtualPropEntry(entry)) {
+            suffix = '/';
+            description = entry.accountScoped ? 'Account mailbox' : 'Mailbox';
         }
+        else if (isVirtualCtxEntry(entry)) {
+            suffix = '/';
+            description = 'Context';
+        }
+        else if (isPropertyEntry(entry)) {
+            description = `${entry.valueType} property`;
+            if (entry.lazy)
+                description += ' (lazy)';
+            if (entry.rw)
+                description += ' (rw)';
+        }
+        else if (isComputedEntry(entry)) {
+            description = 'Computed property';
+        }
+        else {
+            description = 'Entry';
+        }
+        completions.push({
+            value: name + suffix,
+            label: name,
+            description,
+        });
     }
-    // Check if parent is a collection - suggest addressing
-    if (isCollection(parent)) {
-        return getCollectionCompletions(parent, partialSegment);
-    }
-    // Otherwise suggest properties matching partial
-    return getPropertyCompletions(parent, partialSegment);
-}
-function isCollection(obj) {
-    return obj && (typeof obj.byName === 'function' || typeof obj.byIndex === 'function' || typeof obj.byId === 'function');
-}
-function getCollectionCompletions(collection, partial) {
-    const completions = [];
-    // Favor name-based addressing - resolve and get actual names
-    if (typeof collection.byName === 'function') {
-        try {
-            const resolved = collection.resolve();
-            if (resolved.ok && Array.isArray(resolved.value)) {
-                for (const item of resolved.value.slice(0, 10)) {
-                    const name = item.name;
-                    if (name && String(name).toLowerCase().startsWith(partial.toLowerCase())) {
-                        completions.push({
-                            value: encodeURIComponent(String(name)),
-                            label: String(name),
-                            description: 'By name'
-                        });
+    // If current node is a collection, add addressing options and real item names
+    if (isCollectionEntry(currentNode.entry)) {
+        const collEntry = currentNode.entry;
+        // Add real names from resolved collection (if accessible)
+        if (collEntry.addressing.includes('name') || collEntry.addressing.includes('id')) {
+            try {
+                const resolved = specifierFromURI(parentUri);
+                if (resolved.ok && typeof resolved.value.resolve === 'function') {
+                    const items = resolved.value.resolve();
+                    if (items.ok && Array.isArray(items.value)) {
+                        for (const item of items.value.slice(0, 10)) {
+                            const itemName = item.name;
+                            if (itemName && String(itemName).toLowerCase().startsWith(partialSegment.toLowerCase())) {
+                                completions.push({
+                                    value: encodeURIComponent(String(itemName)),
+                                    label: String(itemName),
+                                    description: 'By name',
+                                });
+                            }
+                        }
                     }
                 }
             }
+            catch { /* ignore resolution errors */ }
         }
-        catch { /* ignore */ }
-    }
-    // ID addressing if no name addressing
-    if (typeof collection.byId === 'function' && typeof collection.byName !== 'function') {
-        try {
-            const resolved = collection.resolve();
-            if (resolved.ok && Array.isArray(resolved.value)) {
-                for (const item of resolved.value.slice(0, 10)) {
-                    const id = item.id;
-                    if (id && String(id).startsWith(partial)) {
-                        completions.push({
-                            value: String(id),
-                            label: String(id),
-                            description: 'By ID'
-                        });
-                    }
-                }
+        // Add index notation
+        if (collEntry.addressing.includes('index')) {
+            if (partialSegment.match(/^\[?\d*\]?$/) || completions.length === 0) {
+                completions.push({ value: '[0]', label: '[index]', description: 'Access by index' });
             }
         }
-        catch { /* ignore */ }
-    }
-    // Index addressing - show if typing bracket or no other completions
-    if (typeof collection.byIndex === 'function') {
-        if (partial.match(/^\[?\d*\]?$/) || completions.length === 0) {
-            completions.push({ value: '[0]', label: '[index]', description: 'Access by index' });
-        }
-    }
-    // Query option
-    if (partial === '' || partial === '?') {
-        completions.push({ value: '?', label: '?', description: 'Add filter/sort/pagination' });
-    }
-    return completions;
-}
-function getPropertyCompletions(specifier, partial) {
-    const completions = [];
-    // Get all enumerable properties
-    for (const key of Object.keys(specifier)) {
-        if (key.startsWith('_') || key === 'uri' || key === 'resolve')
-            continue;
-        if (!key.toLowerCase().startsWith(partial.toLowerCase()))
-            continue;
-        const value = specifier[key];
-        if (typeof value === 'function')
-            continue;
-        if (isCollection(value)) {
-            completions.push({ value: `${key}/`, label: key, description: 'Collection' });
-        }
-        else if (value && value._isSpecifier && hasNavigableChildren(value)) {
-            // Only mark as navigable if it has child properties beyond uri/resolve
-            completions.push({ value: `${key}/`, label: key, description: 'Navigable' });
-        }
-        else {
-            completions.push({ value: key, label: key, description: 'Property' });
-        }
-    }
-    // Add completions from hooks
-    for (const hook of completionHooks) {
-        try {
-            const extra = hook(specifier, partial);
-            for (const c of extra) {
-                if (c.label && c.label.toLowerCase().startsWith(partial.toLowerCase())) {
-                    completions.push(c);
-                }
-            }
-        }
-        catch { /* ignore */ }
-    }
-    return completions;
-}
-function hasNavigableChildren(specifier) {
-    for (const key of Object.keys(specifier)) {
-        if (key.startsWith('_') || key === 'uri' || key === 'resolve')
-            continue;
-        if (typeof specifier[key] !== 'function')
-            return true;
-    }
-    return false;
-}
-function getQueryCompletions(scheme, basePath, query) {
-    const completions = [];
-    // Resolve to get the collection and a sample element
-    const spec = specifierFromURI(`${scheme}://${basePath}`);
-    if (!spec.ok || !isCollection(spec.value))
-        return [];
-    const collection = spec.value;
-    // Parse current query
-    const params = query.split('&');
-    const lastParam = params[params.length - 1] || '';
-    // Standard query params
-    if (!lastParam.includes('=') || lastParam === '') {
-        if ('sort'.startsWith(lastParam))
-            completions.push({ value: 'sort=', label: 'sort', description: 'Sort results' });
-        if ('limit'.startsWith(lastParam))
-            completions.push({ value: 'limit=', label: 'limit', description: 'Limit count' });
-        if ('offset'.startsWith(lastParam))
-            completions.push({ value: 'offset=', label: 'offset', description: 'Skip N' });
-        if ('expand'.startsWith(lastParam))
-            completions.push({ value: 'expand=', label: 'expand', description: 'Expand lazy props' });
-    }
-    // Get a sample element to find filterable properties
-    let sampleElement = null;
-    try {
-        const resolved = collection.resolve();
-        if (resolved.ok && resolved.value.length > 0) {
-            sampleElement = resolved.value[0];
-        }
-    }
-    catch { /* ignore */ }
-    if (!sampleElement)
-        return completions;
-    // Property name completion for filters
-    if (!lastParam.includes('=') && !lastParam.includes('.')) {
-        for (const key of Object.keys(sampleElement)) {
-            if (key.startsWith('_'))
-                continue;
-            const val = sampleElement[key];
-            if (typeof val !== 'function' && !isCollection(val) && !(val && val._isSpecifier)) {
-                if (key.startsWith(lastParam)) {
-                    completions.push({ value: `${key}=`, label: key, description: `Filter by ${key}` });
-                }
-            }
-        }
-    }
-    // Operator completion (property.xxx)
-    const dotMatch = lastParam.match(/^(\w+)\.(\w*)$/);
-    if (dotMatch) {
-        const [, , opPartial] = dotMatch;
-        const operators = ['contains', 'startsWith', 'gt', 'lt'];
-        for (const op of operators) {
-            if (op.startsWith(opPartial)) {
-                completions.push({ value: `${dotMatch[1]}.${op}=`, label: op, description: `${op} operator` });
-            }
-        }
-    }
-    // Sort value completion
-    if (lastParam.startsWith('sort=')) {
-        const sortVal = lastParam.slice(5);
-        if (!sortVal.includes('.')) {
-            for (const key of Object.keys(sampleElement)) {
-                if (key.startsWith('_'))
-                    continue;
-                const val = sampleElement[key];
-                if (typeof val !== 'function' && !isCollection(val) && key.startsWith(sortVal)) {
-                    completions.push({ value: `sort=${key}.`, label: key, description: `Sort by ${key}` });
-                }
-            }
-        }
-        else {
-            const [prop] = sortVal.split('.');
-            const dir = sortVal.split('.')[1] || '';
-            if ('asc'.startsWith(dir))
-                completions.push({ value: `sort=${prop}.asc`, label: 'asc', description: 'Ascending' });
-            if ('desc'.startsWith(dir))
-                completions.push({ value: `sort=${prop}.desc`, label: 'desc', description: 'Descending' });
-        }
-    }
-    // Expand value completion - find lazy specifier properties
-    if (lastParam.startsWith('expand=')) {
-        const expandVal = lastParam.slice(7);
-        for (const key of Object.keys(sampleElement)) {
-            if (key.startsWith('_'))
-                continue;
-            const val = sampleElement[key];
-            if (val && val._isSpecifier && key.startsWith(expandVal)) {
-                completions.push({ value: `expand=${key}`, label: key, description: 'Expand lazy property' });
-            }
+        // Add query option
+        if (partialSegment === '' || partialSegment === '?') {
+            completions.push({ value: '?', label: '?', description: 'Add filter/sort/pagination' });
         }
     }
     return completions;
 }
 /// <reference path="./types/jxa.d.ts" />
 /// <reference path="./types/mail-app.d.ts" />
+/// <reference path="./framework/schema.ts" />
+/// <reference path="./framework/specifier.ts" />
+/// <reference path="./framework/runtime.ts" />
+/// <reference path="./framework/uri.ts" />
+/// <reference path="./framework-extras/completions.ts" />
 function parseEmailAddress(raw) {
     if (!raw)
         return { name: '', address: '' };
-    // Format: "Name" <email@domain.com> or Name <email@domain.com> or just email@domain.com
     const match = raw.match(/^(?:"?([^"<]*)"?\s*)?<?([^>]+)>?$/);
     if (match) {
         const name = (match[1] || '').trim();
         const address = (match[2] || '').trim();
-        // If no name but we have something that looks like an email, check if address has a name component
-        if (!name && address.includes('@')) {
+        if (!name && address.includes('@'))
             return { name: '', address };
-        }
-        // If the "address" doesn't have @, it might just be a name
-        if (!address.includes('@')) {
+        if (!address.includes('@'))
             return { name: address, address: '' };
-        }
         return { name, address };
     }
-    // Fallback: treat the whole thing as the address
     return { name: '', address: raw.trim() };
 }
 // ============================================================================
-// Apple Mail Schema Definitions
+// Schema Definitions - Using New Simplified Syntax
 // ============================================================================
-const RecipientBase = {
-    name: accessor('name'),
-    address: accessor('address'),
+const SettingsSchema = {
+    // App info
+    name: t.string,
+    version: t.string,
+    frontmost: t.boolean,
+    // Behavior
+    alwaysBccMyself: t.boolean,
+    alwaysCcMyself: t.boolean,
+    downloadHtmlAttachments: t.boolean,
+    fetchInterval: t.number,
+    expandGroupAddresses: t.boolean,
+    // Composing
+    defaultMessageFormat: t.string,
+    chooseSignatureWhenComposing: t.boolean,
+    quoteOriginalMessage: t.boolean,
+    sameReplyFormat: t.boolean,
+    includeAllOriginalMessageText: t.boolean,
+    // Display
+    highlightSelectedConversation: t.boolean,
+    colorQuotedText: t.boolean,
+    levelOneQuotingColor: t.string,
+    levelTwoQuotingColor: t.string,
+    levelThreeQuotingColor: t.string,
+    // Fonts
+    messageFont: t.string,
+    messageFontSize: t.number,
+    messageListFont: t.string,
+    messageListFontSize: t.number,
+    useFixedWidthFont: t.boolean,
+    fixedWidthFont: t.string,
+    fixedWidthFontSize: t.number,
+    // Sounds
+    newMailSound: t.string,
+    shouldPlayOtherMailSounds: t.boolean,
+    // Spelling
+    checkSpellingWhileTyping: t.boolean,
 };
-const AttachmentBase = {
-    id: accessor('id'),
-    name: accessor('name'),
-    fileSize: accessor('fileSize'),
+const RuleConditionSchema = {
+    header: t.string,
+    qualifier: t.string,
+    ruleType: t.string,
+    expression: t.string,
 };
-const MessageBase = {
-    id: accessor('id'),
-    messageId: accessor('messageId'),
-    subject: accessor('subject'),
+const RuleSchema = {
+    name: t.string,
+    enabled: t.boolean,
+    allConditionsMustBeMet: t.boolean,
+    deleteMessage: t.boolean,
+    markRead: t.boolean,
+    markFlagged: t.boolean,
+    markFlagIndex: t.number,
+    stopEvaluatingRules: t.boolean,
+    forwardMessage: t.string,
+    redirectMessage: t.string,
+    replyText: t.string,
+    playSound: t.string,
+    highlightTextUsingColor: t.string,
+    copyMessage: computed((jxa) => {
+        try {
+            const mailbox = jxa.copyMessage();
+            return mailbox ? mailbox.name() : null;
+        }
+        catch {
+            return null;
+        }
+    }),
+    moveMessage: computed((jxa) => {
+        try {
+            const mailbox = jxa.moveMessage();
+            return mailbox ? mailbox.name() : null;
+        }
+        catch {
+            return null;
+        }
+    }),
+    ruleConditions: collection(RuleConditionSchema, [by.index]),
+};
+const SignatureSchema = {
+    name: t.string,
+    content: lazy(t.string),
+};
+const RecipientSchema = {
+    name: t.string,
+    address: t.string,
+};
+const AttachmentSchema = {
+    id: t.string,
+    name: t.string,
+    fileSize: t.number,
+};
+const MessageSchema = {
+    id: t.number,
+    messageId: t.string,
+    subject: t.string,
     sender: computed((jxa) => parseEmailAddress(str(jxa.sender()))),
     replyTo: computed((jxa) => parseEmailAddress(str(jxa.replyTo()))),
-    dateSent: accessor('dateSent'),
-    dateReceived: accessor('dateReceived'),
-    content: lazyAccessor('content'), // lazy - expensive to fetch
-    readStatus: accessor('readStatus'),
-    flaggedStatus: accessor('flaggedStatus'),
-    junkMailStatus: accessor('junkMailStatus'),
-    messageSize: accessor('messageSize'),
-    toRecipients: collection('toRecipients', RecipientBase, ['name', 'index']),
-    ccRecipients: collection('ccRecipients', RecipientBase, ['name', 'index']),
-    bccRecipients: collection('bccRecipients', RecipientBase, ['name', 'index']),
-    attachments: collection('mailAttachments', AttachmentBase, ['name', 'index', 'id']),
+    dateSent: t.date,
+    dateReceived: t.date,
+    content: lazy(t.string),
+    readStatus: t.boolean,
+    flaggedStatus: t.boolean,
+    junkMailStatus: t.boolean,
+    messageSize: t.number,
+    toRecipients: collection(RecipientSchema, [by.name, by.index]),
+    ccRecipients: collection(RecipientSchema, [by.name, by.index]),
+    bccRecipients: collection(RecipientSchema, [by.name, by.index]),
+    attachments: jxa(collection(AttachmentSchema, [by.name, by.index, by.id]), 'mailAttachments'),
 };
-const MailboxBase = {
-    name: accessor('name'),
-    unreadCount: accessor('unreadCount'),
-    messages: collection('messages', MessageBase, ['index', 'id'])
+const MailboxSchema = {
+    name: t.string,
+    unreadCount: t.number,
+    messages: collection(MessageSchema, [by.index, by.id]),
 };
-// Self-referential: mailboxes contain mailboxes
-MailboxBase.mailboxes = collection('mailboxes', MailboxBase, ['name', 'index']);
-const AccountBase = {
-    id: accessor('id'),
-    name: accessor('name'),
-    fullName: accessor('fullName'),
-    emailAddresses: accessor('emailAddresses'),
-    mailboxes: collection('mailboxes', MailboxBase, ['name', 'index'])
+MailboxSchema.mailboxes = collection(MailboxSchema, [by.name, by.index]);
+const AccountSchema = {
+    id: t.string,
+    name: t.string,
+    fullName: t.string,
+    emailAddresses: t.array(t.string),
+    mailboxes: collection(MailboxSchema, [by.name, by.index]),
+    // Virtual mailboxes - declarative instead of hooks
+    inbox: accountScopedMailbox('inbox'),
+    sent: accountScopedMailbox('sentMailbox'),
+    drafts: accountScopedMailbox('draftsMailbox'),
+    junk: accountScopedMailbox('junkMailbox'),
+    trash: accountScopedMailbox('trashMailbox'),
 };
-// Standard mailbox schemas (same structure as Mailbox but different accessors)
-const StandardMailboxBase = {
-    name: accessor('name'),
-    unreadCount: accessor('unreadCount'),
-    messages: collection('messages', MessageBase, ['index', 'id'])
+const StandardMailboxSchema = {
+    name: t.string,
+    unreadCount: t.number,
+    messages: collection(MessageSchema, [by.index, by.id]),
 };
-const MailAppBase = {
-    accounts: collection('accounts', AccountBase, ['name', 'index', 'id']),
-    // Standard mailboxes (aggregate across all accounts)
-    inbox: { _standardMailbox: true, _jxaName: 'inbox' },
-    drafts: { _standardMailbox: true, _jxaName: 'draftsMailbox' },
-    junk: { _standardMailbox: true, _jxaName: 'junkMailbox' },
-    outbox: { _standardMailbox: true, _jxaName: 'outbox' },
-    sent: { _standardMailbox: true, _jxaName: 'sentMailbox' },
-    trash: { _standardMailbox: true, _jxaName: 'trashMailbox' }
+const MailAppSchema = {
+    accounts: collection(AccountSchema, [by.name, by.index, by.id]),
+    rules: collection(RuleSchema, [by.name, by.index]),
+    signatures: collection(SignatureSchema, [by.name, by.index]),
+    inbox: standardMailbox('inbox'),
+    drafts: standardMailbox('draftsMailbox'),
+    junk: standardMailbox('junkMailbox'),
+    outbox: standardMailbox('outbox'),
+    sent: standardMailbox('sentMailbox'),
+    trash: standardMailbox('trashMailbox'),
+    settings: namespace(SettingsSchema),
 };
 // ============================================================================
-// Create Derived Types
+// Derived Classes
 // ============================================================================
-const Recipient = createDerived(RecipientBase, 'Recipient');
-const Attachment = createDerived(AttachmentBase, 'Attachment');
-const Message = createDerived(MessageBase, 'Message');
-const Mailbox = createDerived(MailboxBase, 'Mailbox');
-const Account = createDerived(AccountBase, 'Account');
+const Settings = createDerived(SettingsSchema, 'Settings');
+const RuleCondition = createDerived(RuleConditionSchema, 'RuleCondition');
+const Rule = createDerived(RuleSchema, 'Rule');
+const Signature = createDerived(SignatureSchema, 'Signature');
+const Recipient = createDerived(RecipientSchema, 'Recipient');
+const Attachment = createDerived(AttachmentSchema, 'Attachment');
+const Message = createDerived(MessageSchema, 'Message');
+const Mailbox = createDerived(MailboxSchema, 'Mailbox');
+const Account = createDerived(AccountSchema, 'Account');
+const MailApp = createDerived(MailAppSchema, 'Mail');
+const StandardMailbox = createDerived(StandardMailboxSchema, 'StandardMailbox');
+// ============================================================================
+// Specifier Helpers
+// ============================================================================
+function createSchemaSpecifier(uri, jxa, schema, typeName) {
+    const DerivedClass = createDerived(schema, typeName);
+    const spec = {
+        _isSpecifier: true, uri,
+        resolve: () => tryResolve(() => DerivedClass.fromJXA(jxa, uri), uri),
+        fix: () => ({ ok: true, value: spec }),
+    };
+    for (const [key, descriptor] of Object.entries(schema)) {
+        const jxaName = getJxaName(descriptor, key);
+        if (descriptor && '_t' in descriptor) {
+            Object.defineProperty(spec, key, {
+                get() { return scalarSpec(`${uri}/${key}`, () => jxa[jxaName]() ?? ''); },
+                enumerable: true
+            });
+        }
+        else if (descriptor && '_coll' in descriptor) {
+            const desc = descriptor;
+            Object.defineProperty(spec, key, {
+                get() { return createCollSpec(`${uri}/${key}`, jxa[jxaName], desc._schema, getAddressingModes(desc._addressing), `${typeName}_${key}`, desc._opts); },
+                enumerable: true
+            });
+        }
+    }
+    return spec;
+}
 // ============================================================================
 // Entry Point
 // ============================================================================
-const MailApp = createDerived(MailAppBase, 'Mail');
-// Create derived type for standard mailboxes
-const StandardMailbox = createDerived(StandardMailboxBase, 'StandardMailbox');
-// Helper to create standard mailbox specifier
-function createStandardMailboxSpecifier(uri, jxaMailbox) {
-    const spec = {
-        _isSpecifier: true,
-        uri,
-        resolve() {
-            return tryResolve(() => StandardMailbox.fromJXA(jxaMailbox, uri), uri);
-        }
-    };
-    // Add properties from StandardMailboxBase
-    for (const [key, descriptor] of Object.entries(StandardMailboxBase)) {
-        if ('_accessor' in descriptor) {
-            Object.defineProperty(spec, key, {
-                get() {
-                    const jxaName = descriptor._jxaName;
-                    return scalarSpecifier(`${uri}/${key}`, () => {
-                        const value = jxaMailbox[jxaName]();
-                        return value == null ? '' : value;
-                    });
-                },
-                enumerable: true
-            });
-        }
-        else if ('_collection' in descriptor) {
-            Object.defineProperty(spec, key, {
-                get() {
-                    const desc = descriptor;
-                    return createCollectionSpecifier(`${uri}/${key}`, jxaMailbox[desc._jxaName], desc._elementBase, desc._addressing, 'StandardMailbox_' + key);
-                },
-                enumerable: true
-            });
-        }
-    }
-    return spec;
-}
-// Lazily initialized app specifier
 let _mailApp = null;
 function getMailApp() {
-    if (!_mailApp) {
-        const jxa = Application('Mail');
-        const app = MailApp.fromJXA(jxa, 'mail://');
-        // Add specifier-like properties
-        app.uri = 'mail://';
-        app._isSpecifier = true;
-        app.resolve = () => ({ ok: true, value: app });
-        // Add standard mailbox specifiers
-        const standardMailboxes = [
-            { name: 'inbox', jxaName: 'inbox' },
-            { name: 'drafts', jxaName: 'draftsMailbox' },
-            { name: 'junk', jxaName: 'junkMailbox' },
-            { name: 'outbox', jxaName: 'outbox' },
-            { name: 'sent', jxaName: 'sentMailbox' },
-            { name: 'trash', jxaName: 'trashMailbox' }
-        ];
-        for (const { name, jxaName } of standardMailboxes) {
-            Object.defineProperty(app, name, {
-                get() {
-                    return createStandardMailboxSpecifier(`mail://${name}`, jxa[jxaName]);
-                },
-                enumerable: true
-            });
-        }
-        _mailApp = app;
+    if (_mailApp)
+        return _mailApp;
+    const jxa = Application('Mail');
+    const app = MailApp.fromJXA(jxa, 'mail://');
+    app.uri = 'mail://';
+    app._isSpecifier = true;
+    app.resolve = () => ({ ok: true, value: app });
+    // Standard mailboxes
+    const standardMailboxes = [
+        { name: 'inbox', jxaName: 'inbox' },
+        { name: 'drafts', jxaName: 'draftsMailbox' },
+        { name: 'junk', jxaName: 'junkMailbox' },
+        { name: 'outbox', jxaName: 'outbox' },
+        { name: 'sent', jxaName: 'sentMailbox' },
+        { name: 'trash', jxaName: 'trashMailbox' },
+    ];
+    for (const { name, jxaName } of standardMailboxes) {
+        Object.defineProperty(app, name, {
+            get() { return createSchemaSpecifier(`mail://${name}`, jxa[jxaName], StandardMailboxSchema, 'StandardMailbox'); },
+            enumerable: true
+        });
     }
+    // Settings
+    Object.defineProperty(app, 'settings', {
+        get() { return createSchemaSpecifier('mail://settings', jxa, SettingsSchema, 'Settings'); },
+        enumerable: true
+    });
+    _mailApp = app;
     return _mailApp;
 }
-// Register mail:// scheme
-registerScheme('mail', getMailApp);
-// Standard mailbox aliases for accounts
-// Handles mail://accounts[X]/inbox, /sent, /drafts, /junk, /trash
-const accountStandardMailboxes = {
-    inbox: 'inbox',
-    sent: 'sentMailbox',
-    drafts: 'draftsMailbox',
-    junk: 'junkMailbox',
-    trash: 'trashMailbox'
-};
-// Completion hook for account standard mailboxes
-registerCompletionHook((specifier, partial) => {
-    // Only applies to account specifiers (check if URI matches accounts[X])
-    if (!specifier || !specifier.uri || !specifier.uri.match(/^mail:\/\/accounts\[\d+\]$/)) {
-        return [];
-    }
-    return Object.keys(accountStandardMailboxes)
-        .filter(name => name.startsWith(partial.toLowerCase()))
-        .map(name => ({
-        value: `${name}/`,
-        label: name,
-        description: 'Standard mailbox'
-    }));
+registerScheme('mail', getMailApp, MailAppSchema, {
+    StandardMailbox: StandardMailboxSchema,
+    Mailbox: MailboxSchema,
+    Settings: SettingsSchema,
+    Account: AccountSchema,
+    Message: MessageSchema,
+    Recipient: RecipientSchema,
+    Attachment: AttachmentSchema,
+    Rule: RuleSchema,
+    RuleCondition: RuleConditionSchema,
+    Signature: SignatureSchema,
 });
-registerNavigationHook((parent, name, uri) => {
-    // Check if this is an account specifier navigating to a standard mailbox
-    const jxaAppName = accountStandardMailboxes[name];
-    if (!jxaAppName)
-        return undefined;
-    // Check if parent has an id (accounts have id)
-    if (!parent || !parent._isSpecifier)
-        return undefined;
-    // Try to get the account's JXA object and find its standard mailbox
-    try {
-        const parentResult = parent.resolve();
-        if (!parentResult.ok)
-            return undefined;
-        const accountId = parentResult.value.id;
-        if (!accountId)
-            return undefined;
-        // Get the app-level standard mailbox and find the one for this account
-        const jxa = Application('Mail');
-        const appMailbox = jxa[jxaAppName]();
-        const accountMailbox = appMailbox.mailboxes().find((m) => {
-            try {
-                return m.account().id() === accountId;
-            }
-            catch {
-                return false;
-            }
-        });
-        if (!accountMailbox)
-            return undefined;
-        // Create a mailbox specifier for it
-        return createMailboxSpecifier(uri, accountMailbox);
-    }
-    catch {
-        return undefined;
-    }
-});
-// Helper to create a mailbox specifier for a JXA mailbox
-function createMailboxSpecifier(uri, jxaMailbox) {
-    const spec = {
-        _isSpecifier: true,
-        uri,
-        resolve() {
-            return tryResolve(() => Mailbox.fromJXA(jxaMailbox, uri), uri);
-        }
-    };
-    // Add properties from MailboxBase
-    for (const [key, descriptor] of Object.entries(MailboxBase)) {
-        if ('_accessor' in descriptor) {
-            Object.defineProperty(spec, key, {
-                get() {
-                    const jxaName = descriptor._jxaName;
-                    return scalarSpecifier(`${uri}/${key}`, () => {
-                        const value = jxaMailbox[jxaName]();
-                        return value == null ? '' : value;
-                    });
-                },
-                enumerable: true
-            });
-        }
-        else if ('_collection' in descriptor) {
-            Object.defineProperty(spec, key, {
-                get() {
-                    const desc = descriptor;
-                    return createCollectionSpecifier(`${uri}/${key}`, jxaMailbox[desc._jxaName], desc._elementBase, desc._addressing, 'Mailbox_' + key);
-                },
-                enumerable: true
-            });
-        }
-    }
-    return spec;
-}
-// Export for JXA
+// ============================================================================
+// Exports
+// ============================================================================
 globalThis.specifierFromURI = specifierFromURI;
 globalThis.getCompletions = getCompletions;
 /// <reference path="./types/mcp.d.ts" />
@@ -1159,11 +1829,13 @@ globalThis.getCompletions = getCompletions;
 function readResource(uri) {
     const spec = specifierFromURI(uri);
     if (!spec.ok) {
-        return { mimeType: 'text/plain', text: spec.error };
+        // Return null to trigger JSON-RPC error response
+        return null;
     }
     const result = spec.value.resolve();
     if (!result.ok) {
-        return { mimeType: 'text/plain', text: result.error };
+        // Return null to trigger JSON-RPC error response
+        return null;
     }
     // Try to get a stable reference URI via fix()
     let fixedUri;
@@ -1187,7 +1859,11 @@ function listResources() {
         { uri: 'mail://junk', name: 'Junk', description: 'Combined junk/spam from all accounts' },
         { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
         // Accounts
-        { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' }
+        { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' },
+        // Rules, Signatures, Settings
+        { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
+        { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' },
+        { uri: 'mail://settings', name: 'Settings', description: 'Mail.app preferences' }
     ];
     const spec = specifierFromURI('mail://accounts');
     if (spec.ok) {
@@ -1389,6 +2065,54 @@ const resourceTemplates = [
         uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/attachments',
         name: 'Attachments',
         description: 'Message attachments. Returns: id, name, fileSize'
+    },
+    // --- Rules ---
+    {
+        uriTemplate: 'mail://rules',
+        name: 'All Rules',
+        description: 'List all mail filtering rules'
+    },
+    {
+        uriTemplate: 'mail://rules[{index}]',
+        name: 'Rule by Index',
+        description: 'Single rule. Returns: name, enabled, conditions, actions'
+    },
+    {
+        uriTemplate: 'mail://rules/{name}',
+        name: 'Rule by Name',
+        description: 'Single rule by name'
+    },
+    {
+        uriTemplate: 'mail://rules[{index}]/ruleConditions',
+        name: 'Rule Conditions',
+        description: 'Conditions for a rule. Returns: header, qualifier, ruleType, expression'
+    },
+    // --- Signatures ---
+    {
+        uriTemplate: 'mail://signatures',
+        name: 'All Signatures',
+        description: 'List all email signatures'
+    },
+    {
+        uriTemplate: 'mail://signatures[{index}]',
+        name: 'Signature by Index',
+        description: 'Single signature by position'
+    },
+    {
+        uriTemplate: 'mail://signatures/{name}',
+        name: 'Signature by Name',
+        description: 'Single signature by name. Returns: name, content (lazy)'
+    },
+    // --- Settings ---
+    {
+        uriTemplate: 'mail://settings',
+        name: 'Settings',
+        description: 'Mail.app preferences: fonts, colors, behavior, composing options'
+    },
+    {
+        uriTemplate: 'mail://settings/{property}',
+        name: 'Setting Property',
+        description: 'Individual setting value (e.g., mail://settings/fetchInterval)'
     }
 ];
 // Export for JXA

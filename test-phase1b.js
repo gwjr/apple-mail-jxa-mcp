@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Phase 1B Test: Core infrastructure verification
-// Tests basic MCP protocol with minimal resource handlers
+// Tests basic MCP protocol with resource handlers
 
 const { spawn } = require('child_process');
 const path = require('path');
@@ -38,7 +38,7 @@ class MCPTestClient {
             });
 
             this.proc.stderr.on('data', (data) => {
-                process.stderr.write(data);
+                if (process.env.DEBUG) process.stderr.write(data);
             });
 
             this.proc.on('error', reject);
@@ -120,23 +120,31 @@ async function runTests() {
             failed++;
         }
         const resourceUris = listResult.resources.map(r => r.uri);
-        if (resourceUris.includes('mail://properties')) {
-            console.log('  ✓ mail://properties in list');
+        // Check for new URI scheme
+        if (resourceUris.includes('mail://inbox')) {
+            console.log('  ✓ mail://inbox in list');
             passed++;
         } else {
-            console.log('  ✗ mail://properties not in list');
+            console.log('  ✗ mail://inbox not in list');
             failed++;
         }
-        console.log(`  Resources found: ${resourceUris.join(', ')}`);
+        if (resourceUris.includes('mail://accounts')) {
+            console.log('  ✓ mail://accounts in list');
+            passed++;
+        } else {
+            console.log('  ✗ mail://accounts not in list');
+            failed++;
+        }
+        console.log(`  Resources found: ${resourceUris.slice(0, 10).join(', ')}${resourceUris.length > 10 ? '...' : ''}`);
 
-        // Test 3: Read mail://properties
-        console.log('\nTest 3: Read mail://properties');
-        const propsResult = await client.call('resources/read', { uri: 'mail://properties' });
-        if (propsResult.contents && propsResult.contents[0]) {
+        // Test 3: Read mail://settings (app properties)
+        console.log('\nTest 3: Read mail://settings');
+        const settingsResult = await client.call('resources/read', { uri: 'mail://settings' });
+        if (settingsResult.contents && settingsResult.contents[0]) {
             console.log('  ✓ Got contents');
             passed++;
-            const content = JSON.parse(propsResult.contents[0].text);
-            console.log(`  Content: ${JSON.stringify(content)}`);
+            const content = JSON.parse(settingsResult.contents[0].text);
+            console.log(`  Content keys: ${Object.keys(content).slice(0, 5).join(', ')}...`);
         } else {
             console.log('  ✗ No contents');
             failed++;
@@ -149,20 +157,20 @@ async function runTests() {
             console.log('  ✓ Got rules content');
             passed++;
             const content = JSON.parse(rulesResult.contents[0].text);
-            console.log(`  Content: ${JSON.stringify(content)}`);
+            console.log(`  Rules count: ${Array.isArray(content) ? content.length : 'N/A'}`);
         } else {
             console.log('  ✗ No rules content');
             failed++;
         }
 
-        // Test 5: Read mail://rules/0 (individual rule)
-        console.log('\nTest 5: Read mail://rules/0');
-        const rule0Result = await client.call('resources/read', { uri: 'mail://rules/0' });
+        // Test 5: Read mail://rules[0] (individual rule)
+        console.log('\nTest 5: Read mail://rules[0]');
+        const rule0Result = await client.call('resources/read', { uri: 'mail://rules[0]' });
         if (rule0Result.contents && rule0Result.contents[0]) {
             console.log('  ✓ Got rule 0 content');
             passed++;
             const content = JSON.parse(rule0Result.contents[0].text);
-            console.log(`  Content: ${JSON.stringify(content)}`);
+            console.log(`  Rule name: ${content.name || 'unnamed'}`);
         } else {
             console.log('  ✗ No rule 0 content');
             failed++;
@@ -175,7 +183,7 @@ async function runTests() {
             console.log('  ✓ Got accounts content');
             passed++;
             const content = JSON.parse(accountsResult.contents[0].text);
-            console.log(`  Content: ${JSON.stringify(content)}`);
+            console.log(`  Accounts count: ${Array.isArray(content) ? content.length : 'N/A'}`);
         } else {
             console.log('  ✗ No accounts content');
             failed++;
@@ -200,7 +208,7 @@ async function runTests() {
             console.log('  ✗ Should have thrown error');
             failed++;
         } catch (e) {
-            if (e.message.includes('not found') || e.message.includes('Resource')) {
+            if (e.message.includes('Unknown segment') || e.message.includes('not found') || e.message.includes('Resource')) {
                 console.log('  ✓ Got expected error');
                 passed++;
             } else {
@@ -209,20 +217,32 @@ async function runTests() {
             }
         }
 
-        // Test 9: URI Router - test various URIs
-        console.log('\nTest 9: URI parsing (via signature with name)');
-        const sigResult = await client.call('resources/read', { uri: 'mail://signatures/Test' });
-        if (sigResult.contents && sigResult.contents[0]) {
-            const content = JSON.parse(sigResult.contents[0].text);
-            if (content.name === 'Test') {
-                console.log('  ✓ URI with name correctly parsed');
+        // Test 9: Read first account by index
+        console.log('\nTest 9: Read mail://accounts[0]');
+        const acc0Result = await client.call('resources/read', { uri: 'mail://accounts[0]' });
+        if (acc0Result.contents && acc0Result.contents[0]) {
+            const content = JSON.parse(acc0Result.contents[0].text);
+            if (content.name) {
+                console.log(`  ✓ Got account: ${content.name}`);
                 passed++;
             } else {
-                console.log('  ✗ Name not correctly parsed:', content);
+                console.log('  ✗ Account has no name');
                 failed++;
             }
         } else {
             console.log('  ✗ No content returned');
+            failed++;
+        }
+
+        // Test 10: Read inbox
+        console.log('\nTest 10: Read mail://inbox');
+        const inboxResult = await client.call('resources/read', { uri: 'mail://inbox' });
+        if (inboxResult.contents && inboxResult.contents[0]) {
+            const content = JSON.parse(inboxResult.contents[0].text);
+            console.log(`  ✓ Inbox: ${content.name || 'unnamed'} (${content.unreadCount ?? '?'} unread)`);
+            passed++;
+        } else {
+            console.log('  ✗ No inbox content');
             failed++;
         }
 
