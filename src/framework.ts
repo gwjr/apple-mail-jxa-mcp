@@ -513,28 +513,47 @@ function createElementSpecifier<Base extends Record<string, any>>(
     // Returns a new specifier with the most stable URI form, respecting addressing order
     fix(): Result<Specifier<Derived<Base>>> {
       return tryResolve(() => {
-        if (!addressing || addressing.length === 0) {
-          return spec; // No addressing modes, can't improve
+        // First, fix parent path if it has indexed segments
+        let fixedBase = baseUri;
+        if (baseUri.includes('[')) {
+          const parentSpec = specifierFromURI(baseUri);
+          if (parentSpec.ok) {
+            const fixedParent = parentSpec.value.fix();
+            if (fixedParent.ok) {
+              fixedBase = fixedParent.value.uri;
+            }
+          }
         }
 
-        // Try addressing modes in order (first non-index mode that works wins)
-        let fixedUri: string | undefined;
+        if (!addressing || addressing.length === 0) {
+          // Can't improve current element, but parent may have been fixed
+          if (fixedBase !== baseUri) {
+            const currentSegment = uri.slice(baseUri.length);
+            return createElementSpecifier(fixedBase + currentSegment, jxa, schema, typeName, addressing);
+          }
+          return spec;
+        }
 
-        for (const mode of addressing) {
+        // Try addressing modes in stability order (id > name), skipping unavailable modes
+        let fixedUri: string | undefined;
+        const stabilityOrder: AddressingMode[] = ['id', 'name'];
+
+        for (const mode of stabilityOrder) {
           if (fixedUri !== undefined) break;
+          if (!addressing.includes(mode)) continue;
 
           if (mode === 'id') {
             try {
               const id = jxa.id();
               if (id != null && id !== '') {
-                fixedUri = `${baseUri}/${encodeURIComponent(String(id))}`;
+                fixedUri = `${fixedBase}/${encodeURIComponent(String(id))}`;
               }
             } catch { /* ignore */ }
           } else if (mode === 'name') {
             try {
               const name = jxa.name();
               if (name != null && name !== '') {
-                fixedUri = `${baseUri}/${encodeURIComponent(String(name))}`;
+                fixedUri = `${fixedBase}/${encodeURIComponent(String(name))}`;
               }
             } catch { /* ignore */ }
           }
@@ -542,7 +561,12 @@ function createElementSpecifier<Base extends Record<string, any>>(
         }
 
         if (fixedUri === undefined) {
-          return spec; // Can't improve, return self
+          // Can't improve current element, but parent may have been fixed
+          if (fixedBase !== baseUri) {
+            const currentSegment = uri.slice(baseUri.length);
+            return createElementSpecifier(fixedBase + currentSegment, jxa, schema, typeName, addressing);
+          }
+          return spec;
         }
 
         // Return new specifier with fixed URI
@@ -607,13 +631,33 @@ function createCollectionSpecifier<
     _isSpecifier: true as const,
     uri,
 
-    // Returns base collection specifier (strips query params)
+    // Returns base collection specifier (strips query params, fixes parent paths)
     fix(): Result<CollectionSpecifier<Derived<ElementBase>, any>> {
-      const baseUri = uri.split('?')[0];
-      if (baseUri === uri) {
+      let fixedUri = uri.split('?')[0];
+
+      // Fix parent path if it has indexed segments
+      if (fixedUri.includes('[')) {
+        // Extract parent element path (everything before the last /collection)
+        const lastSlash = fixedUri.lastIndexOf('/');
+        const schemeEnd = fixedUri.indexOf('://') + 3;
+        if (lastSlash > schemeEnd) {
+          const parentPath = fixedUri.slice(0, lastSlash);
+          const collectionName = fixedUri.slice(lastSlash + 1);
+
+          const parentSpec = specifierFromURI(parentPath);
+          if (parentSpec.ok) {
+            const fixedParent = parentSpec.value.fix();
+            if (fixedParent.ok) {
+              fixedUri = fixedParent.value.uri + '/' + collectionName;
+            }
+          }
+        }
+      }
+
+      if (fixedUri === uri) {
         return { ok: true, value: spec }; // Already at base form
       }
-      return { ok: true, value: createCollectionSpecifier(baseUri, jxaCollection, elementBase, addressing, typeName) };
+      return { ok: true, value: createCollectionSpecifier(fixedUri, jxaCollection, elementBase, addressing, typeName) };
     },
 
     resolve(): Result<Derived<ElementBase>[]> {
@@ -622,37 +666,23 @@ function createCollectionSpecifier<
         const collectionBaseUri = uri.split('?')[0]; // Strip query params for element URIs
 
         let results = jxaArray.map((jxa: any, i: number) => {
-          // Generate the best URI for this element, respecting addressing order
-          // The first mode in the array that works is used (e.g., ['name', 'index', 'id'] prefers name)
-          let elementUri: string | undefined = undefined;
+          // Create element specifier with index-based URI
+          const indexUri = `${collectionBaseUri}[${i}]`;
+          const elementSpec = createElementSpecifier(indexUri, jxa, elementBase, typeName, addressing);
 
-          for (const mode of addressing) {
-            if (elementUri !== undefined) break;
-
-            if (mode === 'id') {
-              try {
-                const id = jxa.id();
-                if (id != null && id !== '') {
-                  elementUri = `${collectionBaseUri}/${encodeURIComponent(String(id))}`;
-                }
-              } catch { /* ignore */ }
-            } else if (mode === 'name') {
-              try {
-                const name = jxa.name();
-                if (name != null && name !== '') {
-                  elementUri = `${collectionBaseUri}/${encodeURIComponent(String(name))}`;
-                }
-              } catch { /* ignore */ }
-            }
-            // 'index' is handled as fallback below
+          // Resolve to get data with _uri = index URI
+          const resolved = elementSpec.resolve();
+          if (!resolved.ok) {
+            return ElementClass.fromJXA(jxa, indexUri); // Fallback
           }
 
-          // Fall back to index if no better addressing available
-          if (elementUri === undefined) {
-            elementUri = `${collectionBaseUri}[${i}]`;
+          // Get stable reference via fix()
+          const fixed = elementSpec.fix();
+          if (fixed.ok && fixed.value.uri !== indexUri) {
+            (resolved.value as any)._ref = fixed.value.uri;
           }
 
-          return ElementClass.fromJXA(jxa, elementUri);
+          return resolved.value;
         });
 
         // Apply JS filter if specified

@@ -39,7 +39,10 @@ function listResources(): McpResource[] {
     { uri: 'mail://junk', name: 'Junk', description: 'Combined junk/spam from all accounts' },
     { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
     // Accounts
-    { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' }
+    { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' },
+    // Rules and Signatures
+    { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
+    { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' }
   ];
 
   const spec = specifierFromURI('mail://accounts');
@@ -252,6 +255,45 @@ const resourceTemplates: McpResourceTemplate[] = [
     uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/attachments',
     name: 'Attachments',
     description: 'Message attachments. Returns: id, name, fileSize'
+  },
+
+  // --- Rules ---
+  {
+    uriTemplate: 'mail://rules',
+    name: 'All Rules',
+    description: 'List all mail filtering rules'
+  },
+  {
+    uriTemplate: 'mail://rules[{index}]',
+    name: 'Rule by Index',
+    description: 'Single rule. Returns: name, enabled, conditions, actions'
+  },
+  {
+    uriTemplate: 'mail://rules/{name}',
+    name: 'Rule by Name',
+    description: 'Single rule by name'
+  },
+  {
+    uriTemplate: 'mail://rules[{index}]/ruleConditions',
+    name: 'Rule Conditions',
+    description: 'Conditions for a rule. Returns: header, qualifier, ruleType, expression'
+  },
+
+  // --- Signatures ---
+  {
+    uriTemplate: 'mail://signatures',
+    name: 'All Signatures',
+    description: 'List all email signatures'
+  },
+  {
+    uriTemplate: 'mail://signatures[{index}]',
+    name: 'Signature by Index',
+    description: 'Single signature by position'
+  },
+  {
+    uriTemplate: 'mail://signatures/{name}',
+    name: 'Signature by Name',
+    description: 'Single signature by name. Returns: name, content (lazy)'
   }
 ];
 

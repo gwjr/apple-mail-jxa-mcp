@@ -33,6 +33,61 @@ function parseEmailAddress(raw: string): ParsedEmailAddress {
 // Apple Mail Schema Definitions
 // ============================================================================
 
+// ============================================================================
+// Rule Condition Schema
+// ============================================================================
+
+const RuleConditionBase = {
+  header: accessor<string, 'header'>('header'),
+  qualifier: accessor<string, 'qualifier'>('qualifier'),
+  ruleType: accessor<string, 'ruleType'>('ruleType'),
+  expression: accessor<string, 'expression'>('expression'),
+} as const;
+
+// ============================================================================
+// Rule Schema
+// ============================================================================
+
+const RuleBase = {
+  name: accessor<string, 'name'>('name'),
+  enabled: accessor<boolean, 'enabled'>('enabled'),
+  allConditionsMustBeMet: accessor<boolean, 'allConditionsMustBeMet'>('allConditionsMustBeMet'),
+  // Actions - simple properties
+  deleteMessage: accessor<boolean, 'deleteMessage'>('deleteMessage'),
+  markRead: accessor<boolean, 'markRead'>('markRead'),
+  markFlagged: accessor<boolean, 'markFlagged'>('markFlagged'),
+  markFlagIndex: accessor<number, 'markFlagIndex'>('markFlagIndex'),
+  stopEvaluatingRules: accessor<boolean, 'stopEvaluatingRules'>('stopEvaluatingRules'),
+  // Actions - string properties
+  forwardMessage: accessor<string, 'forwardMessage'>('forwardMessage'),
+  redirectMessage: accessor<string, 'redirectMessage'>('redirectMessage'),
+  replyText: accessor<string, 'replyText'>('replyText'),
+  playSound: accessor<string, 'playSound'>('playSound'),
+  highlightTextUsingColor: accessor<string, 'highlightTextUsingColor'>('highlightTextUsingColor'),
+  // Mailbox actions (computed to get mailbox name, lazy to avoid upfront resolution)
+  copyMessage: computed<string | null>((jxa) => {
+    try { const mb = jxa.copyMessage(); return mb ? mb.name() : null; } catch { return null; }
+  }),
+  moveMessage: computed<string | null>((jxa) => {
+    try { const mb = jxa.moveMessage(); return mb ? mb.name() : null; } catch { return null; }
+  }),
+  // Conditions collection
+  ruleConditions: collection('ruleConditions', RuleConditionBase, ['index'] as const),
+} as const;
+
+// ============================================================================
+// Signature Schema
+// ============================================================================
+
+const SignatureBase = {
+  name: accessor<string, 'name'>('name'),
+  content: lazyAccessor<string, 'content'>('content'),  // lazy - can be large
+} as const;
+
+// ============================================================================
+// Recipient Schema
+// ============================================================================
+
 const RecipientBase = {
   name: accessor<string, 'name'>('name'),
   address: accessor<string, 'address'>('address'),
@@ -88,6 +143,8 @@ const StandardMailboxBase = {
 
 const MailAppBase = {
   accounts: collection('accounts', AccountBase, ['name', 'index', 'id'] as const),
+  rules: collection('rules', RuleBase, ['name', 'index'] as const),
+  signatures: collection('signatures', SignatureBase, ['name', 'index'] as const),
   // Standard mailboxes (aggregate across all accounts)
   inbox: { _standardMailbox: true, _jxaName: 'inbox' },
   drafts: { _standardMailbox: true, _jxaName: 'draftsMailbox' },
@@ -101,6 +158,9 @@ const MailAppBase = {
 // Create Derived Types
 // ============================================================================
 
+const RuleCondition = createDerived(RuleConditionBase, 'RuleCondition');
+const Rule = createDerived(RuleBase, 'Rule');
+const Signature = createDerived(SignatureBase, 'Signature');
 const Recipient = createDerived(RecipientBase, 'Recipient');
 const Attachment = createDerived(AttachmentBase, 'Attachment');
 const Message = createDerived(MessageBase, 'Message');
@@ -111,6 +171,9 @@ const Account = createDerived(AccountBase, 'Account');
 // Type Aliases for Export
 // ============================================================================
 
+type RuleCondition = InstanceType<typeof RuleCondition>;
+type Rule = InstanceType<typeof Rule>;
+type Signature = InstanceType<typeof Signature>;
 type Recipient = InstanceType<typeof Recipient>;
 type Attachment = InstanceType<typeof Attachment>;
 type Message = InstanceType<typeof Message>;

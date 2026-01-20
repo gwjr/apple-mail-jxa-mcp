@@ -849,19 +849,38 @@ function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
         // Returns a new specifier with the most stable URI form, respecting addressing order
         fix() {
             return tryResolve(() => {
-                if (!addressing || addressing.length === 0) {
-                    return spec; // No addressing modes, can't improve
+                // First, fix parent path if it has indexed segments
+                let fixedBase = baseUri;
+                if (baseUri.includes('[')) {
+                    const parentSpec = specifierFromURI(baseUri);
+                    if (parentSpec.ok) {
+                        const fixedParent = parentSpec.value.fix();
+                        if (fixedParent.ok) {
+                            fixedBase = fixedParent.value.uri;
+                        }
+                    }
                 }
-                // Try addressing modes in order (first non-index mode that works wins)
+                if (!addressing || addressing.length === 0) {
+                    // Can't improve current element, but parent may have been fixed
+                    if (fixedBase !== baseUri) {
+                        const currentSegment = uri.slice(baseUri.length);
+                        return createElementSpecifier(fixedBase + currentSegment, jxa, schema, typeName, addressing);
+                    }
+                    return spec;
+                }
+                // Try addressing modes in stability order (id > name), skipping unavailable modes
                 let fixedUri;
-                for (const mode of addressing) {
+                const stabilityOrder = ['id', 'name'];
+                for (const mode of stabilityOrder) {
                     if (fixedUri !== undefined)
                         break;
+                    if (!addressing.includes(mode))
+                        continue;
                     if (mode === 'id') {
                         try {
                             const id = jxa.id();
                             if (id != null && id !== '') {
-                                fixedUri = `${baseUri}/${encodeURIComponent(String(id))}`;
+                                fixedUri = `${fixedBase}/${encodeURIComponent(String(id))}`;
                             }
                         }
                         catch { /* ignore */ }
@@ -870,7 +889,7 @@ function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
                         try {
                             const name = jxa.name();
                             if (name != null && name !== '') {
-                                fixedUri = `${baseUri}/${encodeURIComponent(String(name))}`;
+                                fixedUri = `${fixedBase}/${encodeURIComponent(String(name))}`;
                             }
                         }
                         catch { /* ignore */ }
@@ -878,7 +897,12 @@ function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
                     // 'index' doesn't provide improvement
                 }
                 if (fixedUri === undefined) {
-                    return spec; // Can't improve, return self
+                    // Can't improve current element, but parent may have been fixed
+                    if (fixedBase !== baseUri) {
+                        const currentSegment = uri.slice(baseUri.length);
+                        return createElementSpecifier(fixedBase + currentSegment, jxa, schema, typeName, addressing);
+                    }
+                    return spec;
                 }
                 // Return new specifier with fixed URI
                 return createElementSpecifier(fixedUri, jxa, schema, typeName, addressing);
@@ -918,50 +942,50 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
     const spec = {
         _isSpecifier: true,
         uri,
-        // Returns base collection specifier (strips query params)
+        // Returns base collection specifier (strips query params, fixes parent paths)
         fix() {
-            const baseUri = uri.split('?')[0];
-            if (baseUri === uri) {
+            let fixedUri = uri.split('?')[0];
+            // Fix parent path if it has indexed segments
+            if (fixedUri.includes('[')) {
+                // Extract parent element path (everything before the last /collection)
+                const lastSlash = fixedUri.lastIndexOf('/');
+                const schemeEnd = fixedUri.indexOf('://') + 3;
+                if (lastSlash > schemeEnd) {
+                    const parentPath = fixedUri.slice(0, lastSlash);
+                    const collectionName = fixedUri.slice(lastSlash + 1);
+                    const parentSpec = specifierFromURI(parentPath);
+                    if (parentSpec.ok) {
+                        const fixedParent = parentSpec.value.fix();
+                        if (fixedParent.ok) {
+                            fixedUri = fixedParent.value.uri + '/' + collectionName;
+                        }
+                    }
+                }
+            }
+            if (fixedUri === uri) {
                 return { ok: true, value: spec }; // Already at base form
             }
-            return { ok: true, value: createCollectionSpecifier(baseUri, jxaCollection, elementBase, addressing, typeName) };
+            return { ok: true, value: createCollectionSpecifier(fixedUri, jxaCollection, elementBase, addressing, typeName) };
         },
         resolve() {
             return tryResolve(() => {
                 const jxaArray = typeof jxaCollection === 'function' ? jxaCollection() : jxaCollection;
                 const collectionBaseUri = uri.split('?')[0]; // Strip query params for element URIs
                 let results = jxaArray.map((jxa, i) => {
-                    // Generate the best URI for this element, respecting addressing order
-                    // The first mode in the array that works is used (e.g., ['name', 'index', 'id'] prefers name)
-                    let elementUri = undefined;
-                    for (const mode of addressing) {
-                        if (elementUri !== undefined)
-                            break;
-                        if (mode === 'id') {
-                            try {
-                                const id = jxa.id();
-                                if (id != null && id !== '') {
-                                    elementUri = `${collectionBaseUri}/${encodeURIComponent(String(id))}`;
-                                }
-                            }
-                            catch { /* ignore */ }
-                        }
-                        else if (mode === 'name') {
-                            try {
-                                const name = jxa.name();
-                                if (name != null && name !== '') {
-                                    elementUri = `${collectionBaseUri}/${encodeURIComponent(String(name))}`;
-                                }
-                            }
-                            catch { /* ignore */ }
-                        }
-                        // 'index' is handled as fallback below
+                    // Create element specifier with index-based URI
+                    const indexUri = `${collectionBaseUri}[${i}]`;
+                    const elementSpec = createElementSpecifier(indexUri, jxa, elementBase, typeName, addressing);
+                    // Resolve to get data with _uri = index URI
+                    const resolved = elementSpec.resolve();
+                    if (!resolved.ok) {
+                        return ElementClass.fromJXA(jxa, indexUri); // Fallback
                     }
-                    // Fall back to index if no better addressing available
-                    if (elementUri === undefined) {
-                        elementUri = `${collectionBaseUri}[${i}]`;
+                    // Get stable reference via fix()
+                    const fixed = elementSpec.fix();
+                    if (fixed.ok && fixed.value.uri !== indexUri) {
+                        resolved.value._ref = fixed.value.uri;
                     }
-                    return ElementClass.fromJXA(jxa, elementUri);
+                    return resolved.value;
                 });
                 // Apply JS filter if specified
                 if (jsFilter && Object.keys(jsFilter).length > 0) {
@@ -1454,6 +1478,66 @@ function parseEmailAddress(raw) {
 // ============================================================================
 // Apple Mail Schema Definitions
 // ============================================================================
+// ============================================================================
+// Rule Condition Schema
+// ============================================================================
+const RuleConditionBase = {
+    header: accessor('header'),
+    qualifier: accessor('qualifier'),
+    ruleType: accessor('ruleType'),
+    expression: accessor('expression'),
+};
+// ============================================================================
+// Rule Schema
+// ============================================================================
+const RuleBase = {
+    name: accessor('name'),
+    enabled: accessor('enabled'),
+    allConditionsMustBeMet: accessor('allConditionsMustBeMet'),
+    // Actions - simple properties
+    deleteMessage: accessor('deleteMessage'),
+    markRead: accessor('markRead'),
+    markFlagged: accessor('markFlagged'),
+    markFlagIndex: accessor('markFlagIndex'),
+    stopEvaluatingRules: accessor('stopEvaluatingRules'),
+    // Actions - string properties
+    forwardMessage: accessor('forwardMessage'),
+    redirectMessage: accessor('redirectMessage'),
+    replyText: accessor('replyText'),
+    playSound: accessor('playSound'),
+    highlightTextUsingColor: accessor('highlightTextUsingColor'),
+    // Mailbox actions (computed to get mailbox name, lazy to avoid upfront resolution)
+    copyMessage: computed((jxa) => {
+        try {
+            const mb = jxa.copyMessage();
+            return mb ? mb.name() : null;
+        }
+        catch {
+            return null;
+        }
+    }),
+    moveMessage: computed((jxa) => {
+        try {
+            const mb = jxa.moveMessage();
+            return mb ? mb.name() : null;
+        }
+        catch {
+            return null;
+        }
+    }),
+    // Conditions collection
+    ruleConditions: collection('ruleConditions', RuleConditionBase, ['index']),
+};
+// ============================================================================
+// Signature Schema
+// ============================================================================
+const SignatureBase = {
+    name: accessor('name'),
+    content: lazyAccessor('content'), // lazy - can be large
+};
+// ============================================================================
+// Recipient Schema
+// ============================================================================
 const RecipientBase = {
     name: accessor('name'),
     address: accessor('address'),
@@ -1503,6 +1587,8 @@ const StandardMailboxBase = {
 };
 const MailAppBase = {
     accounts: collection('accounts', AccountBase, ['name', 'index', 'id']),
+    rules: collection('rules', RuleBase, ['name', 'index']),
+    signatures: collection('signatures', SignatureBase, ['name', 'index']),
     // Standard mailboxes (aggregate across all accounts)
     inbox: { _standardMailbox: true, _jxaName: 'inbox' },
     drafts: { _standardMailbox: true, _jxaName: 'draftsMailbox' },
@@ -1514,6 +1600,9 @@ const MailAppBase = {
 // ============================================================================
 // Create Derived Types
 // ============================================================================
+const RuleCondition = createDerived(RuleConditionBase, 'RuleCondition');
+const Rule = createDerived(RuleBase, 'Rule');
+const Signature = createDerived(SignatureBase, 'Signature');
 const Recipient = createDerived(RecipientBase, 'Recipient');
 const Attachment = createDerived(AttachmentBase, 'Attachment');
 const Message = createDerived(MessageBase, 'Message');
@@ -1725,7 +1814,10 @@ function listResources() {
         { uri: 'mail://junk', name: 'Junk', description: 'Combined junk/spam from all accounts' },
         { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
         // Accounts
-        { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' }
+        { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' },
+        // Rules and Signatures
+        { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
+        { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' }
     ];
     const spec = specifierFromURI('mail://accounts');
     if (spec.ok) {
@@ -1927,6 +2019,43 @@ const resourceTemplates = [
         uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/attachments',
         name: 'Attachments',
         description: 'Message attachments. Returns: id, name, fileSize'
+    },
+    // --- Rules ---
+    {
+        uriTemplate: 'mail://rules',
+        name: 'All Rules',
+        description: 'List all mail filtering rules'
+    },
+    {
+        uriTemplate: 'mail://rules[{index}]',
+        name: 'Rule by Index',
+        description: 'Single rule. Returns: name, enabled, conditions, actions'
+    },
+    {
+        uriTemplate: 'mail://rules/{name}',
+        name: 'Rule by Name',
+        description: 'Single rule by name'
+    },
+    {
+        uriTemplate: 'mail://rules[{index}]/ruleConditions',
+        name: 'Rule Conditions',
+        description: 'Conditions for a rule. Returns: header, qualifier, ruleType, expression'
+    },
+    // --- Signatures ---
+    {
+        uriTemplate: 'mail://signatures',
+        name: 'All Signatures',
+        description: 'List all email signatures'
+    },
+    {
+        uriTemplate: 'mail://signatures[{index}]',
+        name: 'Signature by Index',
+        description: 'Single signature by position'
+    },
+    {
+        uriTemplate: 'mail://signatures/{name}',
+        name: 'Signature by Name',
+        description: 'Single signature by name. Returns: name, content (lazy)'
     }
 ];
 // Export for JXA
