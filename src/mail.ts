@@ -213,3 +213,4 @@ registerScheme('mail', getMailApp);
 
 // Export for JXA
 (globalThis as any).specifierFromURI = specifierFromURI;
+(globalThis as any).getCompletions = getCompletions;

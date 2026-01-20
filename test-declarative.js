@@ -264,3 +264,23 @@ if (expandResult.ok) {
     }
   }
 }
+
+// Test completions
+console.log('\n=== Completions Test ===');
+const completionTests = [
+  '',                              // Should suggest schemes
+  'mail',                          // Should suggest mail://
+  'mail://',                       // Should suggest top-level (accounts, inbox, etc.)
+  'mail://accounts',               // Should suggest [index] or ?
+  'mail://accounts[0]/',           // Should suggest account properties
+  'mail://accounts[0]/mailboxes',  // Should suggest addressing
+  'mail://accounts[0]/mailboxes?', // Should suggest filter params
+  'mail://accounts[0]/mailboxes?name.',  // Should suggest operators
+  'mail://accounts[0]/mailboxes?sort=',  // Should suggest sortable properties
+];
+
+for (const partial of completionTests) {
+  const completions = getCompletions(partial);
+  const values = completions.map(c => c.value).slice(0, 5);
+  console.log(`"${partial}" → [${values.join(', ')}]`);
+}
