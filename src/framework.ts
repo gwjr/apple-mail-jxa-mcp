@@ -87,15 +87,21 @@ function specifierFromURI(uri: string): Result<{ _isSpecifier: true; uri: string
     }
   }
 
-  // Apply whose filter and sort if present
+  // Apply whose filter, sort, pagination, and expand if present
   if (query) {
     try {
-      const { filter, sort } = parseQuery(query);
+      const { filter, sort, pagination, expand } = parseQuery(query);
       if (Object.keys(filter).length > 0 && current.whose) {
         current = current.whose(filter);
       }
       if (sort && current.sortBy) {
         current = current.sortBy(sort);
+      }
+      if (pagination && current.paginate) {
+        current = current.paginate(pagination);
+      }
+      if (expand && expand.length > 0 && current.expand) {
+        current = current.expand(expand);
       }
       resolved += '?' + query;
     } catch (e) {
@@ -127,6 +133,12 @@ type JXACollection<ElementBase, JXAName extends string, Addressing extends reado
   readonly _elementBase: ElementBase;
   readonly _jxaName: JXAName;
   readonly _addressing: Addressing;
+};
+
+type JXAComputed<T> = {
+  readonly _computed: true;
+  readonly _type: T;
+  readonly _compute: (jxa: any) => T;
 };
 
 type AddressingMode = 'name' | 'index' | 'id';
@@ -168,6 +180,16 @@ function collection<ElementBase, JXAName extends string, Addressing extends read
   };
 }
 
+function computed<T>(
+  compute: (jxa: any) => T
+): JXAComputed<T> {
+  return {
+    _computed: true,
+    _type: undefined as any as T,
+    _compute: compute
+  };
+}
+
 // ============================================================================
 // Type-Level Transformations
 // ============================================================================
@@ -177,6 +199,7 @@ type Lower<A> =
   A extends JXAAccessor<infer T, any> ? T :
   A extends JXALazyAccessor<infer T, any> ? Specifier<T> :  // lazy stays as specifier
   A extends JXACollection<infer ElementBase, any, any> ? CollectionSpecifier<Derived<ElementBase>> :
+  A extends JXAComputed<infer T> ? T :
   A;
 
 // Lower all properties
@@ -251,13 +274,24 @@ type SortSpec<T> = {
   direction?: SortDirection;
 };
 
-// Collection specifier with whose and sortBy capabilities
+// Pagination specification
+type PaginationSpec = {
+  limit?: number;
+  offset?: number;
+};
+
+// Expand specification - list of properties to resolve inline
+type ExpandSpec = string[];
+
+// Collection specifier with whose, sortBy, pagination, and expand capabilities
 type CollectionSpecifier<T, A = IndexAddressable<T>> = {
   readonly _isSpecifier: true;
   readonly uri: string;
   resolve(): Result<T[]>;
   whose(filter: WhoseFilter<T>): CollectionSpecifier<T, A>;
   sortBy(spec: SortSpec<T>): CollectionSpecifier<T, A>;
+  paginate(spec: PaginationSpec): CollectionSpecifier<T, A>;
+  expand(props: ExpandSpec): CollectionSpecifier<T, A>;
 } & A;
 
 // ============================================================================
@@ -291,6 +325,8 @@ function createDerived<Base extends Record<string, any>>(
           this._defineLazyAccessorProperty(key, descriptor);
         } else if (this._isCollection(descriptor)) {
           this._defineCollectionProperty(key, descriptor);
+        } else if (this._isComputed(descriptor)) {
+          this._defineComputedProperty(key, descriptor);
         }
       }
     }
@@ -305,6 +341,10 @@ function createDerived<Base extends Record<string, any>>(
 
     private _isCollection(desc: any): desc is JXACollection<any, any, any> {
       return desc && desc._collection === true;
+    }
+
+    private _isComputed(desc: any): desc is JXAComputed<any> {
+      return desc && desc._computed === true;
     }
 
     private _defineAccessorProperty(key: string, descriptor: JXAAccessor<any, any>) {
@@ -347,6 +387,16 @@ function createDerived<Base extends Record<string, any>>(
             descriptor._addressing,
             typeName + '_' + key
           );
+        },
+        enumerable: true
+      });
+    }
+
+    private _defineComputedProperty(key: string, descriptor: JXAComputed<any>) {
+      const self = this;
+      Object.defineProperty(this, key, {
+        get() {
+          return descriptor._compute(self._jxa);
         },
         enumerable: true
       });
@@ -441,7 +491,9 @@ function createCollectionSpecifier<
   addressing: Modes,
   typeName: string,
   sortSpec?: SortSpec<any>,
-  jsFilter?: WhoseFilter<any>
+  jsFilter?: WhoseFilter<any>,
+  pagination?: PaginationSpec,
+  expand?: ExpandSpec
 ): CollectionSpecifier<Derived<ElementBase>, AddressingFromModes<Derived<ElementBase>, Modes>> {
 
   const ElementClass = createDerived(elementBase, typeName);
@@ -478,6 +530,31 @@ function createCollectionSpecifier<
             const bVal = b[sortSpec.by];
             const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
             return sortSpec.direction === 'desc' ? -cmp : cmp;
+          });
+        }
+
+        // Apply pagination if specified
+        if (pagination) {
+          const start = pagination.offset || 0;
+          const end = pagination.limit !== undefined ? start + pagination.limit : undefined;
+          results = results.slice(start, end);
+        }
+
+        // Apply expand if specified - resolve lazy specifiers
+        if (expand && expand.length > 0) {
+          results = results.map((item: any) => {
+            // Create a shallow copy with all values resolved
+            const expanded: any = {};
+            for (const key of Object.keys(item)) {
+              const val = item[key];
+              if (expand.includes(key) && val && val._isSpecifier && typeof val.resolve === 'function') {
+                const resolved = val.resolve();
+                expanded[key] = resolved.ok ? resolved.value : val;
+              } else {
+                expanded[key] = val;
+              }
+            }
+            return expanded;
           });
         }
 
@@ -542,10 +619,10 @@ function createCollectionSpecifier<
       const filteredJXA = jxaCollection.whose(jxaFilter);
       // Test if it works by accessing length (triggers evaluation)
       void filteredJXA.length;
-      return createCollectionSpecifier(filteredUri, filteredJXA, elementBase, addressing, typeName, sortSpec);
+      return createCollectionSpecifier(filteredUri, filteredJXA, elementBase, addressing, typeName, sortSpec, undefined, pagination, expand);
     } catch {
       // JXA filter failed, use JS post-filter
-      return createCollectionSpecifier(filteredUri, jxaCollection, elementBase, addressing, typeName, sortSpec, filter);
+      return createCollectionSpecifier(filteredUri, jxaCollection, elementBase, addressing, typeName, sortSpec, filter, pagination, expand);
     }
   };
 
@@ -553,7 +630,24 @@ function createCollectionSpecifier<
   spec.sortBy = function(newSortSpec: SortSpec<Derived<ElementBase>>): CollectionSpecifier<Derived<ElementBase>, any> {
     const sep = uri.includes('?') ? '&' : '?';
     const sortedUri = `${uri}${sep}sort=${String(newSortSpec.by)}.${newSortSpec.direction || 'asc'}`;
-    return createCollectionSpecifier(sortedUri, jxaCollection, elementBase, addressing, typeName, newSortSpec, jsFilter);
+    return createCollectionSpecifier(sortedUri, jxaCollection, elementBase, addressing, typeName, newSortSpec, jsFilter, pagination, expand);
+  };
+
+  // Add paginate
+  spec.paginate = function(newPagination: PaginationSpec): CollectionSpecifier<Derived<ElementBase>, any> {
+    const parts: string[] = [];
+    if (newPagination.limit !== undefined) parts.push(`limit=${newPagination.limit}`);
+    if (newPagination.offset !== undefined) parts.push(`offset=${newPagination.offset}`);
+    const sep = uri.includes('?') ? '&' : '?';
+    const paginatedUri = parts.length > 0 ? `${uri}${sep}${parts.join('&')}` : uri;
+    return createCollectionSpecifier(paginatedUri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, newPagination, expand);
+  };
+
+  // Add expand
+  spec.expand = function(newExpand: ExpandSpec): CollectionSpecifier<Derived<ElementBase>, any> {
+    const sep = uri.includes('?') ? '&' : '?';
+    const expandUri = `${uri}${sep}expand=${newExpand.join(',')}`;
+    return createCollectionSpecifier(expandUri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, pagination, newExpand);
   };
 
   return spec as CollectionSpecifier<Derived<ElementBase>, AddressingFromModes<Derived<ElementBase>, typeof addressing>>;
@@ -582,8 +676,8 @@ function encodeFilter(filter: WhoseFilter<any>): string {
   return parts.join('&');
 }
 
-function parseQuery(query: string): { filter: WhoseFilter<any>; sort?: SortSpec<any> } {
-  const result: { filter: WhoseFilter<any>; sort?: SortSpec<any> } = { filter: {} };
+function parseQuery(query: string): { filter: WhoseFilter<any>; sort?: SortSpec<any>; pagination?: PaginationSpec; expand?: ExpandSpec } {
+  const result: { filter: WhoseFilter<any>; sort?: SortSpec<any>; pagination?: PaginationSpec; expand?: ExpandSpec } = { filter: {} };
 
   for (const part of query.split('&')) {
     const eqIdx = part.indexOf('=');
@@ -595,6 +689,24 @@ function parseQuery(query: string): { filter: WhoseFilter<any>; sort?: SortSpec<
     if (key === 'sort') {
       const [by, direction] = value.split('.');
       result.sort = { by, direction: (direction as SortDirection) || 'asc' };
+      continue;
+    }
+
+    // Handle pagination parameters
+    if (key === 'limit') {
+      result.pagination = result.pagination || {};
+      result.pagination.limit = Number(value);
+      continue;
+    }
+    if (key === 'offset') {
+      result.pagination = result.pagination || {};
+      result.pagination.offset = Number(value);
+      continue;
+    }
+
+    // Handle expand parameter (comma-separated list of properties)
+    if (key === 'expand') {
+      result.expand = value.split(',').map(s => decodeURIComponent(s.trim()));
       continue;
     }
 

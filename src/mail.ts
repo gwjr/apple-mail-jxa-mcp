@@ -2,6 +2,34 @@
 /// <reference path="./types/mail-app.d.ts" />
 
 // ============================================================================
+// Email Address Parsing (JS-based, no extra Apple Events)
+// ============================================================================
+
+type ParsedEmailAddress = { name: string; address: string };
+
+function parseEmailAddress(raw: string): ParsedEmailAddress {
+  if (!raw) return { name: '', address: '' };
+
+  // Format: "Name" <email@domain.com> or Name <email@domain.com> or just email@domain.com
+  const match = raw.match(/^(?:"?([^"<]*)"?\s*)?<?([^>]+)>?$/);
+  if (match) {
+    const name = (match[1] || '').trim();
+    const address = (match[2] || '').trim();
+    // If no name but we have something that looks like an email, check if address has a name component
+    if (!name && address.includes('@')) {
+      return { name: '', address };
+    }
+    // If the "address" doesn't have @, it might just be a name
+    if (!address.includes('@')) {
+      return { name: address, address: '' };
+    }
+    return { name, address };
+  }
+  // Fallback: treat the whole thing as the address
+  return { name: '', address: raw.trim() };
+}
+
+// ============================================================================
 // Apple Mail Schema Definitions
 // ============================================================================
 
@@ -20,8 +48,8 @@ const MessageBase = {
   id: accessor<number, 'id'>('id'),
   messageId: accessor<string, 'messageId'>('messageId'),
   subject: accessor<string, 'subject'>('subject'),
-  sender: accessor<string, 'sender'>('sender'),
-  replyTo: accessor<string, 'replyTo'>('replyTo'),
+  sender: computed<ParsedEmailAddress>((jxa) => parseEmailAddress(str(jxa.sender()))),
+  replyTo: computed<ParsedEmailAddress>((jxa) => parseEmailAddress(str(jxa.replyTo()))),
   dateSent: accessor<Date, 'dateSent'>('dateSent'),
   dateReceived: accessor<Date, 'dateReceived'>('dateReceived'),
   content: lazyAccessor<string, 'content'>('content'),  // lazy - expensive to fetch
@@ -51,8 +79,22 @@ const AccountBase = {
   mailboxes: collection('mailboxes', MailboxBase, ['name', 'index'] as const)
 } as const;
 
+// Standard mailbox schemas (same structure as Mailbox but different accessors)
+const StandardMailboxBase = {
+  name: accessor<string, 'name'>('name'),
+  unreadCount: accessor<number, 'unreadCount'>('unreadCount'),
+  messages: collection('messages', MessageBase, ['index', 'id'] as const)
+} as const;
+
 const MailAppBase = {
-  accounts: collection('accounts', AccountBase, ['name', 'index', 'id'] as const)
+  accounts: collection('accounts', AccountBase, ['name', 'index', 'id'] as const),
+  // Standard mailboxes (aggregate across all accounts)
+  inbox: { _standardMailbox: true, _jxaName: 'inbox' },
+  drafts: { _standardMailbox: true, _jxaName: 'draftsMailbox' },
+  junk: { _standardMailbox: true, _jxaName: 'junkMailbox' },
+  outbox: { _standardMailbox: true, _jxaName: 'outbox' },
+  sent: { _standardMailbox: true, _jxaName: 'sentMailbox' },
+  trash: { _standardMailbox: true, _jxaName: 'trashMailbox' }
 } as const;
 
 // ============================================================================
@@ -82,6 +124,55 @@ type Account = InstanceType<typeof Account>;
 const MailApp = createDerived(MailAppBase, 'Mail');
 type MailApp = InstanceType<typeof MailApp>;
 
+// Create derived type for standard mailboxes
+const StandardMailbox = createDerived(StandardMailboxBase, 'StandardMailbox');
+
+// Helper to create standard mailbox specifier
+function createStandardMailboxSpecifier(
+  uri: string,
+  jxaMailbox: any
+): any {
+  const spec: any = {
+    _isSpecifier: true,
+    uri,
+    resolve(): Result<any> {
+      return tryResolve(() => StandardMailbox.fromJXA(jxaMailbox, uri), uri);
+    }
+  };
+
+  // Add properties from StandardMailboxBase
+  for (const [key, descriptor] of Object.entries(StandardMailboxBase)) {
+    if ('_accessor' in (descriptor as any)) {
+      Object.defineProperty(spec, key, {
+        get() {
+          const jxaName = (descriptor as any)._jxaName;
+          return scalarSpecifier(`${uri}/${key}`, () => {
+            const value = jxaMailbox[jxaName]();
+            return value == null ? '' : value;
+          });
+        },
+        enumerable: true
+      });
+    } else if ('_collection' in (descriptor as any)) {
+      Object.defineProperty(spec, key, {
+        get() {
+          const desc = descriptor as any;
+          return createCollectionSpecifier(
+            `${uri}/${key}`,
+            jxaMailbox[desc._jxaName],
+            desc._elementBase,
+            desc._addressing,
+            'StandardMailbox_' + key
+          );
+        },
+        enumerable: true
+      });
+    }
+  }
+
+  return spec;
+}
+
 // Lazily initialized app specifier
 let _mailApp: any = null;
 function getMailApp() {
@@ -92,6 +183,26 @@ function getMailApp() {
     (app as any).uri = 'mail://';
     (app as any)._isSpecifier = true;
     (app as any).resolve = () => ({ ok: true, value: app });
+
+    // Add standard mailbox specifiers
+    const standardMailboxes = [
+      { name: 'inbox', jxaName: 'inbox' },
+      { name: 'drafts', jxaName: 'draftsMailbox' },
+      { name: 'junk', jxaName: 'junkMailbox' },
+      { name: 'outbox', jxaName: 'outbox' },
+      { name: 'sent', jxaName: 'sentMailbox' },
+      { name: 'trash', jxaName: 'trashMailbox' }
+    ];
+
+    for (const { name, jxaName } of standardMailboxes) {
+      Object.defineProperty(app, name, {
+        get() {
+          return createStandardMailboxSpecifier(`mail://${name}`, jxa[jxaName]);
+        },
+        enumerable: true
+      });
+    }
+
     _mailApp = app;
   }
   return _mailApp;

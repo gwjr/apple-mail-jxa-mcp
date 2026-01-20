@@ -78,15 +78,21 @@ function specifierFromURI(uri) {
             return { ok: false, error: `Failed at '${segment}': ${e} (resolved: ${resolved})` };
         }
     }
-    // Apply whose filter and sort if present
+    // Apply whose filter, sort, pagination, and expand if present
     if (query) {
         try {
-            const { filter, sort } = parseQuery(query);
+            const { filter, sort, pagination, expand } = parseQuery(query);
             if (Object.keys(filter).length > 0 && current.whose) {
                 current = current.whose(filter);
             }
             if (sort && current.sortBy) {
                 current = current.sortBy(sort);
+            }
+            if (pagination && current.paginate) {
+                current = current.paginate(pagination);
+            }
+            if (expand && expand.length > 0 && current.expand) {
+                current = current.expand(expand);
             }
             resolved += '?' + query;
         }
@@ -121,6 +127,13 @@ function collection(jxaName, elementBase, addressing) {
         _addressing: addressing
     };
 }
+function computed(compute) {
+    return {
+        _computed: true,
+        _type: undefined,
+        _compute: compute
+    };
+}
 // ============================================================================
 // Runtime Implementation Factory
 // ============================================================================
@@ -147,6 +160,9 @@ function createDerived(schema, typeName) {
                 else if (this._isCollection(descriptor)) {
                     this._defineCollectionProperty(key, descriptor);
                 }
+                else if (this._isComputed(descriptor)) {
+                    this._defineComputedProperty(key, descriptor);
+                }
             }
         }
         _isAccessor(desc) {
@@ -157,6 +173,9 @@ function createDerived(schema, typeName) {
         }
         _isCollection(desc) {
             return desc && desc._collection === true;
+        }
+        _isComputed(desc) {
+            return desc && desc._computed === true;
         }
         _defineAccessorProperty(key, descriptor) {
             Object.defineProperty(this, key, {
@@ -190,6 +209,15 @@ function createDerived(schema, typeName) {
                     const base = self._uri || `${typeName.toLowerCase()}://`;
                     const uri = base.endsWith('://') ? `${base}${key}` : `${base}/${key}`;
                     return createCollectionSpecifier(uri, jxaCollection, descriptor._elementBase, descriptor._addressing, typeName + '_' + key);
+                },
+                enumerable: true
+            });
+        }
+        _defineComputedProperty(key, descriptor) {
+            const self = this;
+            Object.defineProperty(this, key, {
+                get() {
+                    return descriptor._compute(self._jxa);
                 },
                 enumerable: true
             });
@@ -255,7 +283,7 @@ function createElementSpecifier(uri, jxa, schema, typeName) {
     return spec;
 }
 // Collection specifier factory
-function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter) {
+function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, pagination, expand) {
     const ElementClass = createDerived(elementBase, typeName);
     const spec = {
         _isSpecifier: true,
@@ -291,6 +319,30 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
                         const bVal = b[sortSpec.by];
                         const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
                         return sortSpec.direction === 'desc' ? -cmp : cmp;
+                    });
+                }
+                // Apply pagination if specified
+                if (pagination) {
+                    const start = pagination.offset || 0;
+                    const end = pagination.limit !== undefined ? start + pagination.limit : undefined;
+                    results = results.slice(start, end);
+                }
+                // Apply expand if specified - resolve lazy specifiers
+                if (expand && expand.length > 0) {
+                    results = results.map((item) => {
+                        // Create a shallow copy with all values resolved
+                        const expanded = {};
+                        for (const key of Object.keys(item)) {
+                            const val = item[key];
+                            if (expand.includes(key) && val && val._isSpecifier && typeof val.resolve === 'function') {
+                                const resolved = val.resolve();
+                                expanded[key] = resolved.ok ? resolved.value : val;
+                            }
+                            else {
+                                expanded[key] = val;
+                            }
+                        }
+                        return expanded;
                     });
                 }
                 return results;
@@ -346,18 +398,35 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
             const filteredJXA = jxaCollection.whose(jxaFilter);
             // Test if it works by accessing length (triggers evaluation)
             void filteredJXA.length;
-            return createCollectionSpecifier(filteredUri, filteredJXA, elementBase, addressing, typeName, sortSpec);
+            return createCollectionSpecifier(filteredUri, filteredJXA, elementBase, addressing, typeName, sortSpec, undefined, pagination, expand);
         }
         catch {
             // JXA filter failed, use JS post-filter
-            return createCollectionSpecifier(filteredUri, jxaCollection, elementBase, addressing, typeName, sortSpec, filter);
+            return createCollectionSpecifier(filteredUri, jxaCollection, elementBase, addressing, typeName, sortSpec, filter, pagination, expand);
         }
     };
     // Add sortBy
     spec.sortBy = function (newSortSpec) {
         const sep = uri.includes('?') ? '&' : '?';
         const sortedUri = `${uri}${sep}sort=${String(newSortSpec.by)}.${newSortSpec.direction || 'asc'}`;
-        return createCollectionSpecifier(sortedUri, jxaCollection, elementBase, addressing, typeName, newSortSpec, jsFilter);
+        return createCollectionSpecifier(sortedUri, jxaCollection, elementBase, addressing, typeName, newSortSpec, jsFilter, pagination, expand);
+    };
+    // Add paginate
+    spec.paginate = function (newPagination) {
+        const parts = [];
+        if (newPagination.limit !== undefined)
+            parts.push(`limit=${newPagination.limit}`);
+        if (newPagination.offset !== undefined)
+            parts.push(`offset=${newPagination.offset}`);
+        const sep = uri.includes('?') ? '&' : '?';
+        const paginatedUri = parts.length > 0 ? `${uri}${sep}${parts.join('&')}` : uri;
+        return createCollectionSpecifier(paginatedUri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, newPagination, expand);
+    };
+    // Add expand
+    spec.expand = function (newExpand) {
+        const sep = uri.includes('?') ? '&' : '?';
+        const expandUri = `${uri}${sep}expand=${newExpand.join(',')}`;
+        return createCollectionSpecifier(expandUri, jxaCollection, elementBase, addressing, typeName, sortSpec, jsFilter, pagination, newExpand);
     };
     return spec;
 }
@@ -400,6 +469,22 @@ function parseQuery(query) {
             result.sort = { by, direction: direction || 'asc' };
             continue;
         }
+        // Handle pagination parameters
+        if (key === 'limit') {
+            result.pagination = result.pagination || {};
+            result.pagination.limit = Number(value);
+            continue;
+        }
+        if (key === 'offset') {
+            result.pagination = result.pagination || {};
+            result.pagination.offset = Number(value);
+            continue;
+        }
+        // Handle expand parameter (comma-separated list of properties)
+        if (key === 'expand') {
+            result.expand = value.split(',').map(s => decodeURIComponent(s.trim()));
+            continue;
+        }
         // Handle filter parameters
         const dotIdx = key.lastIndexOf('.');
         if (dotIdx === -1) {
@@ -426,6 +511,27 @@ function parseQuery(query) {
 }
 /// <reference path="./types/jxa.d.ts" />
 /// <reference path="./types/mail-app.d.ts" />
+function parseEmailAddress(raw) {
+    if (!raw)
+        return { name: '', address: '' };
+    // Format: "Name" <email@domain.com> or Name <email@domain.com> or just email@domain.com
+    const match = raw.match(/^(?:"?([^"<]*)"?\s*)?<?([^>]+)>?$/);
+    if (match) {
+        const name = (match[1] || '').trim();
+        const address = (match[2] || '').trim();
+        // If no name but we have something that looks like an email, check if address has a name component
+        if (!name && address.includes('@')) {
+            return { name: '', address };
+        }
+        // If the "address" doesn't have @, it might just be a name
+        if (!address.includes('@')) {
+            return { name: address, address: '' };
+        }
+        return { name, address };
+    }
+    // Fallback: treat the whole thing as the address
+    return { name: '', address: raw.trim() };
+}
 // ============================================================================
 // Apple Mail Schema Definitions
 // ============================================================================
@@ -442,8 +548,8 @@ const MessageBase = {
     id: accessor('id'),
     messageId: accessor('messageId'),
     subject: accessor('subject'),
-    sender: accessor('sender'),
-    replyTo: accessor('replyTo'),
+    sender: computed((jxa) => parseEmailAddress(str(jxa.sender()))),
+    replyTo: computed((jxa) => parseEmailAddress(str(jxa.replyTo()))),
     dateSent: accessor('dateSent'),
     dateReceived: accessor('dateReceived'),
     content: lazyAccessor('content'), // lazy - expensive to fetch
@@ -470,8 +576,21 @@ const AccountBase = {
     emailAddresses: accessor('emailAddresses'),
     mailboxes: collection('mailboxes', MailboxBase, ['name', 'index'])
 };
+// Standard mailbox schemas (same structure as Mailbox but different accessors)
+const StandardMailboxBase = {
+    name: accessor('name'),
+    unreadCount: accessor('unreadCount'),
+    messages: collection('messages', MessageBase, ['index', 'id'])
+};
 const MailAppBase = {
-    accounts: collection('accounts', AccountBase, ['name', 'index', 'id'])
+    accounts: collection('accounts', AccountBase, ['name', 'index', 'id']),
+    // Standard mailboxes (aggregate across all accounts)
+    inbox: { _standardMailbox: true, _jxaName: 'inbox' },
+    drafts: { _standardMailbox: true, _jxaName: 'draftsMailbox' },
+    junk: { _standardMailbox: true, _jxaName: 'junkMailbox' },
+    outbox: { _standardMailbox: true, _jxaName: 'outbox' },
+    sent: { _standardMailbox: true, _jxaName: 'sentMailbox' },
+    trash: { _standardMailbox: true, _jxaName: 'trashMailbox' }
 };
 // ============================================================================
 // Create Derived Types
@@ -485,6 +604,43 @@ const Account = createDerived(AccountBase, 'Account');
 // Entry Point
 // ============================================================================
 const MailApp = createDerived(MailAppBase, 'Mail');
+// Create derived type for standard mailboxes
+const StandardMailbox = createDerived(StandardMailboxBase, 'StandardMailbox');
+// Helper to create standard mailbox specifier
+function createStandardMailboxSpecifier(uri, jxaMailbox) {
+    const spec = {
+        _isSpecifier: true,
+        uri,
+        resolve() {
+            return tryResolve(() => StandardMailbox.fromJXA(jxaMailbox, uri), uri);
+        }
+    };
+    // Add properties from StandardMailboxBase
+    for (const [key, descriptor] of Object.entries(StandardMailboxBase)) {
+        if ('_accessor' in descriptor) {
+            Object.defineProperty(spec, key, {
+                get() {
+                    const jxaName = descriptor._jxaName;
+                    return scalarSpecifier(`${uri}/${key}`, () => {
+                        const value = jxaMailbox[jxaName]();
+                        return value == null ? '' : value;
+                    });
+                },
+                enumerable: true
+            });
+        }
+        else if ('_collection' in descriptor) {
+            Object.defineProperty(spec, key, {
+                get() {
+                    const desc = descriptor;
+                    return createCollectionSpecifier(`${uri}/${key}`, jxaMailbox[desc._jxaName], desc._elementBase, desc._addressing, 'StandardMailbox_' + key);
+                },
+                enumerable: true
+            });
+        }
+    }
+    return spec;
+}
 // Lazily initialized app specifier
 let _mailApp = null;
 function getMailApp() {
@@ -495,6 +651,23 @@ function getMailApp() {
         app.uri = 'mail://';
         app._isSpecifier = true;
         app.resolve = () => ({ ok: true, value: app });
+        // Add standard mailbox specifiers
+        const standardMailboxes = [
+            { name: 'inbox', jxaName: 'inbox' },
+            { name: 'drafts', jxaName: 'draftsMailbox' },
+            { name: 'junk', jxaName: 'junkMailbox' },
+            { name: 'outbox', jxaName: 'outbox' },
+            { name: 'sent', jxaName: 'sentMailbox' },
+            { name: 'trash', jxaName: 'trashMailbox' }
+        ];
+        for (const { name, jxaName } of standardMailboxes) {
+            Object.defineProperty(app, name, {
+                get() {
+                    return createStandardMailboxSpecifier(`mail://${name}`, jxa[jxaName]);
+                },
+                enumerable: true
+            });
+        }
         _mailApp = app;
     }
     return _mailApp;
@@ -520,6 +693,14 @@ function readResource(uri) {
 }
 function listResources() {
     const resources = [
+        // Standard mailboxes (aggregate across accounts)
+        { uri: 'mail://inbox', name: 'Inbox', description: 'Combined inbox from all accounts' },
+        { uri: 'mail://sent', name: 'Sent', description: 'Combined sent from all accounts' },
+        { uri: 'mail://drafts', name: 'Drafts', description: 'Combined drafts from all accounts' },
+        { uri: 'mail://trash', name: 'Trash', description: 'Combined trash from all accounts' },
+        { uri: 'mail://junk', name: 'Junk', description: 'Combined junk/spam from all accounts' },
+        { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
+        // Accounts
         { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' }
     ];
     const spec = specifierFromURI('mail://accounts');
@@ -538,15 +719,160 @@ function listResources() {
     }
     return resources;
 }
+// ============================================================================
+// Resource Templates Documentation
+// ============================================================================
+//
+// URI Structure: mail://{path}?{query}
+//
+// Path Addressing:
+//   - By index:  collection[0], collection[1], ...
+//   - By name:   collection/MyName (for mailboxes, recipients)
+//   - By id:     collection/12345 (for messages)
+//
+// Query Parameters:
+//   Filters (applied server-side when possible):
+//     - Exact match:   ?name=Inbox
+//     - Greater than:  ?unreadCount.gt=0
+//     - Less than:     ?messageSize.lt=1000000
+//     - Contains:      ?subject.contains=urgent
+//     - Starts with:   ?name.startsWith=Project
+//
+//   Sorting:
+//     - Ascending:     ?sort=name.asc
+//     - Descending:    ?sort=dateReceived.desc
+//
+//   Pagination:
+//     - Limit:         ?limit=10
+//     - Offset:        ?offset=20
+//     - Combined:      ?limit=10&offset=20
+//
+//   Expand (resolve lazy properties inline):
+//     - Single:        ?expand=content
+//     - Multiple:      ?expand=content,attachments
+//
+//   Combined:
+//     ?unreadCount.gt=0&sort=unreadCount.desc&limit=10&expand=content
+//
+// ============================================================================
 const resourceTemplates = [
-    { uriTemplate: 'mail://accounts[{index}]', name: 'Account', description: 'Mail account by index' },
-    { uriTemplate: 'mail://accounts[{index}]/mailboxes', name: 'Mailboxes', description: 'Mailboxes for an account' },
-    { uriTemplate: 'mail://accounts[{index}]/mailboxes?{filter}', name: 'Filtered Mailboxes', description: 'Filter: ?name=X, ?unreadCount.gt=0. Sort: ?sort=name.asc' },
-    { uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}', name: 'Mailbox', description: 'Mailbox by name (can be nested: /mailboxes/A/mailboxes/B)' },
-    { uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages', name: 'Messages', description: 'Messages in a mailbox' },
-    { uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages?{filter}', name: 'Filtered Messages', description: 'Filter: ?readStatus=false. Sort: ?sort=dateReceived.desc' },
-    { uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages[{msgIndex}]', name: 'Message', description: 'Single message by index' },
-    { uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}', name: 'Message', description: 'Single message by id' }
+    // --- Standard Mailboxes (aggregate across all accounts) ---
+    {
+        uriTemplate: 'mail://inbox',
+        name: 'All Inboxes',
+        description: 'Combined inbox across all accounts. Returns: name, unreadCount, messages'
+    },
+    {
+        uriTemplate: 'mail://inbox/messages',
+        name: 'Inbox Messages',
+        description: 'Messages from all inboxes'
+    },
+    {
+        uriTemplate: 'mail://inbox/messages?{query}',
+        name: 'Filtered Inbox Messages',
+        description: 'Filter: ?readStatus=false, ?subject.contains=X. Sort: ?sort=dateReceived.desc. Paginate: ?limit=10&offset=0'
+    },
+    {
+        uriTemplate: 'mail://sent',
+        name: 'All Sent',
+        description: 'Combined sent mailbox across all accounts'
+    },
+    {
+        uriTemplate: 'mail://drafts',
+        name: 'All Drafts',
+        description: 'Combined drafts mailbox across all accounts'
+    },
+    {
+        uriTemplate: 'mail://trash',
+        name: 'All Trash',
+        description: 'Combined trash mailbox across all accounts'
+    },
+    {
+        uriTemplate: 'mail://junk',
+        name: 'All Junk',
+        description: 'Combined junk/spam mailbox across all accounts'
+    },
+    {
+        uriTemplate: 'mail://outbox',
+        name: 'Outbox',
+        description: 'Messages waiting to be sent'
+    },
+    // --- Accounts ---
+    {
+        uriTemplate: 'mail://accounts',
+        name: 'All Accounts',
+        description: 'List all mail accounts'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]',
+        name: 'Account by Index',
+        description: 'Single account. Returns: id, name, fullName, emailAddresses'
+    },
+    {
+        uriTemplate: 'mail://accounts/{name}',
+        name: 'Account by Name',
+        description: 'Single account by name. Example: mail://accounts/iCloud'
+    },
+    // --- Mailboxes ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes',
+        name: 'Mailboxes',
+        description: 'All mailboxes for an account. Returns: name, unreadCount per mailbox'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}',
+        name: 'Mailbox by Name',
+        description: 'Single mailbox. Supports nested: /mailboxes/Work/mailboxes/Projects'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes?{query}',
+        name: 'Filtered Mailboxes',
+        description: 'Filter: ?name=Inbox, ?unreadCount.gt=0. Sort: ?sort=unreadCount.desc'
+    },
+    // --- Messages ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages',
+        name: 'Messages',
+        description: 'All messages. Returns: id, subject, sender {name, address}, dateSent, readStatus, etc. Content is lazy (use ?expand=content)'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages[{msgIndex}]',
+        name: 'Message by Index',
+        description: 'Single message by position (0-indexed)'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}',
+        name: 'Message by ID',
+        description: 'Single message by Mail.app message ID'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages?{query}',
+        name: 'Filtered Messages',
+        description: 'Filter: ?readStatus=false, ?flaggedStatus=true. Sort: ?sort=dateReceived.desc. Expand: ?expand=content'
+    },
+    // --- Message Content (Lazy) ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/content',
+        name: 'Message Content',
+        description: 'Full message body text. Fetched separately as it can be large'
+    },
+    // --- Recipients ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/toRecipients',
+        name: 'To Recipients',
+        description: 'To recipients. Returns: name, address'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/ccRecipients',
+        name: 'CC Recipients',
+        description: 'CC recipients. Returns: name, address'
+    },
+    // --- Attachments ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/attachments',
+        name: 'Attachments',
+        description: 'Message attachments. Returns: id, name, fileSize'
+    }
 ];
 // Export for JXA
 globalThis.readResource = readResource;

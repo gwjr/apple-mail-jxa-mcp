@@ -23,6 +23,19 @@ const uris = [
   'mail://accounts[0]/mailboxes?name=Inbox',  // whose filter
   'mail://accounts[0]/mailboxes?sort=name.asc',  // sort only
   'mail://accounts[0]/mailboxes?unreadCount.gt=0&sort=unreadCount.desc',  // filter + sort
+  'mail://accounts[0]/mailboxes?limit=3',  // pagination: limit only
+  'mail://accounts[0]/mailboxes?offset=2&limit=3',  // pagination: offset + limit
+  'mail://accounts[0]/mailboxes?sort=name.asc&limit=5',  // sort + pagination
+  // Standard mailboxes
+  'mail://inbox',
+  'mail://inbox/messages',
+  'mail://inbox/messages?readStatus=false&limit=5',
+  'mail://inbox/messages?limit=2&expand=content',  // expand content inline
+  'mail://sent',
+  'mail://drafts',
+  'mail://trash',
+  'mail://junk',
+  'mail://outbox',
 ];
 
 for (const uri of uris) {
@@ -94,7 +107,8 @@ if (mailboxesResult.ok) {
       console.log('\nResolved Message:');
       console.log('  id:', msgResult.value.id);
       console.log('  subject:', msgResult.value.subject);
-      console.log('  sender:', msgResult.value.sender);
+      console.log('  sender.name:', msgResult.value.sender.name);
+      console.log('  sender.address:', msgResult.value.sender.address);
       console.log('  content._isSpecifier:', msgResult.value.content._isSpecifier);
       console.log('  content.uri:', msgResult.value.content.uri);
 
@@ -166,5 +180,87 @@ if (mailboxesResult.ok) {
     }
   } else {
     console.log('URI error:', comboResult.error);
+  }
+
+  // Test pagination via API
+  console.log('\n=== Pagination Test (API) ===');
+  const paginated = mailboxes.paginate({ limit: 3 });
+  console.log('paginate({ limit: 3 }).uri:', paginated.uri);
+  const paginatedResult = paginated.resolve();
+  if (paginatedResult.ok) {
+    console.log('Got', paginatedResult.value.length, 'mailboxes (limit 3):');
+    paginatedResult.value.forEach(m => console.log(`  ${m.name}`));
+  }
+
+  // Test pagination with offset via API
+  console.log('\n=== Pagination with Offset (API) ===');
+  const paginatedOffset = mailboxes.paginate({ offset: 2, limit: 3 });
+  console.log('paginate({ offset: 2, limit: 3 }).uri:', paginatedOffset.uri);
+  const paginatedOffsetResult = paginatedOffset.resolve();
+  if (paginatedOffsetResult.ok) {
+    console.log('Got', paginatedOffsetResult.value.length, 'mailboxes (offset 2, limit 3):');
+    paginatedOffsetResult.value.forEach(m => console.log(`  ${m.name}`));
+  }
+
+  // Test pagination via URI
+  console.log('\n=== Pagination via URI ===');
+  const paginatedUriResult = specifierFromURI('mail://accounts[0]/mailboxes?sort=name.asc&limit=5');
+  if (paginatedUriResult.ok) {
+    console.log('URI:', paginatedUriResult.value.uri);
+    const resolved = paginatedUriResult.value.resolve();
+    if (resolved.ok) {
+      console.log('Sorted + paginated (limit 5):');
+      resolved.value.forEach(m => console.log(`  ${m.name}`));
+    }
+  }
+}
+
+// Test standard mailboxes
+console.log('\n=== Standard Mailboxes ===');
+
+const standardMailboxes = ['inbox', 'sent', 'drafts', 'trash', 'junk', 'outbox'];
+for (const name of standardMailboxes) {
+  const result = specifierFromURI(`mail://${name}`);
+  if (result.ok) {
+    const resolved = result.value.resolve();
+    if (resolved.ok) {
+      console.log(`${name}: ${resolved.value.name} (${resolved.value.unreadCount} unread)`);
+    } else {
+      console.log(`${name}: resolve error - ${resolved.error}`);
+    }
+  } else {
+    console.log(`${name}: URI error - ${result.error}`);
+  }
+}
+
+// Test inbox messages
+console.log('\n=== Inbox Messages (first 3) ===');
+const inboxMsgsResult = specifierFromURI('mail://inbox/messages?limit=3');
+if (inboxMsgsResult.ok) {
+  console.log('URI:', inboxMsgsResult.value.uri);
+  const msgs = inboxMsgsResult.value.resolve();
+  if (msgs.ok) {
+    msgs.value.forEach(m => {
+      console.log(`  ${m.subject.substring(0, 50)}... (from: ${m.sender.name} <${m.sender.address}>)`);
+    });
+  } else {
+    console.log('Error:', msgs.error);
+  }
+}
+
+// Test expand parameter
+console.log('\n=== Expand Parameter Test ===');
+const expandResult = specifierFromURI('mail://inbox/messages?limit=1&expand=content');
+if (expandResult.ok) {
+  console.log('URI:', expandResult.value.uri);
+  const msgs = expandResult.value.resolve();
+  if (msgs.ok && msgs.value.length > 0) {
+    const m = msgs.value[0];
+    console.log('Subject:', m.subject);
+    console.log('Content is specifier?', m.content._isSpecifier === true);
+    console.log('Content type:', typeof m.content);
+    if (typeof m.content === 'string') {
+      console.log('Content length:', m.content.length, '(expanded inline)');
+    }
   }
 }
