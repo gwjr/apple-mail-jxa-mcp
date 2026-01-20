@@ -47,7 +47,7 @@ This server runs as a single JXA process with proper NSRunLoop blocking - no Nod
 
 ## Installation
 
-### Claude Desktop
+### Claude Desktop (auto-rebuild on connect)
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -55,12 +55,31 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "apple-mail": {
-      "command": "/path/to/apple-mail-jxa-mcp/mail.js",
-      "args": []
+      "command": "make",
+      "args": ["-C", "/path/to/apple-mail-jxa-mcp", "-s", "run"]
     }
   }
 }
 ```
+
+This automatically rebuilds from source if any files changed, then runs the server.
+
+### Claude Desktop (pre-built)
+
+If you prefer not to require `make`:
+
+```json
+{
+  "mcpServers": {
+    "apple-mail": {
+      "command": "osascript",
+      "args": ["-l", "JavaScript", "/path/to/apple-mail-jxa-mcp/dist/mail.js"]
+    }
+  }
+}
+```
+
+Run `make` once to generate `dist/mail.js`.
 
 ### Claude Code
 
@@ -70,17 +89,11 @@ Add to your project's `.mcp.json`:
 {
   "mcpServers": {
     "apple-mail": {
-      "command": "/path/to/apple-mail-jxa-mcp/mail.js",
-      "args": []
+      "command": "make",
+      "args": ["-C", "/path/to/apple-mail-jxa-mcp", "-s", "run"]
     }
   }
 }
-```
-
-Make sure the script is executable:
-
-```bash
-chmod +x mail.js
 ```
 
 ## Requirements
@@ -88,6 +101,38 @@ chmod +x mail.js
 - macOS (tested on macOS 15)
 - Mail.app configured with at least one account
 - Automation permissions for the MCP client to control Mail
+
+## Project Structure
+
+```
+src/
+  framework.js      # MCP protocol handler, NSRunLoop I/O
+  cache.js          # SQLite message location cache
+  facades.js        # Mailbox/Message wrapper objects
+  mail.js           # Mail.app singleton interface
+  resources.js      # MCP resource handlers
+  tools-messages.js # Message operation tools
+  tools-crud.js     # Attachment/rule/signature tools
+  main.js           # Entry point
+
+dist/
+  mail.js           # Concatenated output (built by make)
+
+Makefile            # Build system
+```
+
+Source files are concatenated with 400-line padding for debuggable line numbers:
+- Error at line 1847 → file index 4 (1847÷400), line 247 in that file (1847%400)
+- Run `make check` to see the mapping
+
+## Building
+
+```bash
+make          # Build dist/mail.js
+make run      # Build and run
+make clean    # Remove dist/
+make check    # Show line number mapping
+```
 
 ## Usage Examples
 
@@ -101,7 +146,7 @@ Once configured, you can ask Claude things like:
 
 ## Testing
 
-Run the test suite:
+Run the test suite (requires Node.js):
 
 ```bash
 node test-mail.js
@@ -125,6 +170,7 @@ Key implementation details:
 - NSFileHandle notifications for stdin
 - Native JSON.parse/stringify (no serialization layer)
 - Direct JXA automation of Mail.app
+- SQLite cache for fast message lookups
 
 ## License
 
