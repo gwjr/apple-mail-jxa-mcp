@@ -1,0 +1,12 @@
+{
+  "name": "jxa-mcp-typescript-test",
+  "version": "1.0.0",
+  "description": "Proof-of-concept: TypeScript to JXA MCP server",
+  "scripts": {
+    "build": "tsc",
+    "run": "osascript -l JavaScript dist/server.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  }
+}

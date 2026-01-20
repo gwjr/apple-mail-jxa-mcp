@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "None",
+    "lib": ["ES2023"],
+    "outFile": "dist/server.js",
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noEmitOnError": true,
+    "declaration": false,
+    "removeComments": false,
+    "esModuleInterop": false,
+    "skipLibCheck": true
+  },
+  "files": [
+    "src/jxa.d.ts",
+    "src/mcp-server.ts",
+    "src/main.ts"
+  ]
+}
