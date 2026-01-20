@@ -7,7 +7,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const readline = require('readline');
 
-const SERVER_PATH = path.join(__dirname, 'mail.js');
+const SERVER_PATH = path.join(__dirname, 'dist', 'mail.js');
 const TIMEOUT = 10000;
 
 class MCPTestClient {
