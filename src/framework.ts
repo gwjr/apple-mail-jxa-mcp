@@ -1,8 +1,8 @@
-/// <reference path="../types/jxa.d.ts" />
-/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="./types/jxa.d.ts" />
+/// <reference path="./types/mail-app.d.ts" />
 
 // ============================================================================
-// Proof of Concept: Declarative JXA Schema System
+// Declarative JXA Schema Framework
 // ============================================================================
 
 // ============================================================================
@@ -21,7 +21,90 @@ function tryResolve<T>(fn: () => T, context: string): Result<T> {
   }
 }
 
-// Result<T> is defined in mail-app.d.ts
+// Registry of root specifier factories by scheme
+const schemeRoots: Record<string, () => any> = {};
+
+function registerScheme(scheme: string, root: () => any): void {
+  schemeRoots[scheme] = root;
+}
+
+// Deserialize a URI into a specifier
+function specifierFromURI(uri: string): Result<{ _isSpecifier: true; uri: string; resolve(): Result<any> }> {
+  const schemeEnd = uri.indexOf('://');
+  if (schemeEnd === -1) {
+    return { ok: false, error: `Invalid URI (no scheme): ${uri}` };
+  }
+
+  const scheme = uri.slice(0, schemeEnd);
+  let rest = uri.slice(schemeEnd + 3);
+
+  // Separate query string
+  let query: string | undefined;
+  const queryIdx = rest.indexOf('?');
+  if (queryIdx !== -1) {
+    query = rest.slice(queryIdx + 1);
+    rest = rest.slice(0, queryIdx);
+  }
+
+  const rootFactory = schemeRoots[scheme];
+  if (!rootFactory) {
+    return { ok: false, error: `Unknown scheme: ${scheme}` };
+  }
+
+  let current: any = rootFactory();
+  let resolved = `${scheme}://`;
+
+  for (const segment of rest.split('/').filter(s => s)) {
+    const indexMatch = segment.match(/^(.+?)\[(\d+)\]$/);
+    const name = indexMatch ? indexMatch[1] : segment;
+    const index = indexMatch ? parseInt(indexMatch[2]) : undefined;
+
+    try {
+      // Property access or element access?
+      if (current[name] !== undefined) {
+        current = current[name];
+        resolved += (resolved.endsWith('://') ? '' : '/') + name;
+      } else if (current.byName) {
+        current = current.byName(decodeURIComponent(name));
+        resolved += (resolved.endsWith('://') ? '' : '/') + name;
+      } else if (current.byId) {
+        current = current.byId(decodeURIComponent(name));
+        resolved += (resolved.endsWith('://') ? '' : '/') + name;
+      } else {
+        return { ok: false, error: `Cannot navigate to '${name}' (resolved: ${resolved})` };
+      }
+
+      // Apply index if present
+      if (index !== undefined) {
+        if (!current.byIndex) {
+          return { ok: false, error: `Cannot index into '${name}' (resolved: ${resolved})` };
+        }
+        current = current.byIndex(index);
+        resolved += `[${index}]`;
+      }
+    } catch (e) {
+      return { ok: false, error: `Failed at '${segment}': ${e} (resolved: ${resolved})` };
+    }
+  }
+
+  // Apply whose filter and sort if present
+  if (query) {
+    try {
+      const { filter, sort } = parseQuery(query);
+      if (Object.keys(filter).length > 0 && current.whose) {
+        current = current.whose(filter);
+      }
+      if (sort && current.sortBy) {
+        current = current.sortBy(sort);
+      }
+      resolved += '?' + query;
+    } catch (e) {
+      return { ok: false, error: `Failed to apply query: ${e} (resolved: ${resolved})` };
+    }
+  }
+
+  return { ok: true, value: current };
+}
 
 // ============================================================================
 // Core Type Descriptors
@@ -144,11 +227,37 @@ type AddressingFromModes<T, Modes> =
   Modes extends readonly ['id'] ? IdAddressable<T> :
   IndexAddressable<T>; // Default fallback
 
-// Collection specifier
+// ============================================================================
+// Whose Filter System
+// ============================================================================
+
+// Predicates for property filtering
+type Predicate<T> =
+  | { equals: T }
+  | { contains: T extends string ? string : never }
+  | { startsWith: T extends string ? string : never }
+  | { greaterThan: T extends number ? number : never }
+  | { lessThan: T extends number ? number : never };
+
+// Filter spec: map of property names to predicates
+type WhoseFilter<T> = {
+  [K in keyof T]?: Predicate<T[K]>;
+};
+
+// Sort specification
+type SortDirection = 'asc' | 'desc';
+type SortSpec<T> = {
+  by: keyof T;
+  direction?: SortDirection;
+};
+
+// Collection specifier with whose and sortBy capabilities
 type CollectionSpecifier<T, A = IndexAddressable<T>> = {
   readonly _isSpecifier: true;
   readonly uri: string;
   resolve(): Result<T[]>;
+  whose(filter: WhoseFilter<T>): CollectionSpecifier<T, A>;
+  sortBy(spec: SortSpec<T>): CollectionSpecifier<T, A>;
 } & A;
 
 // ============================================================================
@@ -173,7 +282,7 @@ function createDerived<Base extends Record<string, any>>(
     static fromJXA(_jxa: any, _uri?: string): LowerAll<Base> {
       return new DerivedClass(_jxa, _uri) as any;
     }
-    
+
     private _initializeProperties() {
       for (const [key, descriptor] of Object.entries(schema)) {
         if (this._isAccessor(descriptor)) {
@@ -229,9 +338,8 @@ function createDerived<Base extends Record<string, any>>(
       Object.defineProperty(this, key, {
         get() {
           const jxaCollection = self._jxa[descriptor._jxaName];
-          const uri = self._uri
-            ? `${self._uri}/${key}`
-            : `${typeName.toLowerCase()}://.../${key}`;
+          const base = self._uri || `${typeName.toLowerCase()}://`;
+          const uri = base.endsWith('://') ? `${base}${key}` : `${base}/${key}`;
           return createCollectionSpecifier(
             uri,
             jxaCollection,
@@ -243,14 +351,14 @@ function createDerived<Base extends Record<string, any>>(
         enumerable: true
       });
     }
-    
+
     private _convertValue(value: any): any {
       if (value == null) return '';
       if (Array.isArray(value)) return value.map(v => this._convertValue(v));
       return value;
     }
   }
-  
+
   return DerivedClass as any as DerivedConstructor<Base>;
 }
 
@@ -276,18 +384,18 @@ function createElementSpecifier<Base extends Record<string, any>>(
   schema: Base,
   typeName: string
 ): Specifier<Derived<Base>> {
-  
+
   const ElementClass = createDerived(schema, typeName);
-  
+
   const spec: any = {
     _isSpecifier: true as const,
     uri,
-    
+
     resolve(): Result<Derived<Base>> {
       return tryResolve(() => ElementClass.fromJXA(jxa, uri), uri);
     }
   };
-  
+
   // Add lifted property specifiers
   for (const [key, descriptor] of Object.entries(schema)) {
     if ('_accessor' in (descriptor as any) || '_lazyAccessor' in (descriptor as any)) {
@@ -318,7 +426,7 @@ function createElementSpecifier<Base extends Record<string, any>>(
       });
     }
   }
-  
+
   return spec as Specifier<Derived<Base>>;
 }
 
@@ -331,30 +439,60 @@ function createCollectionSpecifier<
   jxaCollection: any,
   elementBase: ElementBase,
   addressing: Modes,
-  typeName: string
+  typeName: string,
+  sortSpec?: SortSpec<any>,
+  jsFilter?: WhoseFilter<any>
 ): CollectionSpecifier<Derived<ElementBase>, AddressingFromModes<Derived<ElementBase>, Modes>> {
-  
+
   const ElementClass = createDerived(elementBase, typeName);
-  
+
   const spec: any = {
     _isSpecifier: true as const,
     uri,
-    
+
     resolve(): Result<Derived<ElementBase>[]> {
       return tryResolve(() => {
         const jxaArray = typeof jxaCollection === 'function' ? jxaCollection() : jxaCollection;
-        return jxaArray.map((jxa: any, i: number) => ElementClass.fromJXA(jxa, `${uri}[${i}]`));
+        let results = jxaArray.map((jxa: any, i: number) => ElementClass.fromJXA(jxa, `${uri}[${i}]`));
+
+        // Apply JS filter if specified
+        if (jsFilter && Object.keys(jsFilter).length > 0) {
+          results = results.filter((item: any) => {
+            for (const [key, predicate] of Object.entries(jsFilter)) {
+              const val = item[key];
+              const pred = predicate as any;
+              if ('contains' in pred && typeof val === 'string' && !val.includes(pred.contains)) return false;
+              if ('startsWith' in pred && typeof val === 'string' && !val.startsWith(pred.startsWith)) return false;
+              if ('greaterThan' in pred && !(val > pred.greaterThan)) return false;
+              if ('lessThan' in pred && !(val < pred.lessThan)) return false;
+              if ('equals' in pred && val !== pred.equals) return false;
+            }
+            return true;
+          });
+        }
+
+        // Apply sort if specified
+        if (sortSpec) {
+          results.sort((a: any, b: any) => {
+            const aVal = a[sortSpec.by];
+            const bVal = b[sortSpec.by];
+            const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+            return sortSpec.direction === 'desc' ? -cmp : cmp;
+          });
+        }
+
+        return results;
       }, uri);
     }
   };
-  
+
   // Add addressing methods
   if (addressing.includes('index')) {
     spec.byIndex = function(i: number): Specifier<Derived<ElementBase>> {
       return createElementSpecifier(`${uri}[${i}]`, jxaCollection.at(i), elementBase, typeName);
     };
   }
-  
+
   if (addressing.includes('name')) {
     spec.byName = function(name: string): Specifier<Derived<ElementBase>> {
       return createElementSpecifier(
@@ -365,106 +503,118 @@ function createCollectionSpecifier<
       );
     };
   }
-  
+
   if (addressing.includes('id')) {
     spec.byId = function(id: string | number): Specifier<Derived<ElementBase>> {
       return createElementSpecifier(`${uri}/${id}`, jxaCollection.byId(id), elementBase, typeName);
     };
   }
-  
+
+  // Add whose filtering
+  spec.whose = function(filter: WhoseFilter<Derived<ElementBase>>): CollectionSpecifier<Derived<ElementBase>, any> {
+    const filteredUri = `${uri}?${encodeFilter(filter)}`;
+
+    // Build JXA whose clause
+    const jxaFilter: any = {};
+    for (const [key, predicate] of Object.entries(filter)) {
+      const descriptor = elementBase[key];
+      if (!descriptor || !('_jxaName' in descriptor)) {
+        throw new Error(`Unknown property: ${key}`);
+      }
+      const jxaName = descriptor._jxaName;
+      const pred = predicate as any;
+
+      if ('equals' in pred) {
+        jxaFilter[jxaName] = pred.equals;
+      } else if ('contains' in pred) {
+        jxaFilter[jxaName] = { _contains: pred.contains };
+      } else if ('startsWith' in pred) {
+        jxaFilter[jxaName] = { _beginsWith: pred.startsWith };
+      } else if ('greaterThan' in pred) {
+        jxaFilter[jxaName] = { _greaterThan: pred.greaterThan };
+      } else if ('lessThan' in pred) {
+        jxaFilter[jxaName] = { _lessThan: pred.lessThan };
+      }
+    }
+
+    // Try JXA whose first, fall back to JS filter
+    try {
+      const filteredJXA = jxaCollection.whose(jxaFilter);
+      // Test if it works by accessing length (triggers evaluation)
+      void filteredJXA.length;
+      return createCollectionSpecifier(filteredUri, filteredJXA, elementBase, addressing, typeName, sortSpec);
+    } catch {
+      // JXA filter failed, use JS post-filter
+      return createCollectionSpecifier(filteredUri, jxaCollection, elementBase, addressing, typeName, sortSpec, filter);
+    }
+  };
+
+  // Add sortBy
+  spec.sortBy = function(newSortSpec: SortSpec<Derived<ElementBase>>): CollectionSpecifier<Derived<ElementBase>, any> {
+    const sep = uri.includes('?') ? '&' : '?';
+    const sortedUri = `${uri}${sep}sort=${String(newSortSpec.by)}.${newSortSpec.direction || 'asc'}`;
+    return createCollectionSpecifier(sortedUri, jxaCollection, elementBase, addressing, typeName, newSortSpec, jsFilter);
+  };
+
   return spec as CollectionSpecifier<Derived<ElementBase>, AddressingFromModes<Derived<ElementBase>, typeof addressing>>;
 }
 
 // ============================================================================
-// Schema Definitions
+// Filter Encoding/Decoding
 // ============================================================================
 
-const RecipientBase = {
-  name: accessor<string, 'name'>('name'),
-  address: accessor<string, 'address'>('address'),
-} as const;
-
-const AttachmentBase = {
-  id: accessor<string, 'id'>('id'),
-  name: accessor<string, 'name'>('name'),
-  fileSize: accessor<number, 'fileSize'>('fileSize'),
-} as const;
-
-const MessageBase = {
-  id: accessor<number, 'id'>('id'),
-  messageId: accessor<string, 'messageId'>('messageId'),
-  subject: accessor<string, 'subject'>('subject'),
-  sender: accessor<string, 'sender'>('sender'),
-  replyTo: accessor<string, 'replyTo'>('replyTo'),
-  dateSent: accessor<Date, 'dateSent'>('dateSent'),
-  dateReceived: accessor<Date, 'dateReceived'>('dateReceived'),
-  content: lazyAccessor<string, 'content'>('content'),  // lazy - expensive to fetch
-  readStatus: accessor<boolean, 'readStatus'>('readStatus'),
-  flaggedStatus: accessor<boolean, 'flaggedStatus'>('flaggedStatus'),
-  junkMailStatus: accessor<boolean, 'junkMailStatus'>('junkMailStatus'),
-  messageSize: accessor<number, 'messageSize'>('messageSize'),
-  toRecipients: collection('toRecipients', RecipientBase, ['name', 'index'] as const),
-  ccRecipients: collection('ccRecipients', RecipientBase, ['name', 'index'] as const),
-  bccRecipients: collection('bccRecipients', RecipientBase, ['name', 'index'] as const),
-  attachments: collection('mailAttachments', AttachmentBase, ['name', 'index', 'id'] as const),
-} as const;
-
-const MailboxBase = {
-  name: accessor<string, 'name'>('name'),
-  unreadCount: accessor<number, 'unreadCount'>('unreadCount'),
-  messages: collection('messages', MessageBase, ['index', 'id'] as const)
-} as const;
-
-const AccountBase = {
-  id: accessor<string, 'id'>('id'),
-  name: accessor<string, 'name'>('name'),
-  fullName: accessor<string, 'fullName'>('fullName'),
-  emailAddresses: accessor<string[], 'emailAddresses'>('emailAddresses'),
-  mailboxes: collection('mailboxes', MailboxBase, ['name', 'index'] as const)
-} as const;
-
-// ============================================================================
-// Create Derived Types
-// ============================================================================
-
-const Mailbox = createDerived(MailboxBase, 'Mailbox');
-const Account = createDerived(AccountBase, 'Account');
-
-// ============================================================================
-// Type Aliases for Export
-// ============================================================================
-
-type Mailbox = InstanceType<typeof Mailbox>;
-type Account = InstanceType<typeof Account>;
-
-// ============================================================================
-// Entry Point
-// ============================================================================
-
-var Mail = {
-  _app: null as MailApplication | null,
-
-  get app(): MailApplication {
-    if (!this._app) {
-      const app = Application('Mail');
-      if (typeof app.accounts === 'undefined') {
-        throw new Error('Not connected to Mail.app');
-      }
-      this._app = app as MailApplication;
+function encodeFilter(filter: WhoseFilter<any>): string {
+  const parts: string[] = [];
+  for (const [key, predicate] of Object.entries(filter)) {
+    const pred = predicate as any;
+    if ('equals' in pred) {
+      parts.push(`${key}=${encodeURIComponent(String(pred.equals))}`);
+    } else if ('contains' in pred) {
+      parts.push(`${key}.contains=${encodeURIComponent(pred.contains)}`);
+    } else if ('startsWith' in pred) {
+      parts.push(`${key}.startsWith=${encodeURIComponent(pred.startsWith)}`);
+    } else if ('greaterThan' in pred) {
+      parts.push(`${key}.gt=${pred.greaterThan}`);
+    } else if ('lessThan' in pred) {
+      parts.push(`${key}.lt=${pred.lessThan}`);
     }
-    return this._app;
-  },
-
-  accounts(): CollectionSpecifier<Account, NameAddressable<Account> & IndexAddressable<Account> & IdAddressable<Account>> {
-    return createCollectionSpecifier(
-      'mail://accounts',
-      this.app.accounts,
-      AccountBase,
-      ['name', 'index', 'id'] as const,
-      'Account'
-    );
   }
-};
+  return parts.join('&');
+}
 
-// Export for JXA
-(globalThis as any).Mail = Mail;
+function parseQuery(query: string): { filter: WhoseFilter<any>; sort?: SortSpec<any> } {
+  const result: { filter: WhoseFilter<any>; sort?: SortSpec<any> } = { filter: {} };
+
+  for (const part of query.split('&')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = part.slice(0, eqIdx);
+    const value = part.slice(eqIdx + 1);
+
+    // Handle sort parameter
+    if (key === 'sort') {
+      const [by, direction] = value.split('.');
+      result.sort = { by, direction: (direction as SortDirection) || 'asc' };
+      continue;
+    }
+
+    // Handle filter parameters
+    const dotIdx = key.lastIndexOf('.');
+    if (dotIdx === -1) {
+      result.filter[key] = { equals: decodeURIComponent(value) };
+    } else {
+      const prop = key.slice(0, dotIdx);
+      const op = key.slice(dotIdx + 1);
+      if (op === 'contains') {
+        result.filter[prop] = { contains: decodeURIComponent(value) };
+      } else if (op === 'startsWith') {
+        result.filter[prop] = { startsWith: decodeURIComponent(value) };
+      } else if (op === 'gt') {
+        result.filter[prop] = { greaterThan: Number(value) };
+      } else if (op === 'lt') {
+        result.filter[prop] = { lessThan: Number(value) };
+      }
+    }
+  }
+  return result;
+}

@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outFile": "dist/mail-test.js"
+  },
+  "files": [
+    "src/types/jxa.d.ts",
+    "src/types/mail-app.d.ts",
+    "src/types/mcp.d.ts",
+    "src/framework.ts",
+    "src/mail.ts",
+    "src/resources.ts"
+  ]
+}

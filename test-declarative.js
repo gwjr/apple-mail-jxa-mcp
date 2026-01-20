@@ -3,7 +3,7 @@
 ObjC.import('stdlib');
 
 const code = $.NSString.stringWithContentsOfFileEncodingError(
-  'dist/mail.js',
+  'dist/mail-test.js',
   $.NSUTF8StringEncoding,
   null
 ).js;
@@ -11,12 +11,44 @@ eval(code);
 
 console.log('=== Declarative Schema Test ===\n');
 
-// Get accounts collection
-const accounts = Mail.accounts();
+// Test specifierFromURI
+console.log('=== URI Deserialization ===');
+const uris = [
+  'mail://',
+  'mail://accounts',
+  'mail://accounts[0]',
+  'mail://accounts[0]/mailboxes',
+  'mail://accounts[0]/mailboxes/INBOX',
+  'mail://accounts[0]/mailboxes/INBOX/mailboxes',  // nested mailboxes
+  'mail://accounts[0]/mailboxes?name=Inbox',  // whose filter
+  'mail://accounts[0]/mailboxes?sort=name.asc',  // sort only
+  'mail://accounts[0]/mailboxes?unreadCount.gt=0&sort=unreadCount.desc',  // filter + sort
+];
+
+for (const uri of uris) {
+  const result = specifierFromURI(uri);
+  if (result.ok) {
+    console.log(`${uri} → ${result.value.uri}`);
+  } else {
+    console.log(`${uri} → ERROR: ${result.error}`);
+  }
+}
+console.log('');
+
+// Test readResource
+console.log('=== MCP Resource Handler ===');
+const resource = readResource('mail://accounts[0]');
+console.log('readResource(mail://accounts[0]):', resource.mimeType, typeof resource.text);
+console.log('');
+
+// Get accounts collection via URI
+const accountsResult = specifierFromURI('mail://accounts');
+const accounts = accountsResult.value;
 console.log('accounts.uri:', accounts.uri);
 
 // Get first account by index
-const acc = accounts.byIndex(0);
+const accResult2 = specifierFromURI('mail://accounts[0]');
+const acc = accResult2.value;
 console.log('acc.uri:', acc.uri);
 
 // Resolve just the name
@@ -88,5 +120,51 @@ if (mailboxesResult.ok) {
     }
   } else {
     console.log('No mailbox with unread messages found');
+  }
+
+  // Test whose filter
+  console.log('\n=== Whose Filter Test ===');
+  const inboxFilter = mailboxes.whose({ name: { equals: 'Inbox' } });
+  console.log('whose({ name: equals Inbox }).uri:', inboxFilter.uri);
+  const inboxResult = inboxFilter.resolve();
+  if (inboxResult.ok) {
+    console.log('Found:', inboxResult.value.length, 'mailbox(es)');
+    if (inboxResult.value.length > 0) {
+      console.log('First match:', inboxResult.value[0].name);
+    }
+  } else {
+    console.log('Error:', inboxResult.error);
+  }
+
+  // Test sort
+  console.log('\n=== Sort Test ===');
+  const sorted = mailboxes.sortBy({ by: 'unreadCount', direction: 'desc' });
+  console.log('sortBy({ by: unreadCount, direction: desc }).uri:', sorted.uri);
+  const sortedResult = sorted.resolve();
+  if (sortedResult.ok) {
+    console.log('Top 5 by unread:');
+    sortedResult.value.slice(0, 5).forEach(m => {
+      console.log(`  ${m.name}: ${m.unreadCount}`);
+    });
+  } else {
+    console.log('Error:', sortedResult.error);
+  }
+
+  // Test filter + sort via URI
+  console.log('\n=== Filter + Sort via URI ===');
+  const comboResult = specifierFromURI('mail://accounts[0]/mailboxes?unreadCount.gt=0&sort=unreadCount.desc');
+  if (comboResult.ok) {
+    console.log('URI:', comboResult.value.uri);
+    const resolved = comboResult.value.resolve();
+    if (resolved.ok) {
+      console.log('Mailboxes with unread, sorted desc:');
+      resolved.value.slice(0, 5).forEach(m => {
+        console.log(`  ${m.name}: ${m.unreadCount}`);
+      });
+    } else {
+      console.log('Resolve error:', resolved.error);
+    }
+  } else {
+    console.log('URI error:', comboResult.error);
   }
 }

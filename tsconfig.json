@@ -16,6 +16,11 @@
   "files": [
     "src/types/jxa.d.ts",
     "src/types/mail-app.d.ts",
-    "src/mail/declarative-proof-of-concept.ts"
+    "src/types/mcp.d.ts",
+    "src/core/mcp-server.ts",
+    "src/framework.ts",
+    "src/mail.ts",
+    "src/resources.ts",
+    "src/main.ts"
   ]
 }
