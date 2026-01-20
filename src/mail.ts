@@ -211,6 +211,111 @@ function getMailApp() {
 // Register mail:// scheme
 registerScheme('mail', getMailApp);
 
+// Standard mailbox aliases for accounts
+// Handles mail://accounts[X]/inbox, /sent, /drafts, /junk, /trash
+const accountStandardMailboxes: Record<string, string> = {
+  inbox: 'inbox',
+  sent: 'sentMailbox',
+  drafts: 'draftsMailbox',
+  junk: 'junkMailbox',
+  trash: 'trashMailbox'
+};
+
+// Completion hook for account standard mailboxes
+registerCompletionHook((specifier: any, partial: string) => {
+  // Only applies to account specifiers (check if URI matches accounts[X])
+  if (!specifier || !specifier.uri || !specifier.uri.match(/^mail:\/\/accounts\[\d+\]$/)) {
+    return [];
+  }
+
+  return Object.keys(accountStandardMailboxes)
+    .filter(name => name.startsWith(partial.toLowerCase()))
+    .map(name => ({
+      value: `${name}/`,
+      label: name,
+      description: 'Standard mailbox'
+    }));
+});
+
+registerNavigationHook((parent: any, name: string, uri: string) => {
+  // Check if this is an account specifier navigating to a standard mailbox
+  const jxaAppName = accountStandardMailboxes[name];
+  if (!jxaAppName) return undefined;
+
+  // Check if parent has an id (accounts have id)
+  if (!parent || !parent._isSpecifier) return undefined;
+
+  // Try to get the account's JXA object and find its standard mailbox
+  try {
+    const parentResult = parent.resolve();
+    if (!parentResult.ok) return undefined;
+
+    const accountId = parentResult.value.id;
+    if (!accountId) return undefined;
+
+    // Get the app-level standard mailbox and find the one for this account
+    const jxa = Application('Mail');
+    const appMailbox = jxa[jxaAppName]();
+    const accountMailbox = appMailbox.mailboxes().find((m: any) => {
+      try {
+        return m.account().id() === accountId;
+      } catch {
+        return false;
+      }
+    });
+
+    if (!accountMailbox) return undefined;
+
+    // Create a mailbox specifier for it
+    return createMailboxSpecifier(uri, accountMailbox);
+  } catch {
+    return undefined;
+  }
+});
+
+// Helper to create a mailbox specifier for a JXA mailbox
+function createMailboxSpecifier(uri: string, jxaMailbox: any): any {
+  const spec: any = {
+    _isSpecifier: true,
+    uri,
+    resolve(): Result<any> {
+      return tryResolve(() => Mailbox.fromJXA(jxaMailbox, uri), uri);
+    }
+  };
+
+  // Add properties from MailboxBase
+  for (const [key, descriptor] of Object.entries(MailboxBase)) {
+    if ('_accessor' in (descriptor as any)) {
+      Object.defineProperty(spec, key, {
+        get() {
+          const jxaName = (descriptor as any)._jxaName;
+          return scalarSpecifier(`${uri}/${key}`, () => {
+            const value = jxaMailbox[jxaName]();
+            return value == null ? '' : value;
+          });
+        },
+        enumerable: true
+      });
+    } else if ('_collection' in (descriptor as any)) {
+      Object.defineProperty(spec, key, {
+        get() {
+          const desc = descriptor as any;
+          return createCollectionSpecifier(
+            `${uri}/${key}`,
+            jxaMailbox[desc._jxaName],
+            desc._elementBase,
+            desc._addressing,
+            'Mailbox_' + key
+          );
+        },
+        enumerable: true
+      });
+    }
+  }
+
+  return spec;
+}
+
 // Export for JXA
 (globalThis as any).specifierFromURI = specifierFromURI;
 (globalThis as any).getCompletions = getCompletions;

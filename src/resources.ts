@@ -4,7 +4,7 @@
 // MCP Resource Handler
 // ============================================================================
 
-function readResource(uri: string): { mimeType: string; text: string | object } | null {
+function readResource(uri: string): { mimeType: string; text: string | object; fixedUri?: string } | null {
   const spec = specifierFromURI(uri);
   if (!spec.ok) {
     return { mimeType: 'text/plain', text: spec.error };
@@ -15,7 +15,18 @@ function readResource(uri: string): { mimeType: string; text: string | object } 
     return { mimeType: 'text/plain', text: result.error };
   }
 
-  return { mimeType: 'application/json', text: result.value };
+  // Try to get a stable reference URI via fix()
+  let fixedUri: string | undefined;
+  const fixed = spec.value.fix();
+  if (fixed.ok && fixed.value.uri !== uri) {
+    fixedUri = fixed.value.uri;
+    // Update _uri in result if it's an object
+    if (result.value && typeof result.value === 'object' && '_uri' in result.value) {
+      (result.value as any)._uri = fixedUri;
+    }
+  }
+
+  return { mimeType: 'application/json', text: result.value, fixedUri };
 }
 
 function listResources(): McpResource[] {
@@ -144,6 +155,38 @@ const resourceTemplates: McpResourceTemplate[] = [
     uriTemplate: 'mail://accounts/{name}',
     name: 'Account by Name',
     description: 'Single account by name. Example: mail://accounts/iCloud'
+  },
+
+  // --- Account Standard Mailboxes ---
+  {
+    uriTemplate: 'mail://accounts[{index}]/inbox',
+    name: 'Account Inbox',
+    description: "The account's inbox mailbox"
+  },
+  {
+    uriTemplate: 'mail://accounts[{index}]/sent',
+    name: 'Account Sent',
+    description: "The account's sent mailbox"
+  },
+  {
+    uriTemplate: 'mail://accounts[{index}]/drafts',
+    name: 'Account Drafts',
+    description: "The account's drafts mailbox"
+  },
+  {
+    uriTemplate: 'mail://accounts[{index}]/junk',
+    name: 'Account Junk',
+    description: "The account's junk/spam mailbox"
+  },
+  {
+    uriTemplate: 'mail://accounts[{index}]/trash',
+    name: 'Account Trash',
+    description: "The account's trash/deleted items mailbox"
+  },
+  {
+    uriTemplate: 'mail://accounts[{index}]/inbox/messages?{query}',
+    name: 'Account Inbox Messages',
+    description: "Messages in the account's inbox. Supports filter/sort/pagination"
   },
 
   // --- Mailboxes ---

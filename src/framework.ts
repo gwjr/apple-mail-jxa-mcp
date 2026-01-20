@@ -28,6 +28,24 @@ function registerScheme(scheme: string, root: () => any): void {
   schemeRoots[scheme] = root;
 }
 
+// Registry of navigation hooks for special paths
+// Hook receives (parentSpecifier, propertyName, uri) and returns a specifier or undefined
+type NavigationHook = (parent: any, name: string, uri: string) => any | undefined;
+const navigationHooks: NavigationHook[] = [];
+
+function registerNavigationHook(hook: NavigationHook): void {
+  navigationHooks.push(hook);
+}
+
+// Registry of completion hooks for extra completions
+// Hook receives (specifier, partial) and returns extra completions
+type CompletionHook = (specifier: any, partial: string) => Completion[];
+const completionHooks: CompletionHook[] = [];
+
+function registerCompletionHook(hook: CompletionHook): void {
+  completionHooks.push(hook);
+}
+
 // Guard against recursive completion calls during error handling
 let _inErrorSuggestion = false;
 
@@ -46,7 +64,7 @@ function suggestCompletions(partial: string, max: number = 5): string {
 }
 
 // Deserialize a URI into a specifier
-function specifierFromURI(uri: string): Result<{ _isSpecifier: true; uri: string; resolve(): Result<any> }> {
+function specifierFromURI(uri: string): Result<{ _isSpecifier: true; uri: string; resolve(): Result<any>; fix(): Result<any> }> {
   const schemeEnd = uri.indexOf('://');
   if (schemeEnd === -1) {
     const suggestions = suggestCompletions(uri);
@@ -91,9 +109,21 @@ function specifierFromURI(uri: string): Result<{ _isSpecifier: true; uri: string
         current = current.byId(decodeURIComponent(name));
         resolved += (resolved.endsWith('://') ? '' : '/') + name;
       } else {
-        const partial = resolved + (resolved.endsWith('://') ? '' : '/') + name;
-        const suggestions = suggestCompletions(partial);
-        return { ok: false, error: `Cannot navigate to '${name}' from ${resolved}.${suggestions}` };
+        // Try navigation hooks for special paths
+        const nextUri = resolved + (resolved.endsWith('://') ? '' : '/') + name;
+        let hooked: any = undefined;
+        for (const hook of navigationHooks) {
+          hooked = hook(current, name, nextUri);
+          if (hooked !== undefined) break;
+        }
+        if (hooked !== undefined) {
+          current = hooked;
+          resolved = nextUri;
+        } else {
+          const partial = resolved + (resolved.endsWith('://') ? '' : '/') + name;
+          const suggestions = suggestCompletions(partial);
+          return { ok: false, error: `Cannot navigate to '${name}' from ${resolved}.${suggestions}` };
+        }
       }
 
       // Apply index if present
@@ -248,11 +278,12 @@ type Lift<T> = T extends { readonly _isSpecifier: true }
   ? T
   : Specifier<T>;
 
-// Specifier: wraps T, exposes lifted properties, has resolve()
+// Specifier: wraps T, exposes lifted properties, has resolve() and fix()
 type Specifier<T> = {
   readonly _isSpecifier: true;
   readonly uri: string;
   resolve(): Result<T>;
+  fix(): Result<Specifier<T>>;  // Returns specifier with most stable URI (id > name > index)
 } & {
   readonly [K in keyof T]: Lift<T[K]>;
 };
@@ -311,6 +342,7 @@ type CollectionSpecifier<T, A = IndexAddressable<T>> = {
   readonly _isSpecifier: true;
   readonly uri: string;
   resolve(): Result<T[]>;
+  fix(): Result<CollectionSpecifier<T, A>>;  // Returns specifier with base URI (no query params)
   whose(filter: WhoseFilter<T>): CollectionSpecifier<T, A>;
   sortBy(spec: SortSpec<T>): CollectionSpecifier<T, A>;
   paginate(spec: PaginationSpec): CollectionSpecifier<T, A>;
@@ -441,13 +473,17 @@ function createDerived<Base extends Record<string, any>>(
 
 // Helper for scalar specifiers
 function scalarSpecifier<T>(uri: string, getValue: () => T): Specifier<T> {
-  return {
+  const spec: any = {
     _isSpecifier: true as const,
     uri,
     resolve(): Result<T> {
       return tryResolve(getValue, uri);
+    },
+    fix(): Result<Specifier<T>> {
+      return { ok: true, value: spec }; // Scalars can't be improved
     }
-  } as Specifier<T>;
+  };
+  return spec as Specifier<T>;
 }
 
 // Element specifier factory
@@ -455,10 +491,16 @@ function createElementSpecifier<Base extends Record<string, any>>(
   uri: string,
   jxa: any,
   schema: Base,
-  typeName: string
+  typeName: string,
+  addressing?: readonly AddressingMode[]
 ): Specifier<Derived<Base>> {
 
   const ElementClass = createDerived(schema, typeName);
+
+  // Extract base URI (collection path without element reference)
+  // e.g., "mail://accounts[0]/mailboxes" from "mail://accounts[0]/mailboxes[72]"
+  const baseUriMatch = uri.match(/^(.+?)(?:\/[^\/\[]+|\[\d+\])$/);
+  const baseUri = baseUriMatch ? baseUriMatch[1] : uri;
 
   const spec: any = {
     _isSpecifier: true as const,
@@ -466,6 +508,46 @@ function createElementSpecifier<Base extends Record<string, any>>(
 
     resolve(): Result<Derived<Base>> {
       return tryResolve(() => ElementClass.fromJXA(jxa, uri), uri);
+    },
+
+    // Returns a new specifier with the most stable URI form, respecting addressing order
+    fix(): Result<Specifier<Derived<Base>>> {
+      return tryResolve(() => {
+        if (!addressing || addressing.length === 0) {
+          return spec; // No addressing modes, can't improve
+        }
+
+        // Try addressing modes in order (first non-index mode that works wins)
+        let fixedUri: string | undefined;
+
+        for (const mode of addressing) {
+          if (fixedUri !== undefined) break;
+
+          if (mode === 'id') {
+            try {
+              const id = jxa.id();
+              if (id != null && id !== '') {
+                fixedUri = `${baseUri}/${encodeURIComponent(String(id))}`;
+              }
+            } catch { /* ignore */ }
+          } else if (mode === 'name') {
+            try {
+              const name = jxa.name();
+              if (name != null && name !== '') {
+                fixedUri = `${baseUri}/${encodeURIComponent(String(name))}`;
+              }
+            } catch { /* ignore */ }
+          }
+          // 'index' doesn't provide improvement
+        }
+
+        if (fixedUri === undefined) {
+          return spec; // Can't improve, return self
+        }
+
+        // Return new specifier with fixed URI
+        return createElementSpecifier(fixedUri, jxa, schema, typeName, addressing);
+      }, uri);
     }
   };
 
@@ -525,10 +607,53 @@ function createCollectionSpecifier<
     _isSpecifier: true as const,
     uri,
 
+    // Returns base collection specifier (strips query params)
+    fix(): Result<CollectionSpecifier<Derived<ElementBase>, any>> {
+      const baseUri = uri.split('?')[0];
+      if (baseUri === uri) {
+        return { ok: true, value: spec }; // Already at base form
+      }
+      return { ok: true, value: createCollectionSpecifier(baseUri, jxaCollection, elementBase, addressing, typeName) };
+    },
+
     resolve(): Result<Derived<ElementBase>[]> {
       return tryResolve(() => {
         const jxaArray = typeof jxaCollection === 'function' ? jxaCollection() : jxaCollection;
-        let results = jxaArray.map((jxa: any, i: number) => ElementClass.fromJXA(jxa, `${uri}[${i}]`));
+        const collectionBaseUri = uri.split('?')[0]; // Strip query params for element URIs
+
+        let results = jxaArray.map((jxa: any, i: number) => {
+          // Generate the best URI for this element, respecting addressing order
+          // The first mode in the array that works is used (e.g., ['name', 'index', 'id'] prefers name)
+          let elementUri: string | undefined = undefined;
+
+          for (const mode of addressing) {
+            if (elementUri !== undefined) break;
+
+            if (mode === 'id') {
+              try {
+                const id = jxa.id();
+                if (id != null && id !== '') {
+                  elementUri = `${collectionBaseUri}/${encodeURIComponent(String(id))}`;
+                }
+              } catch { /* ignore */ }
+            } else if (mode === 'name') {
+              try {
+                const name = jxa.name();
+                if (name != null && name !== '') {
+                  elementUri = `${collectionBaseUri}/${encodeURIComponent(String(name))}`;
+                }
+              } catch { /* ignore */ }
+            }
+            // 'index' is handled as fallback below
+          }
+
+          // Fall back to index if no better addressing available
+          if (elementUri === undefined) {
+            elementUri = `${collectionBaseUri}[${i}]`;
+          }
+
+          return ElementClass.fromJXA(jxa, elementUri);
+        });
 
         // Apply JS filter if specified
         if (jsFilter && Object.keys(jsFilter).length > 0) {
@@ -586,27 +711,31 @@ function createCollectionSpecifier<
     }
   };
 
+  // Get base URI without query string for element URIs
+  const baseUri = uri.split('?')[0];
+
   // Add addressing methods
   if (addressing.includes('index')) {
     spec.byIndex = function(i: number): Specifier<Derived<ElementBase>> {
-      return createElementSpecifier(`${uri}[${i}]`, jxaCollection.at(i), elementBase, typeName);
+      return createElementSpecifier(`${baseUri}[${i}]`, jxaCollection.at(i), elementBase, typeName, addressing);
     };
   }
 
   if (addressing.includes('name')) {
     spec.byName = function(name: string): Specifier<Derived<ElementBase>> {
       return createElementSpecifier(
-        `${uri}/${encodeURIComponent(name)}`,
+        `${baseUri}/${encodeURIComponent(name)}`,
         jxaCollection.byName(name),
         elementBase,
-        typeName
+        typeName,
+        addressing
       );
     };
   }
 
   if (addressing.includes('id')) {
     spec.byId = function(id: string | number): Specifier<Derived<ElementBase>> {
-      return createElementSpecifier(`${uri}/${id}`, jxaCollection.byId(id), elementBase, typeName);
+      return createElementSpecifier(`${baseUri}/${id}`, jxaCollection.byId(id), elementBase, typeName, addressing);
     };
   }
 
@@ -908,6 +1037,18 @@ function getPropertyCompletions(specifier: any, partial: string): Completion[] {
     } else {
       completions.push({ value: key, label: key, description: 'Property' });
     }
+  }
+
+  // Add completions from hooks
+  for (const hook of completionHooks) {
+    try {
+      const extra = hook(specifier, partial);
+      for (const c of extra) {
+        if (c.label && c.label.toLowerCase().startsWith(partial.toLowerCase())) {
+          completions.push(c);
+        }
+      }
+    } catch { /* ignore */ }
   }
 
   return completions;

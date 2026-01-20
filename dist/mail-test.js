@@ -23,6 +23,14 @@ const schemeRoots = {};
 function registerScheme(scheme, root) {
     schemeRoots[scheme] = root;
 }
+const navigationHooks = [];
+function registerNavigationHook(hook) {
+    navigationHooks.push(hook);
+}
+const completionHooks = [];
+function registerCompletionHook(hook) {
+    completionHooks.push(hook);
+}
 // Guard against recursive completion calls during error handling
 let _inErrorSuggestion = false;
 // Helper to format completion suggestions for error messages
@@ -84,9 +92,23 @@ function specifierFromURI(uri) {
                 resolved += (resolved.endsWith('://') ? '' : '/') + name;
             }
             else {
-                const partial = resolved + (resolved.endsWith('://') ? '' : '/') + name;
-                const suggestions = suggestCompletions(partial);
-                return { ok: false, error: `Cannot navigate to '${name}' from ${resolved}.${suggestions}` };
+                // Try navigation hooks for special paths
+                const nextUri = resolved + (resolved.endsWith('://') ? '' : '/') + name;
+                let hooked = undefined;
+                for (const hook of navigationHooks) {
+                    hooked = hook(current, name, nextUri);
+                    if (hooked !== undefined)
+                        break;
+                }
+                if (hooked !== undefined) {
+                    current = hooked;
+                    resolved = nextUri;
+                }
+                else {
+                    const partial = resolved + (resolved.endsWith('://') ? '' : '/') + name;
+                    const suggestions = suggestCompletions(partial);
+                    return { ok: false, error: `Cannot navigate to '${name}' from ${resolved}.${suggestions}` };
+                }
             }
             // Apply index if present
             if (index !== undefined) {
@@ -261,22 +283,68 @@ function createDerived(schema, typeName) {
 // ============================================================================
 // Helper for scalar specifiers
 function scalarSpecifier(uri, getValue) {
-    return {
+    const spec = {
         _isSpecifier: true,
         uri,
         resolve() {
             return tryResolve(getValue, uri);
+        },
+        fix() {
+            return { ok: true, value: spec }; // Scalars can't be improved
         }
     };
+    return spec;
 }
 // Element specifier factory
-function createElementSpecifier(uri, jxa, schema, typeName) {
+function createElementSpecifier(uri, jxa, schema, typeName, addressing) {
     const ElementClass = createDerived(schema, typeName);
+    // Extract base URI (collection path without element reference)
+    // e.g., "mail://accounts[0]/mailboxes" from "mail://accounts[0]/mailboxes[72]"
+    const baseUriMatch = uri.match(/^(.+?)(?:\/[^\/\[]+|\[\d+\])$/);
+    const baseUri = baseUriMatch ? baseUriMatch[1] : uri;
     const spec = {
         _isSpecifier: true,
         uri,
         resolve() {
             return tryResolve(() => ElementClass.fromJXA(jxa, uri), uri);
+        },
+        // Returns a new specifier with the most stable URI form, respecting addressing order
+        fix() {
+            return tryResolve(() => {
+                if (!addressing || addressing.length === 0) {
+                    return spec; // No addressing modes, can't improve
+                }
+                // Try addressing modes in order (first non-index mode that works wins)
+                let fixedUri;
+                for (const mode of addressing) {
+                    if (fixedUri !== undefined)
+                        break;
+                    if (mode === 'id') {
+                        try {
+                            const id = jxa.id();
+                            if (id != null && id !== '') {
+                                fixedUri = `${baseUri}/${encodeURIComponent(String(id))}`;
+                            }
+                        }
+                        catch { /* ignore */ }
+                    }
+                    else if (mode === 'name') {
+                        try {
+                            const name = jxa.name();
+                            if (name != null && name !== '') {
+                                fixedUri = `${baseUri}/${encodeURIComponent(String(name))}`;
+                            }
+                        }
+                        catch { /* ignore */ }
+                    }
+                    // 'index' doesn't provide improvement
+                }
+                if (fixedUri === undefined) {
+                    return spec; // Can't improve, return self
+                }
+                // Return new specifier with fixed URI
+                return createElementSpecifier(fixedUri, jxa, schema, typeName, addressing);
+            }, uri);
         }
     };
     // Add lifted property specifiers
@@ -312,10 +380,51 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
     const spec = {
         _isSpecifier: true,
         uri,
+        // Returns base collection specifier (strips query params)
+        fix() {
+            const baseUri = uri.split('?')[0];
+            if (baseUri === uri) {
+                return { ok: true, value: spec }; // Already at base form
+            }
+            return { ok: true, value: createCollectionSpecifier(baseUri, jxaCollection, elementBase, addressing, typeName) };
+        },
         resolve() {
             return tryResolve(() => {
                 const jxaArray = typeof jxaCollection === 'function' ? jxaCollection() : jxaCollection;
-                let results = jxaArray.map((jxa, i) => ElementClass.fromJXA(jxa, `${uri}[${i}]`));
+                const collectionBaseUri = uri.split('?')[0]; // Strip query params for element URIs
+                let results = jxaArray.map((jxa, i) => {
+                    // Generate the best URI for this element, respecting addressing order
+                    // The first mode in the array that works is used (e.g., ['name', 'index', 'id'] prefers name)
+                    let elementUri = undefined;
+                    for (const mode of addressing) {
+                        if (elementUri !== undefined)
+                            break;
+                        if (mode === 'id') {
+                            try {
+                                const id = jxa.id();
+                                if (id != null && id !== '') {
+                                    elementUri = `${collectionBaseUri}/${encodeURIComponent(String(id))}`;
+                                }
+                            }
+                            catch { /* ignore */ }
+                        }
+                        else if (mode === 'name') {
+                            try {
+                                const name = jxa.name();
+                                if (name != null && name !== '') {
+                                    elementUri = `${collectionBaseUri}/${encodeURIComponent(String(name))}`;
+                                }
+                            }
+                            catch { /* ignore */ }
+                        }
+                        // 'index' is handled as fallback below
+                    }
+                    // Fall back to index if no better addressing available
+                    if (elementUri === undefined) {
+                        elementUri = `${collectionBaseUri}[${i}]`;
+                    }
+                    return ElementClass.fromJXA(jxa, elementUri);
+                });
                 // Apply JS filter if specified
                 if (jsFilter && Object.keys(jsFilter).length > 0) {
                     results = results.filter((item) => {
@@ -373,20 +482,22 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
             }, uri);
         }
     };
+    // Get base URI without query string for element URIs
+    const baseUri = uri.split('?')[0];
     // Add addressing methods
     if (addressing.includes('index')) {
         spec.byIndex = function (i) {
-            return createElementSpecifier(`${uri}[${i}]`, jxaCollection.at(i), elementBase, typeName);
+            return createElementSpecifier(`${baseUri}[${i}]`, jxaCollection.at(i), elementBase, typeName, addressing);
         };
     }
     if (addressing.includes('name')) {
         spec.byName = function (name) {
-            return createElementSpecifier(`${uri}/${encodeURIComponent(name)}`, jxaCollection.byName(name), elementBase, typeName);
+            return createElementSpecifier(`${baseUri}/${encodeURIComponent(name)}`, jxaCollection.byName(name), elementBase, typeName, addressing);
         };
     }
     if (addressing.includes('id')) {
         spec.byId = function (id) {
-            return createElementSpecifier(`${uri}/${id}`, jxaCollection.byId(id), elementBase, typeName);
+            return createElementSpecifier(`${baseUri}/${id}`, jxaCollection.byId(id), elementBase, typeName, addressing);
         };
     }
     // Add whose filtering
@@ -664,6 +775,18 @@ function getPropertyCompletions(specifier, partial) {
             completions.push({ value: key, label: key, description: 'Property' });
         }
     }
+    // Add completions from hooks
+    for (const hook of completionHooks) {
+        try {
+            const extra = hook(specifier, partial);
+            for (const c of extra) {
+                if (c.label && c.label.toLowerCase().startsWith(partial.toLowerCase())) {
+                    completions.push(c);
+                }
+            }
+        }
+        catch { /* ignore */ }
+    }
     return completions;
 }
 function hasNavigableChildren(specifier) {
@@ -932,6 +1055,100 @@ function getMailApp() {
 }
 // Register mail:// scheme
 registerScheme('mail', getMailApp);
+// Standard mailbox aliases for accounts
+// Handles mail://accounts[X]/inbox, /sent, /drafts, /junk, /trash
+const accountStandardMailboxes = {
+    inbox: 'inbox',
+    sent: 'sentMailbox',
+    drafts: 'draftsMailbox',
+    junk: 'junkMailbox',
+    trash: 'trashMailbox'
+};
+// Completion hook for account standard mailboxes
+registerCompletionHook((specifier, partial) => {
+    // Only applies to account specifiers (check if URI matches accounts[X])
+    if (!specifier || !specifier.uri || !specifier.uri.match(/^mail:\/\/accounts\[\d+\]$/)) {
+        return [];
+    }
+    return Object.keys(accountStandardMailboxes)
+        .filter(name => name.startsWith(partial.toLowerCase()))
+        .map(name => ({
+        value: `${name}/`,
+        label: name,
+        description: 'Standard mailbox'
+    }));
+});
+registerNavigationHook((parent, name, uri) => {
+    // Check if this is an account specifier navigating to a standard mailbox
+    const jxaAppName = accountStandardMailboxes[name];
+    if (!jxaAppName)
+        return undefined;
+    // Check if parent has an id (accounts have id)
+    if (!parent || !parent._isSpecifier)
+        return undefined;
+    // Try to get the account's JXA object and find its standard mailbox
+    try {
+        const parentResult = parent.resolve();
+        if (!parentResult.ok)
+            return undefined;
+        const accountId = parentResult.value.id;
+        if (!accountId)
+            return undefined;
+        // Get the app-level standard mailbox and find the one for this account
+        const jxa = Application('Mail');
+        const appMailbox = jxa[jxaAppName]();
+        const accountMailbox = appMailbox.mailboxes().find((m) => {
+            try {
+                return m.account().id() === accountId;
+            }
+            catch {
+                return false;
+            }
+        });
+        if (!accountMailbox)
+            return undefined;
+        // Create a mailbox specifier for it
+        return createMailboxSpecifier(uri, accountMailbox);
+    }
+    catch {
+        return undefined;
+    }
+});
+// Helper to create a mailbox specifier for a JXA mailbox
+function createMailboxSpecifier(uri, jxaMailbox) {
+    const spec = {
+        _isSpecifier: true,
+        uri,
+        resolve() {
+            return tryResolve(() => Mailbox.fromJXA(jxaMailbox, uri), uri);
+        }
+    };
+    // Add properties from MailboxBase
+    for (const [key, descriptor] of Object.entries(MailboxBase)) {
+        if ('_accessor' in descriptor) {
+            Object.defineProperty(spec, key, {
+                get() {
+                    const jxaName = descriptor._jxaName;
+                    return scalarSpecifier(`${uri}/${key}`, () => {
+                        const value = jxaMailbox[jxaName]();
+                        return value == null ? '' : value;
+                    });
+                },
+                enumerable: true
+            });
+        }
+        else if ('_collection' in descriptor) {
+            Object.defineProperty(spec, key, {
+                get() {
+                    const desc = descriptor;
+                    return createCollectionSpecifier(`${uri}/${key}`, jxaMailbox[desc._jxaName], desc._elementBase, desc._addressing, 'Mailbox_' + key);
+                },
+                enumerable: true
+            });
+        }
+    }
+    return spec;
+}
 // Export for JXA
 globalThis.specifierFromURI = specifierFromURI;
 globalThis.getCompletions = getCompletions;
@@ -948,7 +1165,17 @@ function readResource(uri) {
     if (!result.ok) {
         return { mimeType: 'text/plain', text: result.error };
     }
-    return { mimeType: 'application/json', text: result.value };
+    // Try to get a stable reference URI via fix()
+    let fixedUri;
+    const fixed = spec.value.fix();
+    if (fixed.ok && fixed.value.uri !== uri) {
+        fixedUri = fixed.value.uri;
+        // Update _uri in result if it's an object
+        if (result.value && typeof result.value === 'object' && '_uri' in result.value) {
+            result.value._uri = fixedUri;
+        }
+    }
+    return { mimeType: 'application/json', text: result.value, fixedUri };
 }
 function listResources() {
     const resources = [
@@ -1071,6 +1298,37 @@ const resourceTemplates = [
         uriTemplate: 'mail://accounts/{name}',
         name: 'Account by Name',
         description: 'Single account by name. Example: mail://accounts/iCloud'
+    },
+    // --- Account Standard Mailboxes ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/inbox',
+        name: 'Account Inbox',
+        description: "The account's inbox mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/sent',
+        name: 'Account Sent',
+        description: "The account's sent mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/drafts',
+        name: 'Account Drafts',
+        description: "The account's drafts mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/junk',
+        name: 'Account Junk',
+        description: "The account's junk/spam mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/trash',
+        name: 'Account Trash',
+        description: "The account's trash/deleted items mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/inbox/messages?{query}',
+        name: 'Account Inbox Messages',
+        description: "Messages in the account's inbox. Supports filter/sort/pagination"
     },
     // --- Mailboxes ---
     {
