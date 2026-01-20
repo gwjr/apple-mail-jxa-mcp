@@ -228,15 +228,58 @@ server.setResources(
             return { mimeType: 'application/json', text: { account: accountName, mailboxes } };
         }
 
-        // Mailbox: mailbox://Account/Path → children if any, otherwise info
-        match = uri.match(/^mailbox:\/\/([^\/]+)\/(.+)$/);
+        // Mailbox: mailbox://Account/Path with optional query params for message listing
+        // Query params: ?limit=N&offset=N&unread=true
+        match = uri.match(/^mailbox:\/\/([^\/]+)\/([^?]+)(\?.*)?$/);
         if (match) {
             const accountName = decodeURIComponent(match[1]);
             const mailboxPath = decodeURIComponent(match[2]);
+            const queryString = match[3] || '';
             const mb = Mail.findMailbox(accountName, mailboxPath);
             if (!mb) return null;
 
-            // Find direct children
+            // Parse query parameters
+            const params = {};
+            if (queryString) {
+                queryString.slice(1).split('&').forEach(pair => {
+                    const [k, v] = pair.split('=');
+                    params[decodeURIComponent(k)] = decodeURIComponent(v || '');
+                });
+            }
+
+            // If query params present OR explicit messages=true, return message listing
+            const wantsMessages = queryString.length > 0 || params.messages === 'true';
+            if (wantsMessages) {
+                const limit = parseInt(params.limit, 10) || 20;
+                const offset = parseInt(params.offset, 10) || 0;
+                const unreadOnly = params.unread === 'true';
+
+                const messages = mb.messages({ limit: limit + offset, unreadOnly });
+                const slice = messages.slice(offset, offset + limit);
+
+                return {
+                    mimeType: 'application/json',
+                    text: {
+                        account: accountName,
+                        path: mb.path,
+                        unreadCount: mb.unreadCount,
+                        limit: limit,
+                        offset: offset,
+                        messages: slice.map((m, i) => ({
+                            index: offset + i,
+                            messageId: m.messageId,
+                            url: m.url,
+                            subject: m.subject,
+                            sender: m.sender,
+                            dateReceived: m.dateReceived,
+                            read: m.read,
+                            flagged: m.flagged
+                        }))
+                    }
+                };
+            }
+
+            // No query params: return mailbox info with children
             const account = Mail.accounts().find(a => a.name === accountName);
             const allMailboxes = account ? account.mailboxes() : [];
             const prefix = mailboxPath + '/';
@@ -270,3 +313,17 @@ server.setResources(
         return null;
     }
 );
+
+// Resource templates for RFC 6570 URI template support
+server.setResourceTemplates([
+    {
+        uriTemplate: 'mailbox://{account}/{+path}',
+        name: 'Mailbox Info',
+        description: 'Get mailbox info and child mailboxes'
+    },
+    {
+        uriTemplate: 'mailbox://{account}/{+path}?limit={limit}&offset={offset}&unread={unread}',
+        name: 'Mailbox Messages',
+        description: 'Browse messages in a mailbox with optional filtering and pagination'
+    }
+]);

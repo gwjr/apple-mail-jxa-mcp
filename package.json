@@ -1,0 +1,12 @@
+{
+  "name": "apple-mail-jxa-mcp",
+  "version": "1.0.0",
+  "description": "Apple Mail MCP Server using JXA (JavaScript for Automation)",
+  "scripts": {
+    "build": "tsc",
+    "run": "osascript -l JavaScript dist/mail.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  }
+}

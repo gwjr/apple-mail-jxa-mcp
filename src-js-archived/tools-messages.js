@@ -4,6 +4,7 @@
 server.addTool({
     name: 'list_messages',
     description: 'List messages in a mailbox. Returns summary info with message:// URLs.',
+    annotations: { readOnlyHint: true },
     inputSchema: {
         type: 'object',
         properties: {
@@ -26,6 +27,7 @@ server.addTool({
 server.addTool({
     name: 'get_message',
     description: 'Get full details of a message including its content',
+    annotations: { readOnlyHint: true },
     inputSchema: {
         type: 'object',
         properties: {
@@ -41,8 +43,9 @@ server.addTool({
 });
 
 server.addTool({
-    name: 'send_email',
-    description: 'Create and send an email message',
+    name: 'compose_email',
+    description: 'Create a draft email and open it for user review. The user must manually send the email.',
+    annotations: { destructiveHint: false },
     inputSchema: {
         type: 'object',
         properties: {
@@ -50,17 +53,18 @@ server.addTool({
             cc: { type: 'array', items: { type: 'string' }, description: 'CC addresses' },
             bcc: { type: 'array', items: { type: 'string' }, description: 'BCC addresses' },
             subject: { type: 'string', description: 'Email subject' },
-            body: { type: 'string', description: 'Email body' },
-            sendNow: { type: 'boolean', description: 'Send immediately (default: true)' }
+            body: { type: 'string', description: 'Email body' }
         },
         required: ['to', 'subject', 'body']
     },
     handler: (args) => {
         const app = Mail.app;
+
+        // Create visible draft - opens compose window
         const msg = app.OutgoingMessage({
             subject: args.subject,
             content: args.body,
-            visible: args.sendNow === false
+            visible: true
         });
         app.outgoingMessages.push(msg);
 
@@ -68,17 +72,17 @@ server.addTool({
         if (args.cc) for (const addr of args.cc) msg.ccRecipients.push(app.CcRecipient({ address: addr }));
         if (args.bcc) for (const addr of args.bcc) msg.bccRecipients.push(app.BccRecipient({ address: addr }));
 
-        if (args.sendNow !== false) {
-            msg.send();
-            return `Email sent to ${args.to.join(', ')}`;
-        }
-        return `Draft created: ${args.subject}`;
+        // Bring Mail to front for user review
+        app.activate();
+
+        return `Draft opened for review. To: ${args.to.join(', ')}. Please review and send in Mail.app.`;
     }
 });
 
 server.addTool({
     name: 'mark_read',
     description: 'Mark a message as read',
+    annotations: { idempotentHint: true },
     inputSchema: {
         type: 'object',
         properties: { url: { type: 'string', description: 'Message URL' } },
@@ -95,6 +99,7 @@ server.addTool({
 server.addTool({
     name: 'mark_unread',
     description: 'Mark a message as unread',
+    annotations: { idempotentHint: true },
     inputSchema: {
         type: 'object',
         properties: { url: { type: 'string', description: 'Message URL' } },
@@ -111,6 +116,7 @@ server.addTool({
 server.addTool({
     name: 'toggle_flag',
     description: 'Toggle the flagged status of a message',
+    annotations: { idempotentHint: false },
     inputSchema: {
         type: 'object',
         properties: { url: { type: 'string', description: 'Message URL' } },
@@ -127,6 +133,7 @@ server.addTool({
 server.addTool({
     name: 'move_message',
     description: 'Move a message to a different mailbox',
+    annotations: { destructiveHint: true },
     inputSchema: {
         type: 'object',
         properties: {
@@ -152,6 +159,7 @@ server.addTool({
 server.addTool({
     name: 'delete_message',
     description: 'Delete a message (moves to Trash)',
+    annotations: { destructiveHint: true },
     inputSchema: {
         type: 'object',
         properties: { url: { type: 'string', description: 'Message URL' } },
@@ -166,18 +174,9 @@ server.addTool({
 });
 
 server.addTool({
-    name: 'check_mail',
-    description: 'Check for new mail across all accounts',
-    inputSchema: { type: 'object', properties: {}, required: [] },
-    handler: () => {
-        Mail.checkForNewMail();
-        return 'Checking...';
-    }
-});
-
-server.addTool({
     name: 'get_selection',
     description: 'Get currently selected messages in Mail.app',
+    annotations: { readOnlyHint: true },
     inputSchema: { type: 'object', properties: {}, required: [] },
     handler: () => {
         const app = Mail.app;
@@ -193,6 +192,7 @@ server.addTool({
 server.addTool({
     name: 'get_windows',
     description: 'Get info about open Mail windows',
+    annotations: { readOnlyHint: true },
     inputSchema: { type: 'object', properties: {}, required: [] },
     handler: () => {
         const app = Mail.app;

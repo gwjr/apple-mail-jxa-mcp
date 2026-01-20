@@ -13,29 +13,30 @@ This server runs as a single JXA process with proper NSRunLoop blocking - no Nod
 
 ## Features
 
-### Tools (19)
+### Tools (18)
 
-| Tool | Description |
-|------|-------------|
-| `list_messages` | List messages in a mailbox |
-| `get_message` | Get full message details by URL |
-| `send_email` | Create and send an email |
-| `mark_read` | Mark a message as read |
-| `mark_unread` | Mark a message as unread |
-| `toggle_flag` | Toggle flagged status |
-| `move_message` | Move message to another mailbox |
-| `delete_message` | Delete a message (moves to Trash) |
-| `check_mail` | Check for new mail |
-| `get_selection` | Get currently selected messages in Mail.app |
-| `get_windows` | Get info about open Mail windows |
-| `list_attachments` | List attachments of a message |
-| `save_attachment` | Save an attachment to disk |
-| `create_rule` | Create a new mail rule |
-| `update_rule` | Update an existing rule |
-| `delete_rule` | Delete a mail rule |
-| `create_signature` | Create a new signature |
-| `update_signature` | Update an existing signature |
-| `delete_signature` | Delete a signature |
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `list_messages` | List messages in a mailbox | readOnly |
+| `get_message` | Get full message details by URL | readOnly |
+| `compose_email` | Create draft email for user review | non-destructive |
+| `mark_read` | Mark a message as read | idempotent |
+| `mark_unread` | Mark a message as unread | idempotent |
+| `toggle_flag` | Toggle flagged status | non-idempotent |
+| `move_message` | Move message to another mailbox | destructive |
+| `delete_message` | Delete a message (moves to Trash) | destructive |
+| `get_selection` | Get currently selected messages in Mail.app | readOnly |
+| `get_windows` | Get info about open Mail windows | readOnly |
+| `list_attachments` | List attachments of a message | readOnly |
+| `save_attachment` | Save an attachment to disk | openWorld |
+| `create_rule` | Create a new mail rule | non-idempotent |
+| `update_rule` | Update an existing rule | idempotent |
+| `delete_rule` | Delete a mail rule | destructive |
+| `create_signature` | Create a new signature | non-idempotent |
+| `update_signature` | Update an existing signature | idempotent |
+| `delete_signature` | Delete a signature | destructive |
+
+All tools include MCP annotations indicating their behavior (read-only, idempotent, destructive, etc.) for better client integration.
 
 ### Resources
 
@@ -44,6 +45,24 @@ This server runs as a single JXA process with proper NSRunLoop blocking - no Nod
 - **Signatures** (`mail://signatures`) - All email signatures
 - **Unified Mailboxes** (`unified://inbox`, `unified://sent`, etc.) - Cross-account mailboxes
 - **Accounts** (`mailaccount://...`) - Hierarchical account/mailbox browsing
+- **Mailbox Messages** (`mailbox://Account/Path?limit=N&offset=N&unread=true`) - Browse messages
+
+#### Browsing Messages via Resources
+
+The recommended way to work with messages is through resource browsing:
+
+```
+mailbox://Account/INBOX                    # Mailbox info and children
+mailbox://Account/INBOX?limit=20           # First 20 messages
+mailbox://Account/INBOX?limit=20&offset=20 # Next 20 messages (pagination)
+mailbox://Account/INBOX?unread=true        # Unread messages only
+```
+
+Each message in the listing includes a stable `message://` URL that can be used with tools like `get_message`, `mark_read`, etc.
+
+#### Message URL Lookup
+
+The `message://` URLs returned from resources use the RFC 2822 Message-ID for stability. Message lookup is best-effort: it checks the cache and inbox quickly, but may return null if the message has moved to an unusual location. For reliable access, browse via `mailbox://` resources first.
 
 ## Installation
 
@@ -132,6 +151,7 @@ make          # Build dist/mail.js
 make run      # Build and run
 make clean    # Remove dist/
 make check    # Show line number mapping
+make reset    # Kill running server (for testing)
 ```
 
 ## Usage Examples

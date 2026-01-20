@@ -39,7 +39,7 @@ class MCPTestClient {
             });
 
             this.proc.stderr.on('data', (data) => {
-                // Debug output goes to stderr
+                if (process.env.DEBUG) process.stderr.write(data);
             });
 
             this.proc.on('error', reject);
@@ -96,6 +96,7 @@ function skip(name, fn) {
 }
 
 async function runTests() {
+    const filter = process.argv[2]; // Optional test name filter
     const client = new MCPTestClient();
 
     console.log('Starting MCP server...');
@@ -103,6 +104,11 @@ async function runTests() {
     console.log('Server started.\n');
 
     for (const t of tests) {
+        // Filter by name if argument provided
+        if (filter && !t.name.toLowerCase().includes(filter.toLowerCase())) {
+            continue;
+        }
+
         if (t.skip) {
             console.log(`⏭  SKIP: ${t.name}`);
             skipped++;
@@ -153,13 +159,45 @@ test('tools/list returns expected tools', async (client) => {
     // Check core tools exist
     assertIncludes(names, 'list_messages');
     assertIncludes(names, 'get_message');
-    assertIncludes(names, 'send_email');
+    assertIncludes(names, 'compose_email');
     assertIncludes(names, 'get_selection');
     assertIncludes(names, 'list_attachments');
     assertIncludes(names, 'create_rule');
     assertIncludes(names, 'create_signature');
 
-    assert(names.length >= 19, `Expected at least 19 tools, got ${names.length}`);
+    assert(names.length >= 18, `Expected at least 18 tools, got ${names.length}`);
+});
+
+// Tool annotations
+test('tools/list includes annotations', async (client) => {
+    const result = await client.call('tools/list');
+
+    // Check some tools have expected annotations
+    const listMessages = result.tools.find(t => t.name === 'list_messages');
+    assert(listMessages.annotations?.readOnlyHint === true, 'Expected list_messages to have readOnlyHint');
+
+    const deleteMessage = result.tools.find(t => t.name === 'delete_message');
+    assert(deleteMessage.annotations?.destructiveHint === true, 'Expected delete_message to have destructiveHint');
+
+    const markRead = result.tools.find(t => t.name === 'mark_read');
+    assert(markRead.annotations?.idempotentHint === true, 'Expected mark_read to have idempotentHint');
+
+    const toggleFlag = result.tools.find(t => t.name === 'toggle_flag');
+    assert(toggleFlag.annotations?.idempotentHint === false, 'Expected toggle_flag to have idempotentHint=false');
+});
+
+// Resource templates
+test('resources/templates/list returns templates', async (client) => {
+    const result = await client.call('resources/templates/list');
+
+    assert(Array.isArray(result.resourceTemplates), 'Expected resourceTemplates array');
+    assert(result.resourceTemplates.length >= 2, 'Expected at least 2 resource templates');
+
+    // Check for mailbox templates
+    const hasMailboxTemplate = result.resourceTemplates.some(t =>
+        t.uriTemplate && t.uriTemplate.includes('mailbox://')
+    );
+    assert(hasMailboxTemplate, 'Expected mailbox URI template');
 });
 
 // Resources listing
@@ -215,6 +253,42 @@ test('resources/read unified://inbox', async (client) => {
     assert(typeof content.messageCount === 'number', 'Expected messageCount');
 });
 
+// Mailbox message listing via resources
+test('resources/read mailbox:// with query params returns messages', async (client) => {
+    // Find an account and inbox
+    const list = await client.call('resources/list');
+    const accountUri = list.resources.find(r => r.uri.startsWith('mailaccount://'))?.uri;
+    if (!accountUri) throw new Error('No account found');
+
+    const accountResult = await client.call('resources/read', { uri: accountUri });
+    const account = JSON.parse(accountResult.contents[0].text);
+    const inboxMb = account.mailboxes?.find(m => m.name.toLowerCase() === 'inbox');
+    if (!inboxMb) throw new Error('No inbox found');
+
+    // Use the mailbox URI from the listing, which is properly formatted
+    const mailboxBaseUri = inboxMb.uri;
+
+    // Read mailbox with message listing query params
+    const msgResult = await client.call('resources/read', {
+        uri: `${mailboxBaseUri}?limit=5`
+    });
+    const content = JSON.parse(msgResult.contents[0].text);
+
+    assert(content.account, 'Expected account in response');
+    assert(content.path, 'Expected path in response');
+    assert(Array.isArray(content.messages), 'Expected messages array');
+    assert(content.limit === 5, 'Expected limit to be 5');
+
+    // If there are messages, verify structure
+    if (content.messages.length > 0) {
+        const msg = content.messages[0];
+        assert(msg.url, 'Expected message url');
+        assert(msg.subject !== undefined, 'Expected message subject');
+        assert(typeof msg.read === 'boolean', 'Expected message read status');
+        assert(typeof msg.index === 'number', 'Expected message index');
+    }
+});
+
 // Account hierarchy
 test('resources/read mailaccount:// shows top-level mailboxes', async (client) => {
     const list = await client.call('resources/list');
@@ -253,12 +327,6 @@ test('tools/call get_windows', async (client) => {
     assert(Array.isArray(windows), 'Expected windows array');
 });
 
-// Check mail tool
-test('tools/call check_mail', async (client) => {
-    const result = await client.call('tools/call', { name: 'check_mail' });
-    assertEqual(result.content[0].text, 'Checking...');
-});
-
 // List messages - discovers a mailbox from account hierarchy
 test('tools/call list_messages on discovered mailbox', async (client) => {
     // Find an account and its first mailbox
@@ -284,6 +352,160 @@ test('tools/call list_messages on discovered mailbox', async (client) => {
     // Should return a JSON array (might be empty)
     const messages = JSON.parse(result.content[0].text);
     assert(Array.isArray(messages), 'Expected messages array');
+});
+
+// Helper to find a message for testing
+async function findTestMessage(client) {
+    const list = await client.call('resources/list');
+    const accountUri = list.resources.find(r => r.uri.startsWith('mailaccount://'))?.uri;
+    if (!accountUri) return null;
+
+    const accountResult = await client.call('resources/read', { uri: accountUri });
+    const account = JSON.parse(accountResult.contents[0].text);
+    const inbox = account.mailboxes?.find(m => m.name.toLowerCase() === 'inbox');
+    if (!inbox) return null;
+
+    const result = await client.call('tools/call', {
+        name: 'list_messages',
+        arguments: { mailbox: inbox.name, limit: 1 }
+    });
+    const messages = JSON.parse(result.content[0].text);
+    return messages[0] || null;
+}
+
+// Get message details
+test('tools/call get_message', async (client) => {
+    const msg = await findTestMessage(client);
+    if (!msg) throw new Error('No message found to test');
+
+    const result = await client.call('tools/call', {
+        name: 'get_message',
+        arguments: { url: msg.url }
+    });
+    const details = JSON.parse(result.content[0].text);
+
+    assert(details.subject, 'Expected subject');
+    assert(details.url, 'Expected url');
+    // Full details should include content
+    assert('content' in details || 'source' in details, 'Expected content or source in full details');
+});
+
+// List attachments
+test('tools/call list_attachments', async (client) => {
+    const msg = await findTestMessage(client);
+    if (!msg) throw new Error('No message found to test');
+
+    const result = await client.call('tools/call', {
+        name: 'list_attachments',
+        arguments: { url: msg.url }
+    });
+    const text = result.content[0].text;
+
+    // Should return array (possibly empty) or handle gracefully
+    // Some messages may fail to enumerate attachments
+    if (!text.startsWith('Error:')) {
+        const attachments = JSON.parse(text);
+        assert(Array.isArray(attachments), 'Expected attachments array');
+    }
+});
+
+// Mark read/unread (reversible)
+test('tools/call mark_read and mark_unread', async (client) => {
+    const msg = await findTestMessage(client);
+    if (!msg) throw new Error('No message found to test');
+
+    const originalRead = msg.read;
+
+    // Toggle to opposite state
+    if (originalRead) {
+        await client.call('tools/call', { name: 'mark_unread', arguments: { url: msg.url } });
+    } else {
+        await client.call('tools/call', { name: 'mark_read', arguments: { url: msg.url } });
+    }
+
+    // Restore original state
+    if (originalRead) {
+        await client.call('tools/call', { name: 'mark_read', arguments: { url: msg.url } });
+    } else {
+        await client.call('tools/call', { name: 'mark_unread', arguments: { url: msg.url } });
+    }
+
+    // Verify restored
+    const verifyResult = await client.call('tools/call', {
+        name: 'get_message',
+        arguments: { url: msg.url }
+    });
+    const verified = JSON.parse(verifyResult.content[0].text);
+    assertEqual(verified.read, originalRead, 'Expected read status to be restored');
+});
+
+// Toggle flag (reversible)
+test('tools/call toggle_flag', async (client) => {
+    const msg = await findTestMessage(client);
+    if (!msg) throw new Error('No message found to test');
+
+    const originalFlagged = msg.flagged;
+
+    // Toggle twice to restore
+    await client.call('tools/call', { name: 'toggle_flag', arguments: { url: msg.url } });
+    await client.call('tools/call', { name: 'toggle_flag', arguments: { url: msg.url } });
+
+    // Verify restored
+    const verifyResult = await client.call('tools/call', {
+        name: 'get_message',
+        arguments: { url: msg.url }
+    });
+    const verified = JSON.parse(verifyResult.content[0].text);
+    assertEqual(verified.flagged, originalFlagged, 'Expected flagged status to be restored');
+});
+
+// Move message from Trash, then delete to put it back
+// Only works with messages already in Trash - doesn't touch user's inbox
+test('tools/call move_message from Trash and delete_message', async (client) => {
+    // Find a message in Trash
+    const result = await client.call('tools/call', {
+        name: 'list_messages',
+        arguments: { mailbox: 'Trash', limit: 1 }
+    });
+    const messages = JSON.parse(result.content[0].text);
+    if (messages.length === 0) {
+        throw new Error('No message in Trash to test (need at least one trashed message)');
+    }
+    const msg = messages[0];
+
+    // Find a suitable destination mailbox (not Inbox, not Trash)
+    // Try Archive, Drafts, or any available mailbox
+    const list = await client.call('resources/list');
+    const accountUri = list.resources.find(r => r.uri.startsWith('mailaccount://'))?.uri;
+    if (!accountUri) throw new Error('No account found');
+
+    const accountResult = await client.call('resources/read', { uri: accountUri });
+    const account = JSON.parse(accountResult.contents[0].text);
+    const destMailbox = account.mailboxes?.find(m =>
+        !['inbox', 'trash', 'junk', 'sent', 'drafts'].includes(m.name.toLowerCase())
+    ) || account.mailboxes?.find(m => m.name.toLowerCase() === 'drafts');
+
+    if (!destMailbox) {
+        throw new Error('No suitable destination mailbox found');
+    }
+
+    // Move from Trash to destination
+    const moveResult = await client.call('tools/call', {
+        name: 'move_message',
+        arguments: { url: msg.url, toMailbox: destMailbox.name }
+    });
+    const moveText = moveResult.content[0].text;
+    if (moveText.includes('not found')) {
+        throw new Error(`Mailbox not found: ${destMailbox.name}`);
+    }
+    assert(moveText.includes('Moved'), 'Expected move confirmation');
+
+    // Delete to put it back in Trash
+    const deleteResult = await client.call('tools/call', {
+        name: 'delete_message',
+        arguments: { url: msg.url }
+    });
+    assertEqual(deleteResult.content[0].text, 'Deleted', 'Expected delete confirmation');
 });
 
 // Error handling

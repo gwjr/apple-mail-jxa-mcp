@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "None",
+    "lib": ["ES2023"],
+    "outFile": "dist/mail.js",
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noEmitOnError": true,
+    "declaration": false,
+    "removeComments": false,
+    "esModuleInterop": false,
+    "skipLibCheck": true
+  },
+  "files": [
+    "src/types/jxa.d.ts",
+    "src/types/mail-app.d.ts",
+    "src/types/mcp.d.ts",
+    "src/core/uri-router.ts",
+    "src/core/mcp-server.ts",
+    "src/mail/cache.ts",
+    "src/mail/collections.ts",
+    "src/mail/message.ts",
+    "src/mail/mailbox.ts",
+    "src/mail/account.ts",
+    "src/mail/app.ts",
+    "src/resources/properties.ts",
+    "src/resources/rules.ts",
+    "src/resources/signatures.ts",
+    "src/resources/accounts.ts",
+    "src/resources/mailboxes.ts",
+    "src/resources/messages.ts",
+    "src/resources/index.ts",
+    "src/main.ts"
+  ]
+}

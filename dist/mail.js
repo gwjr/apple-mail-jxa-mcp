@@ -1,411 +1,550 @@
-// === src/framework.js (lines 1-400) ===
-// MCP Framework for JXA
-// Provides JSON-RPC 2.0 over stdio with NSRunLoop-based I/O
-
-ObjC.import('Foundation');
-
-function createMCPServer(options) {
-    const serverName = options.name || 'jxa-mcp-server';
-    const serverVersion = options.version || '1.0.0';
-    const protocolVersion = options.protocolVersion || '2024-11-05';
-    const debug = options.debug !== false;
-
-    const stdin = $.NSFileHandle.fileHandleWithStandardInput;
-    const stdout = $.NSFileHandle.fileHandleWithStandardOutput;
-    const stderr = $.NSFileHandle.fileHandleWithStandardError;
-
-    const tools = [];
-    const toolHandlers = {};
-    let resourceLister = null;
-    let resourceReader = null;
-
-    function log(msg) {
-        if (!debug) return;
-        const data = $.NSString.alloc.initWithUTF8String('[' + serverName + '] ' + msg + '\n')
+"use strict";
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+// ============================================================================
+// URI Router for mail:// scheme
+// Parses URIs into discriminated union types for exhaustive handling
+// ============================================================================
+// Encode/decode URI components safely
+function encodeURISegment(segment) {
+    return encodeURIComponent(segment);
+}
+function decodeURISegment(segment) {
+    return decodeURIComponent(segment);
+}
+// ============================================================================
+// URI Parser
+// ============================================================================
+function parseMailURI(uri) {
+    // Must start with mail://
+    if (!uri.startsWith('mail://')) {
+        return { type: 'unknown', uri };
+    }
+    const withoutScheme = uri.slice(7); // Remove "mail://"
+    // Separate path and query string
+    const [pathPart, queryPart] = withoutScheme.split('?');
+    const segments = pathPart.split('/').filter(s => s.length > 0);
+    // Parse query parameters
+    const query = {};
+    if (queryPart) {
+        for (const pair of queryPart.split('&')) {
+            const [key, value] = pair.split('=');
+            if (key) {
+                query[decodeURIComponent(key)] = decodeURIComponent(value || '');
+            }
+        }
+    }
+    // Empty path: mail://
+    if (segments.length === 0) {
+        return { type: 'unknown', uri };
+    }
+    // Top-level resources
+    const first = segments[0];
+    // mail://properties
+    if (first === 'properties' && segments.length === 1) {
+        return { type: 'properties', uri };
+    }
+    // mail://rules or mail://rules/{index}
+    if (first === 'rules') {
+        if (segments.length === 1) {
+            return { type: 'rules', uri };
+        }
+        if (segments.length === 2) {
+            const index = parseInt(segments[1], 10);
+            if (!isNaN(index) && index >= 0) {
+                return { type: 'rules', uri, index };
+            }
+        }
+        return { type: 'unknown', uri };
+    }
+    // mail://signatures or mail://signatures/{name}
+    if (first === 'signatures') {
+        if (segments.length === 1) {
+            return { type: 'signatures', uri };
+        }
+        if (segments.length === 2) {
+            return { type: 'signatures', uri, name: decodeURISegment(segments[1]) };
+        }
+        return { type: 'unknown', uri };
+    }
+    // mail://accounts...
+    if (first === 'accounts') {
+        // mail://accounts
+        if (segments.length === 1) {
+            return { type: 'accounts', uri };
+        }
+        const accountName = decodeURISegment(segments[1]);
+        // mail://accounts/{account}
+        if (segments.length === 2) {
+            return { type: 'account', uri, account: accountName };
+        }
+        // Parse the rest: alternating /mailboxes/{name} and terminal /messages
+        return parseMailboxPath(uri, accountName, segments.slice(2), query);
+    }
+    return { type: 'unknown', uri };
+}
+// Parse mailbox path: /mailboxes/{name}/mailboxes/{name}/.../messages/{id}/attachments
+function parseMailboxPath(uri, account, segments, query) {
+    const path = [];
+    let i = 0;
+    while (i < segments.length) {
+        const segment = segments[i];
+        if (segment === 'mailboxes') {
+            // Check if this is terminal (list child mailboxes)
+            if (i + 1 >= segments.length) {
+                // mail://accounts/{a}/mailboxes (no path yet) - list top-level mailboxes
+                if (path.length === 0) {
+                    return { type: 'account-mailboxes', uri, account };
+                }
+                // mail://accounts/{a}/mailboxes/{m}/mailboxes - list child mailboxes
+                return { type: 'mailbox-mailboxes', uri, account, path };
+            }
+            // /mailboxes/{name} - add to path
+            i++;
+            path.push(decodeURISegment(segments[i]));
+            i++;
+            continue;
+        }
+        if (segment === 'messages') {
+            // Must have at least one mailbox in path
+            if (path.length === 0) {
+                return { type: 'unknown', uri };
+            }
+            // mail://accounts/{a}/mailboxes/{m}/messages - list messages
+            if (i + 1 >= segments.length) {
+                const messageQuery = {
+                    limit: parseInt(query['limit'], 10) || 20,
+                    offset: parseInt(query['offset'], 10) || 0,
+                    unread: query['unread'] === 'true' ? true : undefined
+                };
+                return {
+                    type: 'mailbox-messages',
+                    uri,
+                    account,
+                    path,
+                    query: messageQuery
+                };
+            }
+            // mail://accounts/{a}/mailboxes/{m}/messages/{id}
+            const messageId = parseInt(segments[i + 1], 10);
+            if (isNaN(messageId)) {
+                return { type: 'unknown', uri };
+            }
+            // mail://accounts/{a}/mailboxes/{m}/messages/{id}/attachments
+            if (i + 2 < segments.length && segments[i + 2] === 'attachments') {
+                return {
+                    type: 'message-attachments',
+                    uri,
+                    account,
+                    path,
+                    id: messageId
+                };
+            }
+            // Just the message
+            if (i + 2 >= segments.length) {
+                return {
+                    type: 'message',
+                    uri,
+                    account,
+                    path,
+                    id: messageId
+                };
+            }
+            return { type: 'unknown', uri };
+        }
+        // Unknown segment
+        return { type: 'unknown', uri };
+    }
+    // Ended with a mailbox path but no terminal segment
+    if (path.length > 0) {
+        return { type: 'mailbox', uri, account, path };
+    }
+    return { type: 'unknown', uri };
+}
+// ============================================================================
+// URI Builders
+// ============================================================================
+const URIBuilder = {
+    properties() {
+        return 'mail://properties';
+    },
+    rules(index) {
+        if (index !== undefined) {
+            return `mail://rules/${index}`;
+        }
+        return 'mail://rules';
+    },
+    signatures(name) {
+        if (name !== undefined) {
+            return `mail://signatures/${encodeURISegment(name)}`;
+        }
+        return 'mail://signatures';
+    },
+    accounts() {
+        return 'mail://accounts';
+    },
+    account(name) {
+        return `mail://accounts/${encodeURISegment(name)}`;
+    },
+    accountMailboxes(account) {
+        return `mail://accounts/${encodeURISegment(account)}/mailboxes`;
+    },
+    mailbox(account, path) {
+        const pathStr = path.map(p => `mailboxes/${encodeURISegment(p)}`).join('/');
+        return `mail://accounts/${encodeURISegment(account)}/${pathStr}`;
+    },
+    mailboxMailboxes(account, path) {
+        const pathStr = path.map(p => `mailboxes/${encodeURISegment(p)}`).join('/');
+        return `mail://accounts/${encodeURISegment(account)}/${pathStr}/mailboxes`;
+    },
+    mailboxMessages(account, path, query) {
+        const pathStr = path.map(p => `mailboxes/${encodeURISegment(p)}`).join('/');
+        let uri = `mail://accounts/${encodeURISegment(account)}/${pathStr}/messages`;
+        const params = [];
+        if (query?.limit !== undefined)
+            params.push(`limit=${query.limit}`);
+        if (query?.offset !== undefined)
+            params.push(`offset=${query.offset}`);
+        if (query?.unread !== undefined)
+            params.push(`unread=${query.unread}`);
+        if (params.length > 0) {
+            uri += '?' + params.join('&');
+        }
+        return uri;
+    },
+    message(account, path, id) {
+        const pathStr = path.map(p => `mailboxes/${encodeURISegment(p)}`).join('/');
+        return `mail://accounts/${encodeURISegment(account)}/${pathStr}/messages/${id}`;
+    },
+    messageAttachments(account, path, id) {
+        const pathStr = path.map(p => `mailboxes/${encodeURISegment(p)}`).join('/');
+        return `mail://accounts/${encodeURISegment(account)}/${pathStr}/messages/${id}/attachments`;
+    },
+    // Build Apple's message:// URL from RFC 2822 Message-ID
+    messageURL(messageId) {
+        // Encode special characters for URL
+        const encoded = messageId
+            .replace(/%/g, '%25')
+            .replace(/ /g, '%20')
+            .replace(/#/g, '%23');
+        return `message://<${encoded}>`;
+    }
+};
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+/// <reference path="uri-router.ts" />
+// ============================================================================
+// MCP Server Implementation with Resources Support
+// JSON-RPC 2.0 over stdio with NSRunLoop-based I/O
+// ============================================================================
+// Standard JSON-RPC error codes
+const JsonRpcErrorCodes = {
+    PARSE_ERROR: -32700,
+    INVALID_REQUEST: -32600,
+    METHOD_NOT_FOUND: -32601,
+    INVALID_PARAMS: -32602,
+    INTERNAL_ERROR: -32603,
+    RESOURCE_NOT_FOUND: -32002,
+    SERVER_ERROR: -32000
+};
+class MCPServer {
+    serverInfo;
+    tools;
+    resourceLister;
+    resourceReader;
+    resourceTemplates;
+    stdin;
+    stdout;
+    stderr;
+    buffer;
+    shouldQuit;
+    dataAvailable;
+    observer;
+    debug;
+    constructor(name, version, debug = true) {
+        this.serverInfo = { name, version };
+        this.tools = new Map();
+        this.resourceLister = null;
+        this.resourceReader = null;
+        this.resourceTemplates = [];
+        this.buffer = "";
+        this.shouldQuit = false;
+        this.dataAvailable = false;
+        this.debug = debug;
+        // Import Foundation framework
+        ObjC.import("Foundation");
+        // Get standard file handles
+        this.stdin = $.NSFileHandle.fileHandleWithStandardInput;
+        this.stdout = $.NSFileHandle.fileHandleWithStandardOutput;
+        this.stderr = $.NSFileHandle.fileHandleWithStandardError;
+    }
+    // ============================================================================
+    // Tool Registration
+    // ============================================================================
+    addTool(definition) {
+        const tool = {
+            name: definition.name,
+            description: definition.description,
+            inputSchema: definition.inputSchema ?? { type: "object", properties: {}, required: [] }
+        };
+        if (definition.annotations) {
+            tool.annotations = definition.annotations;
+        }
+        this.tools.set(definition.name, { tool, handler: definition.handler });
+        return this;
+    }
+    // ============================================================================
+    // Resource Registration
+    // ============================================================================
+    setResources(lister, reader) {
+        this.resourceLister = lister;
+        this.resourceReader = reader;
+        return this;
+    }
+    setResourceTemplates(templates) {
+        this.resourceTemplates = templates;
+        return this;
+    }
+    // ============================================================================
+    // I/O Helpers
+    // ============================================================================
+    log(message) {
+        if (!this.debug)
+            return;
+        const fullMessage = `[${this.serverInfo.name}] ${message}\n`;
+        const data = $.NSString.alloc.initWithUTF8String(fullMessage)
             .dataUsingEncoding($.NSUTF8StringEncoding);
-        stderr.writeData(data);
+        this.stderr.writeData(data);
     }
-
-    function writeLine(obj) {
-        const str = JSON.stringify(obj) + '\n';
-        const data = $.NSString.alloc.initWithUTF8String(str)
+    send(response) {
+        const json = JSON.stringify(response) + "\n";
+        const data = $.NSString.alloc.initWithUTF8String(json)
             .dataUsingEncoding($.NSUTF8StringEncoding);
-        stdout.writeData(data);
+        this.stdout.writeData(data);
     }
-
-    function sendResult(id, result) {
-        writeLine({ jsonrpc: '2.0', id: id, result: result });
+    sendResult(id, result) {
+        this.send({ jsonrpc: "2.0", id, result });
     }
-
-    function sendError(id, code, message) {
-        writeLine({ jsonrpc: '2.0', id: id, error: { code: code, message: message } });
+    sendError(id, code, message) {
+        this.send({ jsonrpc: "2.0", id, error: { code, message } });
     }
-
-    function sendToolResult(id, text, isError) {
-        sendResult(id, {
-            content: [{ type: 'text', text: String(text) }],
-            isError: isError || false
+    sendToolResult(id, text, isError = false) {
+        this.sendResult(id, {
+            content: [{ type: "text", text: String(text) }],
+            isError
         });
     }
-
-    function handleRequest(request) {
-        const { id, method, params } = request;
-
-        switch (method) {
-            case 'initialize':
-                log('Initialize from: ' + (params?.clientInfo?.name || 'unknown'));
-                const capabilities = { tools: {} };
-                if (resourceLister) capabilities.resources = {};
-                sendResult(id, {
-                    protocolVersion: protocolVersion,
-                    capabilities: capabilities,
-                    serverInfo: { name: serverName, version: serverVersion }
-                });
+    // ============================================================================
+    // Request Handlers
+    // ============================================================================
+    handleInitialize(id, params) {
+        const clientName = params.clientInfo?.name ?? 'unknown';
+        this.log(`Initialize from: ${clientName}`);
+        const capabilities = {};
+        if (this.tools.size > 0) {
+            capabilities.tools = {};
+        }
+        if (this.resourceLister) {
+            capabilities.resources = {};
+        }
+        this.sendResult(id, {
+            protocolVersion: "2024-11-05",
+            serverInfo: this.serverInfo,
+            capabilities
+        });
+    }
+    handleToolsList(id) {
+        const tools = [];
+        this.tools.forEach(({ tool }) => tools.push(tool));
+        this.log(`Tools list (${tools.length})`);
+        this.sendResult(id, { tools });
+    }
+    handleToolsCall(id, params) {
+        const name = params.name;
+        const args = params.arguments ?? {};
+        this.log(`Call: ${name}`);
+        const entry = this.tools.get(name);
+        if (!entry) {
+            this.sendError(id, JsonRpcErrorCodes.METHOD_NOT_FOUND, `Unknown tool: ${name}`);
+            return;
+        }
+        try {
+            const result = entry.handler(args);
+            this.sendResult(id, result);
+        }
+        catch (e) {
+            const error = e;
+            this.sendToolResult(id, `Error: ${error.message}`, true);
+        }
+    }
+    handleResourcesList(id) {
+        this.log("Resources list");
+        if (!this.resourceLister) {
+            this.sendResult(id, { resources: [] });
+            return;
+        }
+        try {
+            const resources = this.resourceLister();
+            this.sendResult(id, { resources });
+        }
+        catch (e) {
+            const error = e;
+            this.sendError(id, JsonRpcErrorCodes.SERVER_ERROR, `Resource list error: ${error.message}`);
+        }
+    }
+    handleResourcesRead(id, params) {
+        const uri = params.uri;
+        this.log(`Resource read: ${uri}`);
+        if (!this.resourceReader) {
+            this.sendError(id, JsonRpcErrorCodes.METHOD_NOT_FOUND, "Resources not supported");
+            return;
+        }
+        try {
+            this.log(`[DBG] calling resourceReader...`);
+            const content = this.resourceReader(uri);
+            this.log(`[DBG] resourceReader returned`);
+            if (content === null || content === undefined) {
+                this.sendError(id, JsonRpcErrorCodes.RESOURCE_NOT_FOUND, `Resource not found: ${uri}`);
+                return;
+            }
+            this.log(`[DBG] stringifying content...`);
+            const textContent = typeof content.text === 'string'
+                ? content.text
+                : JSON.stringify(content.text, null, 2);
+            this.log(`[DBG] stringified, length: ${textContent.length}`);
+            this.log(`[DBG] building result...`);
+            const result = {
+                contents: [{
+                        uri,
+                        mimeType: content.mimeType || 'application/json',
+                        text: textContent
+                    }]
+            };
+            this.log(`[DBG] calling sendResult...`);
+            this.sendResult(id, result);
+            this.log(`[DBG] sendResult done`);
+        }
+        catch (e) {
+            const error = e;
+            this.sendError(id, JsonRpcErrorCodes.SERVER_ERROR, `Resource read error: ${error.message}`);
+        }
+    }
+    handleResourceTemplatesList(id) {
+        this.log("Resource templates list");
+        this.sendResult(id, { resourceTemplates: this.resourceTemplates });
+    }
+    // ============================================================================
+    // Request Dispatch
+    // ============================================================================
+    handleRequest(request) {
+        switch (request.method) {
+            case "initialize":
+                this.handleInitialize(request.id, request.params ?? {});
                 break;
-
-            case 'notifications/initialized':
-                log('Client initialized');
+            case "initialized":
+            case "notifications/initialized":
+                this.log("Client initialized");
                 break;
-
-            case 'tools/list':
-                log('Tools list (' + tools.length + ')');
-                sendResult(id, { tools: tools });
+            case "tools/list":
+                this.handleToolsList(request.id);
                 break;
-
-            case 'tools/call':
-                const toolName = params?.name;
-                const args = params?.arguments || {};
-                log('Call: ' + toolName);
-
-                const handler = toolHandlers[toolName];
-                if (!handler) {
-                    sendError(id, -32601, 'Unknown tool: ' + toolName);
-                    break;
-                }
-
-                try {
-                    const result = handler(args);
-                    if (result && result._error) {
-                        sendToolResult(id, result._error, true);
-                    } else {
-                        sendToolResult(id, result ?? 'OK');
-                    }
-                } catch (e) {
-                    sendToolResult(id, 'Error: ' + e.message, true);
-                }
+            case "tools/call":
+                this.handleToolsCall(request.id, request.params ?? {});
                 break;
-
-            case 'resources/list':
-                log('Resources list');
-                if (!resourceLister) {
-                    sendResult(id, { resources: [] });
-                } else {
-                    try {
-                        sendResult(id, { resources: resourceLister() });
-                    } catch (e) {
-                        sendError(id, -32000, 'Resource list error: ' + e.message);
-                    }
-                }
+            case "resources/list":
+                this.handleResourcesList(request.id);
                 break;
-
-            case 'resources/read':
-                const uri = params?.uri;
-                log('Resource read: ' + uri);
-                if (!resourceReader) {
-                    sendError(id, -32601, 'Resources not supported');
-                } else {
-                    try {
-                        const content = resourceReader(uri);
-                        if (content === null || content === undefined) {
-                            sendError(id, -32002, 'Resource not found: ' + uri);
-                        } else {
-                            sendResult(id, {
-                                contents: [{
-                                    uri: uri,
-                                    mimeType: content.mimeType || 'application/json',
-                                    text: typeof content.text === 'string' ? content.text : JSON.stringify(content.text, null, 2)
-                                }]
-                            });
-                        }
-                    } catch (e) {
-                        sendError(id, -32000, 'Resource read error: ' + e.message);
-                    }
-                }
+            case "resources/read":
+                this.handleResourcesRead(request.id, request.params ?? {});
                 break;
-
+            case "resources/templates/list":
+                this.handleResourceTemplatesList(request.id);
+                break;
             default:
-                if (id !== undefined && !method?.startsWith('notifications/')) {
-                    sendError(id, -32601, 'Method not found: ' + method);
+                // Only send error for requests (with id), not notifications
+                if (request.id !== undefined && !request.method?.startsWith('notifications/')) {
+                    this.sendError(request.id, JsonRpcErrorCodes.METHOD_NOT_FOUND, `Method not found: ${request.method}`);
                 }
         }
     }
-
-    return {
-        addTool: function(def) {
-            tools.push({
-                name: def.name,
-                description: def.description || '',
-                inputSchema: def.inputSchema || { type: 'object', properties: {}, required: [] }
-            });
-            toolHandlers[def.name] = def.handler;
-            return this;
-        },
-
-        setResources: function(lister, reader) {
-            resourceLister = lister;
-            resourceReader = reader;
-            return this;
-        },
-
-        error: function(msg) { return { _error: msg }; },
-
-        run: function() {
-            log('Starting');
-
-            let buffer = '';
-            let dataAvailable = false;
-            let shouldQuit = false;
-
-            const handlerName = 'H' + Date.now();
-            ObjC.registerSubclass({
-                name: handlerName,
-                methods: {
-                    'h:': {
-                        types: ['void', ['id']],
-                        implementation: function() { dataAvailable = true; }
+    // ============================================================================
+    // Buffer Processing
+    // ============================================================================
+    processBuffer() {
+        const lines = this.buffer.split("\n");
+        this.buffer = lines.pop() ?? "";
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed)
+                continue;
+            try {
+                const request = JSON.parse(trimmed);
+                this.handleRequest(request);
+            }
+            catch (e) {
+                const error = e;
+                this.log(`Parse error: ${error.message}`);
+                this.sendError(null, JsonRpcErrorCodes.PARSE_ERROR, "Parse error");
+            }
+        }
+    }
+    // ============================================================================
+    // Main Run Loop
+    // ============================================================================
+    run() {
+        this.log(`${this.serverInfo.name} v${this.serverInfo.version} starting...`);
+        // Register Objective-C subclass for notification handling
+        const observerClassName = `StdinObserver_${Date.now()}`;
+        ObjC.registerSubclass({
+            name: observerClassName,
+            methods: {
+                "handleData:": {
+                    types: ["void", ["id"]],
+                    implementation: (_notification) => {
+                        this.dataAvailable = true;
                     }
-                }
-            });
-
-            const handler = $[handlerName].alloc.init;
-            $.NSNotificationCenter.defaultCenter.addObserverSelectorNameObject(
-                handler, 'h:', 'NSFileHandleDataAvailableNotification', stdin
-            );
-
-            stdin.waitForDataInBackgroundAndNotify;
-
-            while (!shouldQuit) {
-                $.NSRunLoop.currentRunLoop.runUntilDate(
-                    $.NSDate.dateWithTimeIntervalSinceNow(1.0)
-                );
-
-                if (dataAvailable) {
-                    dataAvailable = false;
-                    const data = stdin.availableData;
-
-                    if (data.length === 0) {
-                        shouldQuit = true;
-                        break;
-                    }
-
-                    buffer += $.NSString.alloc.initWithDataEncoding(
-                        data, $.NSUTF8StringEncoding
-                    ).js;
-
-                    let lines = buffer.split('\n');
-                    buffer = lines.pop();
-
-                    for (const line of lines) {
-                        if (!line.trim()) continue;
-                        try {
-                            handleRequest(JSON.parse(line));
-                        } catch (e) {
-                            sendError(null, -32700, 'Parse error');
-                        }
-                    }
-
-                    if (!shouldQuit) stdin.waitForDataInBackgroundAndNotify;
                 }
             }
-
-            $.NSNotificationCenter.defaultCenter.removeObserverNameObject(
-                handler, 'NSFileHandleDataAvailableNotification', stdin
-            );
-            log('Done');
+        });
+        // Access the registered class via the $ bridge
+        this.observer = $[observerClassName].alloc.init;
+        // Register for stdin data notifications
+        $.NSNotificationCenter.defaultCenter.addObserverSelectorNameObject(this.observer, "handleData:", "NSFileHandleDataAvailableNotification", this.stdin);
+        // Start listening
+        void this.stdin.waitForDataInBackgroundAndNotify;
+        // Main run loop
+        while (!this.shouldQuit) {
+            $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(1.0));
+            if (this.dataAvailable) {
+                this.dataAvailable = false;
+                const data = this.stdin.availableData;
+                if (data.length === 0) {
+                    this.shouldQuit = true;
+                    break;
+                }
+                const nsString = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+                if (nsString) {
+                    this.buffer += nsString.js;
+                    this.processBuffer();
+                }
+                void this.stdin.waitForDataInBackgroundAndNotify;
+            }
         }
-    };
+        // Cleanup
+        $.NSNotificationCenter.defaultCenter.removeObserverNameObject(this.observer, "NSFileHandleDataAvailableNotification", this.stdin);
+        this.log("Server shutting down");
+    }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// === src/cache.js (lines 401-800) ===
+/// <reference path="../types/jxa.d.ts" />
+// ============================================================================
 // SQLite Cache for message lookups
 // Stores message locations to avoid expensive mailbox scans
-
+// ============================================================================
 const CACHE_DIR = $.NSHomeDirectory().js + '/.cache/jxa-mail';
 const CACHE_DB = CACHE_DIR + '/messages.db';
 const ATTACHMENTS_DIR = CACHE_DIR + '/attachments';
-
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
     message_id TEXT PRIMARY KEY,
@@ -413,13 +552,16 @@ CREATE TABLE IF NOT EXISTS messages (
     mailbox_path TEXT NOT NULL,
     internal_id INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_messages_account_mailbox ON messages(account, mailbox_path);
 CREATE VIEW IF NOT EXISTS mailbox_popularity AS
 SELECT account, mailbox_path, COUNT(*) as message_count
 FROM messages GROUP BY account, mailbox_path ORDER BY message_count DESC;
 `;
-
 const Cache = {
+    _initialized: false,
     init() {
+        if (this._initialized)
+            return;
         const fm = $.NSFileManager.defaultManager;
         if (!fm.fileExistsAtPath(CACHE_DIR)) {
             fm.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(CACHE_DIR, true, $(), $());
@@ -428,2773 +570,1170 @@ const Cache = {
             fm.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(ATTACHMENTS_DIR, true, $(), $());
         }
         this.sql(SCHEMA);
+        this._initialized = true;
     },
-
     sql(query) {
         const app = Application.currentApplication();
         app.includeStandardAdditions = true;
         // Shell-safe escaping: single quotes prevent all interpolation
-        const shellEsc = s => "'" + s.replace(/'/g, "'\\''") + "'";
+        const shellEsc = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
         try {
             return app.doShellScript('sqlite3 ' + shellEsc(CACHE_DB) + ' ' + shellEsc(query));
-        } catch (e) {
+        }
+        catch {
             return null;
         }
     },
-
     store(messageId, account, mailboxPath, internalId) {
-        const esc = s => s.replace(/'/g, "''");
+        this.init();
+        const esc = (s) => s.replace(/'/g, "''");
         this.sql(`INSERT OR REPLACE INTO messages VALUES ('${esc(messageId)}', '${esc(account)}', '${esc(mailboxPath)}', ${internalId})`);
     },
-
     lookup(messageId) {
+        this.init();
         const result = this.sql(`SELECT account, mailbox_path, internal_id FROM messages WHERE message_id = '${messageId.replace(/'/g, "''")}'`);
-        if (!result) return null;
-        const [account, mailboxPath, internalId] = result.split('|');
-        return internalId ? { account, mailboxPath, internalId: parseInt(internalId, 10) } : null;
+        if (!result)
+            return null;
+        const parts = result.split('|');
+        if (parts.length < 3)
+            return null;
+        const [account, mailboxPath, internalIdStr] = parts;
+        const internalId = parseInt(internalIdStr, 10);
+        return !isNaN(internalId) ? { account, mailboxPath, internalId } : null;
     },
-
     popularMailboxes() {
+        this.init();
         const result = this.sql('SELECT account, mailbox_path FROM mailbox_popularity');
-        if (!result) return [];
+        if (!result)
+            return [];
         return result.split('\n').filter(l => l).map(l => {
             const [account, mailboxPath] = l.split('|');
             return { account, mailboxPath };
         });
+    },
+    getAttachmentsDir() {
+        this.init();
+        return ATTACHMENTS_DIR;
     }
 };
-
-Cache.init();
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// === src/facades.js (lines 801-1200) ===
-// Facade objects for Mail.app JXA types
-// Wraps raw JXA references with cleaner APIs and JSON serialization
-
-function Mailbox(jxaMailbox) {
-    return {
-        _jxa: jxaMailbox,
-        get name() { return jxaMailbox.name(); },
-        get path() {
-            const s = Automation.getDisplayString(jxaMailbox);
-            const m = s.match(/mailboxes\.byName\("([^"]+)"\)/);
-            return m ? m[1] : jxaMailbox.name();
-        },
-        get accountName() { return jxaMailbox.account().name(); },
-        get unreadCount() { return jxaMailbox.unreadCount(); },
-        messages(opts) {
-            opts = opts || {};
-            let msgs = opts.unreadOnly
-                ? jxaMailbox.messages.whose({ readStatus: { _equals: false } })()
-                : jxaMailbox.messages();
-            if (opts.limit) msgs = msgs.slice(0, opts.limit);
-            return msgs.map(m => Message(m));
-        },
-        searchByMessageId(messageId) {
-            try {
-                const found = jxaMailbox.messages.whose({ messageId: { _equals: messageId } })();
-                return found.length > 0 ? Message(found[0]) : null;
-            } catch (e) { return null; }
-        }
-    };
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+// ============================================================================
+// Collection and Specifier Base Patterns
+// Lazy navigation with explicit resolution
+// ============================================================================
+// ============================================================================
+// Result Helpers
+// ============================================================================
+function ok(value) {
+    return { ok: true, value };
 }
-
-function Message(jxaMsg) {
+function err(error) {
+    return { ok: false, error };
+}
+// ============================================================================
+// String Coercion
+// JXA returns bridged Cocoa strings with enumerable character keys.
+// This causes JSON.stringify to iterate every character. Force primitive.
+// ============================================================================
+function str(val) {
+    return val == null ? '' : '' + val;
+}
+function strOrNull(val) {
+    return val == null ? null : '' + val;
+}
+// Safe property access with fallback
+function getOr(fn, fallback) {
+    try {
+        const value = fn();
+        return value ?? fallback;
+    }
+    catch {
+        return fallback;
+    }
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="cache.ts" />
+/// <reference path="collections.ts" />
+function MessageSpecifier(jxa, accountName, mailboxPath) {
+    // Cache computed values
+    let _id = null;
+    let _messageId = null;
     const self = {
-        _jxa: jxaMsg,
-        get id() { return jxaMsg.id(); },
-        get messageId() { return jxaMsg.messageId(); },
-        get url() {
-            const mid = self.messageId.replace(/%/g, '%25').replace(/ /g, '%20').replace(/#/g, '%23');
+        _jxa: jxa,
+        accountName,
+        mailboxPath,
+        get id() {
+            if (_id === null) {
+                _id = getOr(() => jxa.id(), 0);
+            }
+            return _id;
+        },
+        get messageId() {
+            if (_messageId === null) {
+                _messageId = str(getOr(() => jxa.messageId(), ''));
+            }
+            return _messageId;
+        },
+        get messageUrl() {
+            const mid = self.messageId
+                .replace(/%/g, '%25')
+                .replace(/ /g, '%20')
+                .replace(/#/g, '%23');
             return `message://<${mid}>`;
         },
-        get subject() { return jxaMsg.subject(); },
-        get sender() { return jxaMsg.sender(); },
-        get dateReceived() { try { return jxaMsg.dateReceived().toISOString(); } catch(e) { return null; } },
-        get dateSent() { try { return jxaMsg.dateSent().toISOString(); } catch(e) { return null; } },
-        get read() { return jxaMsg.readStatus(); },
-        set read(v) { jxaMsg.readStatus = v; },
-        get flagged() { return jxaMsg.flaggedStatus(); },
-        set flagged(v) { jxaMsg.flaggedStatus = v; },
-        get mailbox() { return Mailbox(jxaMsg.mailbox()); },
-
-        cache() {
-            const mb = self.mailbox;
-            Cache.store(self.messageId, mb.accountName, mb.path, self.id);
+        get read() {
+            return getOr(() => jxa.readStatus, false);
         },
-
-        props(full) {
+        set read(value) {
+            jxa.readStatus = value;
+        },
+        get flagged() {
+            return getOr(() => jxa.flaggedStatus, false);
+        },
+        set flagged(value) {
+            jxa.flaggedStatus = value;
+        },
+        uri() {
+            return URIBuilder.message(accountName, mailboxPath, self.id);
+        },
+        cache() {
+            try {
+                Cache.store(self.messageId, accountName, mailboxPath.join('/'), self.id);
+            }
+            catch {
+                // Ignore cache errors
+            }
+        },
+        resolve() {
+            try {
+                const id = self.id;
+                if (id === 0) {
+                    return err(`Failed to resolve message in ${accountName}/${mailboxPath.join('/')}: invalid id`);
+                }
+                const resolveRecipients = (getter) => {
+                    try {
+                        return getter().map(r => ({
+                            name: strOrNull(getOr(() => r.name(), null)),
+                            address: str(getOr(() => r.address(), ''))
+                        }));
+                    }
+                    catch {
+                        return [];
+                    }
+                };
+                const resolveAttachments = () => {
+                    try {
+                        return jxa.mailAttachments().map((a, i) => ({
+                            index: i,
+                            name: str(getOr(() => a.name(), '')),
+                            mimeType: str(getOr(() => a.mimeType(), 'application/octet-stream')),
+                            fileSize: getOr(() => a.fileSize(), null),
+                            downloaded: getOr(() => a.downloaded(), false)
+                        }));
+                    }
+                    catch {
+                        return [];
+                    }
+                };
+                let dateSent = null;
+                let dateReceived = null;
+                try {
+                    const ds = jxa.dateSent();
+                    dateSent = ds ? ds.toISOString() : null;
+                }
+                catch { /* ignore */ }
+                try {
+                    const dr = jxa.dateReceived();
+                    dateReceived = dr ? dr.toISOString() : null;
+                }
+                catch { /* ignore */ }
+                const message = {
+                    id,
+                    messageId: self.messageId,
+                    subject: strOrNull(getOr(() => jxa.subject(), null)),
+                    sender: strOrNull(getOr(() => jxa.sender(), null)),
+                    dateSent,
+                    dateReceived,
+                    read: self.read,
+                    flagged: self.flagged,
+                    replyTo: strOrNull(getOr(() => jxa.replyTo(), null)),
+                    content: strOrNull(getOr(() => jxa.content(), null)),
+                    toRecipients: resolveRecipients(() => jxa.toRecipients()),
+                    ccRecipients: resolveRecipients(() => jxa.ccRecipients()),
+                    bccRecipients: resolveRecipients(() => jxa.bccRecipients()),
+                    attachments: resolveAttachments()
+                };
+                self.cache();
+                return ok(message);
+            }
+            catch (e) {
+                const err_msg = e instanceof Error ? e.message : String(e);
+                return err(`Failed to resolve message in ${accountName}/${mailboxPath.join('/')}: ${err_msg}`);
+            }
+        },
+        summary() {
             self.cache();
-            const p = {
-                url: self.url,
-                subject: self.subject,
-                sender: self.sender,
-                dateReceived: self.dateReceived,
+            let dateReceived = null;
+            try {
+                const dr = jxa.dateReceived();
+                dateReceived = dr ? dr.toISOString() : null;
+            }
+            catch { /* ignore */ }
+            return {
+                id: self.id,
+                uri: self.uri(),
+                messageUrl: self.messageUrl,
+                subject: strOrNull(getOr(() => jxa.subject(), null)),
+                sender: strOrNull(getOr(() => jxa.sender(), null)),
+                dateReceived,
                 read: self.read,
                 flagged: self.flagged
             };
-            if (full) {
-                p.dateSent = self.dateSent;
-                p.replyTo = jxaMsg.replyTo();
-                p.junk = jxaMsg.junkMailStatus();
-                p.mailbox = self.mailbox.path;
-                p.account = self.mailbox.accountName;
-                p.content = jxaMsg.content();
-                p.toRecipients = jxaMsg.toRecipients().map(r => ({ name: r.name(), address: r.address() }));
-                p.ccRecipients = jxaMsg.ccRecipients().map(r => ({ name: r.name(), address: r.address() }));
-                p.attachments = jxaMsg.mailAttachments().map((a, i) => ({
+        },
+        full() {
+            self.cache();
+            const resolveRecipients = (getter) => {
+                try {
+                    return getter().map(r => ({
+                        name: strOrNull(getOr(() => r.name(), null)),
+                        address: str(getOr(() => r.address(), ''))
+                    }));
+                }
+                catch {
+                    return [];
+                }
+            };
+            let dateSent = null;
+            let dateReceived = null;
+            try {
+                const ds = jxa.dateSent();
+                dateSent = ds ? ds.toISOString() : null;
+            }
+            catch { /* ignore */ }
+            try {
+                const dr = jxa.dateReceived();
+                dateReceived = dr ? dr.toISOString() : null;
+            }
+            catch { /* ignore */ }
+            return {
+                id: self.id,
+                uri: self.uri(),
+                messageUrl: self.messageUrl,
+                subject: strOrNull(getOr(() => jxa.subject(), null)),
+                sender: strOrNull(getOr(() => jxa.sender(), null)),
+                dateReceived,
+                dateSent,
+                read: self.read,
+                flagged: self.flagged,
+                replyTo: strOrNull(getOr(() => jxa.replyTo(), null)),
+                junk: getOr(() => jxa.junkMailStatus(), null),
+                mailbox: mailboxPath.join('/'),
+                account: accountName,
+                content: strOrNull(getOr(() => jxa.content(), null)),
+                toRecipients: resolveRecipients(() => jxa.toRecipients()),
+                ccRecipients: resolveRecipients(() => jxa.ccRecipients()),
+                attachments: self.getAttachments(),
+                attachmentsUri: URIBuilder.messageAttachments(accountName, mailboxPath, self.id)
+            };
+        },
+        getAttachments() {
+            try {
+                return jxa.mailAttachments().map((a, i) => ({
                     index: i,
-                    name: a.name(),
-                    mimeType: a.mimeType(),
-                    fileSize: (() => { try { return a.fileSize(); } catch(e) { return null; } })(),
-                    downloaded: a.downloaded()
+                    name: str(getOr(() => a.name(), '')),
+                    mimeType: str(getOr(() => a.mimeType(), 'application/octet-stream')),
+                    fileSize: getOr(() => a.fileSize(), null),
+                    downloaded: getOr(() => a.downloaded(), false)
                 }));
             }
-            return p;
+            catch {
+                return [];
+            }
         }
     };
     return self;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// === src/mail.js (lines 1201-1600) ===
-// Mail.app singleton
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="cache.ts" />
+/// <reference path="collections.ts" />
+/// <reference path="message.ts" />
+function MailboxSpecifier(jxa, accountName, path) {
+    const self = {
+        _jxa: jxa,
+        accountName,
+        path,
+        get name() {
+            return str(getOr(() => jxa.name(), ''));
+        },
+        get unreadCount() {
+            return getOr(() => jxa.unreadCount(), 0);
+        },
+        uri() {
+            return URIBuilder.mailbox(accountName, path);
+        },
+        resolve() {
+            try {
+                const mailbox = {
+                    name: self.name,
+                    unreadCount: self.unreadCount
+                };
+                return ok(mailbox);
+            }
+            catch (e) {
+                const err_msg = e instanceof Error ? e.message : String(e);
+                return err(`Failed to resolve mailbox ${path.join('/')} in ${accountName}: ${err_msg}`);
+            }
+        },
+        info() {
+            return {
+                name: self.name,
+                uri: self.uri(),
+                unreadCount: self.unreadCount,
+                messagesUri: URIBuilder.mailboxMessages(accountName, path),
+                mailboxesUri: URIBuilder.mailboxMailboxes(accountName, path)
+            };
+        },
+        infoWithChildren(hasChildren) {
+            return {
+                ...self.info(),
+                hasChildren
+            };
+        },
+        // Efficient message access - uses index-based iteration to avoid N+1
+        getMessages(opts) {
+            const options = opts ?? {};
+            const limit = options.limit ?? 20;
+            const offset = options.offset ?? 0;
+            const unreadOnly = options.unreadOnly ?? false;
+            const result = [];
+            // If filtering by unread, use whose() clause
+            if (unreadOnly) {
+                try {
+                    const unreadMsgs = jxa.messages.whose({ readStatus: { _equals: false } })();
+                    const startIdx = offset;
+                    const endIdx = Math.min(offset + limit, unreadMsgs.length);
+                    for (let i = startIdx; i < endIdx; i++) {
+                        try {
+                            result.push(MessageSpecifier(unreadMsgs[i], accountName, path));
+                        }
+                        catch {
+                            // Skip messages that fail to load
+                        }
+                    }
+                    return result;
+                }
+                catch {
+                    return [];
+                }
+            }
+            // For all messages, use index-based access to avoid loading all
+            let index = 0;
+            let collected = 0;
+            try {
+                while (collected < limit) {
+                    try {
+                        const msg = jxa.messages.at(index);
+                        // Verify the message exists by accessing a property
+                        msg.id();
+                        if (index >= offset) {
+                            result.push(MessageSpecifier(msg, accountName, path));
+                            collected++;
+                        }
+                        index++;
+                    }
+                    catch {
+                        // No more messages or error accessing this index
+                        break;
+                    }
+                }
+                return result;
+            }
+            catch {
+                return [];
+            }
+        },
+        getMessageById(id) {
+            try {
+                const msg = jxa.messages.byId(id);
+                // Verify it exists
+                msg.id();
+                return MessageSpecifier(msg, accountName, path);
+            }
+            catch {
+                return null;
+            }
+        },
+        searchByMessageId(messageId) {
+            try {
+                const found = jxa.messages.whose({ messageId: { _equals: messageId } })();
+                return found.length > 0 ? MessageSpecifier(found[0], accountName, path) : null;
+            }
+            catch {
+                return null;
+            }
+        },
+        getChildMailboxes() {
+            try {
+                return jxa.mailboxes().map((m) => {
+                    const childName = str(getOr(() => m.name(), ''));
+                    return MailboxSpecifier(m, accountName, [...path, childName]);
+                });
+            }
+            catch {
+                return [];
+            }
+        }
+    };
+    return self;
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="collections.ts" />
+/// <reference path="mailbox.ts" />
+function AccountSpecifier(jxa) {
+    // Cache the name since it's used frequently
+    let _name = null;
+    const self = {
+        _jxa: jxa,
+        get name() {
+            if (_name === null) {
+                _name = str(getOr(() => jxa.name(), ''));
+            }
+            return _name;
+        },
+        get emailAddresses() {
+            return getOr(() => jxa.emailAddresses(), []);
+        },
+        get enabled() {
+            return getOr(() => jxa.enabled(), false);
+        },
+        get fullName() {
+            return str(getOr(() => jxa.fullName(), ''));
+        },
+        uri() {
+            return URIBuilder.account(self.name);
+        },
+        info() {
+            return {
+                name: self.name,
+                uri: self.uri(),
+                mailboxesUri: URIBuilder.accountMailboxes(self.name),
+                emailAddresses: self.emailAddresses,
+                enabled: self.enabled
+            };
+        },
+        getAllMailboxes() {
+            try {
+                return jxa.mailboxes().map((m) => {
+                    // Extract path from JXA specifier display string
+                    const displayStr = Automation.getDisplayString(m);
+                    const match = displayStr.match(/mailboxes\.byName\("([^"]+)"\)/);
+                    const mailboxPath = match ? match[1] : str(getOr(() => m.name(), ''));
+                    const pathParts = mailboxPath.split('/');
+                    return MailboxSpecifier(m, self.name, pathParts);
+                });
+            }
+            catch {
+                return [];
+            }
+        },
+        getTopLevelMailboxes() {
+            const all = self.getAllMailboxes();
+            // Top-level mailboxes have single-element paths
+            return all.filter(mb => mb.path.length === 1);
+        },
+        findMailbox(path) {
+            try {
+                const mb = jxa.mailboxes.byName(path);
+                // Verify it exists
+                mb.name();
+                const pathParts = path.split('/');
+                return MailboxSpecifier(mb, self.name, pathParts);
+            }
+            catch {
+                return null;
+            }
+        }
+    };
+    return self;
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="cache.ts" />
+/// <reference path="collections.ts" />
+/// <reference path="message.ts" />
+/// <reference path="mailbox.ts" />
+/// <reference path="account.ts" />
+// ============================================================================
+// Mail.app Singleton
 // Central interface to Apple Mail via JXA
-
+// ============================================================================
 const Mail = {
     _app: null,
-    get app() { return this._app || (this._app = Application('Mail')); },
-
-    accounts() {
-        return this.app.accounts().map(a => ({
-            name: a.name(),
-            mailboxes: () => a.mailboxes().map(m => Mailbox(m))
-        }));
+    get app() {
+        if (!this._app) {
+            this._app = Application('Mail');
+        }
+        return this._app;
     },
-
-    findMailbox(accountName, mailboxPath) {
+    // ============================================================================
+    // Accounts
+    // ============================================================================
+    getAccounts() {
         try {
-            const acc = this.app.accounts.byName(accountName);
-            const mb = acc.mailboxes.byName(mailboxPath);
-            mb.name(); // verify exists
-            return Mailbox(mb);
-        } catch (e) { return null; }
+            return this.app.accounts().map((a) => AccountSpecifier(a));
+        }
+        catch {
+            return [];
+        }
     },
-
+    getAccount(name) {
+        try {
+            const acc = this.app.accounts.byName(name);
+            // Verify exists
+            acc.name();
+            return AccountSpecifier(acc);
+        }
+        catch {
+            return null;
+        }
+    },
+    // ============================================================================
+    // Mailbox Lookup
+    // ============================================================================
+    findMailbox(accountName, mailboxPath) {
+        const account = this.getAccount(accountName);
+        if (!account)
+            return null;
+        return account.findMailbox(mailboxPath);
+    },
+    // Find mailbox by name across accounts (or within specific account)
     findMailboxByName(accountName, name) {
-        for (const acc of this.app.accounts()) {
-            if (accountName && acc.name() !== accountName) continue;
-            for (const mb of acc.mailboxes()) {
-                if (mb.name() === name) return Mailbox(mb);
+        const accounts = accountName
+            ? [this.getAccount(accountName)].filter((a) => a !== null)
+            : this.getAccounts();
+        for (const acc of accounts) {
+            for (const mb of acc.getAllMailboxes()) {
+                if (mb.name === name)
+                    return mb;
             }
         }
         return null;
     },
-
+    // Navigate mailbox hierarchy: given path array, find the nested mailbox
+    findMailboxByPath(accountName, pathParts) {
+        if (pathParts.length === 0)
+            return null;
+        const account = this.getAccount(accountName);
+        if (!account)
+            return null;
+        // Build the path string for JXA lookup
+        const fullPath = pathParts.join('/');
+        return account.findMailbox(fullPath);
+    },
+    // ============================================================================
+    // Message Lookup
+    // ============================================================================
+    // Find message by internal ID in a specific mailbox
+    findMessageById(accountName, mailboxPath, messageId) {
+        const mb = this.findMailboxByPath(accountName, mailboxPath);
+        if (!mb)
+            return null;
+        return mb.getMessageById(messageId);
+    },
+    // Best-effort message lookup from message:// URL
+    // Uses cache first, then searches inboxes
     messageFromUrl(url) {
         const match = url.match(/^message:\/\/<(.+)>$/);
-        if (!match) return null;
+        if (!match)
+            return null;
         // Decode URL escapes (must decode %25 first to handle literal % in message IDs)
-        const messageId = match[1].replace(/%25/g, '%').replace(/%23/g, '#').replace(/%20/g, ' ');
-
-        // 1. Cache lookup
+        const messageId = match[1]
+            .replace(/%25/g, '%')
+            .replace(/%23/g, '#')
+            .replace(/%20/g, ' ');
+        // 1. Cache lookup (fast path)
         const cached = Cache.lookup(messageId);
         if (cached) {
             const mb = this.findMailbox(cached.account, cached.mailboxPath);
             if (mb) {
-                try {
-                    const found = mb._jxa.messages.whose({ id: { _equals: cached.internalId } })();
-                    if (found.length && found[0].messageId() === messageId) {
-                        return Message(found[0]);
-                    }
-                } catch (e) {}
+                const msg = mb.searchByMessageId(messageId);
+                if (msg)
+                    return msg;
             }
         }
-
-        // 2. Search inboxes
-        for (const acc of this.app.accounts()) {
-            const inbox = this.findMailboxByName(acc.name(), 'INBOX') || this.findMailboxByName(acc.name(), 'Inbox');
+        // 2. Quick inbox search across all accounts
+        for (const acc of this.getAccounts()) {
+            const inbox = this.findMailboxByName(acc.name, 'INBOX')
+                || this.findMailboxByName(acc.name, 'Inbox');
             if (inbox) {
                 const msg = inbox.searchByMessageId(messageId);
-                if (msg) { msg.cache(); return msg; }
+                if (msg) {
+                    msg.cache();
+                    return msg;
+                }
             }
         }
-
-        // 3. Search by popularity
-        const searched = new Set();
-        for (const { account, mailboxPath } of Cache.popularMailboxes()) {
-            if (mailboxPath.toLowerCase() === 'inbox') continue;
-            const key = `${account}:${mailboxPath}`;
-            if (searched.has(key)) continue;
-            searched.add(key);
-            const mb = this.findMailbox(account, mailboxPath);
-            if (mb) {
-                const msg = mb.searchByMessageId(messageId);
-                if (msg) { msg.cache(); return msg; }
-            }
-        }
-
-        // 4. Full enumeration disabled - too expensive
+        // Not found - no exhaustive search to keep response fast
         return null;
     },
-
-    checkForNewMail() { this.app.checkForNewMail(); },
-    move(msg, toMailbox) { this.app.move(msg._jxa, { to: toMailbox._jxa }); },
-    delete(msg) { this.app.delete(msg._jxa); }
+    // ============================================================================
+    // Unified Mailboxes (Cross-Account)
+    // ============================================================================
+    get inbox() {
+        try {
+            return MailboxSpecifier(this.app.inbox, '__unified__', ['INBOX']);
+        }
+        catch {
+            return null;
+        }
+    },
+    get drafts() {
+        try {
+            return MailboxSpecifier(this.app.drafts, '__unified__', ['Drafts']);
+        }
+        catch {
+            return null;
+        }
+    },
+    get sentMailbox() {
+        try {
+            return MailboxSpecifier(this.app.sentMailbox, '__unified__', ['Sent']);
+        }
+        catch {
+            return null;
+        }
+    },
+    get junkMailbox() {
+        try {
+            return MailboxSpecifier(this.app.junkMailbox, '__unified__', ['Junk']);
+        }
+        catch {
+            return null;
+        }
+    },
+    get trash() {
+        try {
+            return MailboxSpecifier(this.app.trash, '__unified__', ['Trash']);
+        }
+        catch {
+            return null;
+        }
+    },
+    get outbox() {
+        try {
+            return MailboxSpecifier(this.app.outbox, '__unified__', ['Outbox']);
+        }
+        catch {
+            return null;
+        }
+    },
+    // ============================================================================
+    // Actions
+    // ============================================================================
+    checkForNewMail() {
+        try {
+            this.app.checkForNewMail();
+        }
+        catch {
+            // Ignore
+        }
+    },
+    moveMessage(msg, toMailbox) {
+        this.app.move(msg._jxa, { to: toMailbox._jxa });
+    },
+    deleteMessage(msg) {
+        this.app.delete(msg._jxa);
+    },
+    // ============================================================================
+    // Rules
+    // ============================================================================
+    getRules() {
+        return getOr(() => this.app.rules(), []);
+    },
+    // ============================================================================
+    // Signatures
+    // ============================================================================
+    getSignatures() {
+        return getOr(() => this.app.signatures(), []);
+    }
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// === src/resources.js (lines 1601-2000) ===
-// MCP Server instance and Resource handlers
-// Hierarchical resource structure for Mail.app
-
-const server = createMCPServer({
-    name: 'jxa-mail',
-    version: '1.0.0'
-});
-
-// Resources: hierarchical structure
-// - mail://properties - app properties
-// - mail://rules - mail rules (can drill into individual rules)
-// - mail://signatures - email signatures
-// - unified://inbox etc. - cross-account mailboxes
-// - mailaccount://Name - accounts → mailboxes → nested mailboxes
-
-server.setResources(
-    // Lister: app-level resources + unified mailboxes + accounts
-    () => {
-        const appResources = [
-            { uri: 'mail://properties', name: 'App Properties', description: 'Mail.app properties' },
-            { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
-            { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' }
-        ];
-
-        const unified = [
-            { key: 'inbox', name: 'All Inboxes' },
-            { key: 'drafts', name: 'All Drafts' },
-            { key: 'sent', name: 'All Sent' },
-            { key: 'junk', name: 'All Junk' },
-            { key: 'trash', name: 'All Trash' },
-            { key: 'outbox', name: 'Outbox' }
-        ].map(u => ({
-            uri: `unified://${u.key}`,
-            name: u.name,
-            description: 'Cross-account mailbox'
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+/// <reference path="../mail/collections.ts" />
+/// <reference path="../mail/app.ts" />
+function readProperties() {
+    const app = Mail.app;
+    return {
+        mimeType: 'application/json',
+        text: {
+            name: getOr(() => app.name(), null),
+            version: getOr(() => app.version(), null),
+            applicationVersion: getOr(() => app.applicationVersion(), null),
+            frontmost: getOr(() => app.frontmost(), null),
+            alwaysBccMyself: getOr(() => app.alwaysBccMyself(), null),
+            alwaysCcMyself: getOr(() => app.alwaysCcMyself(), null),
+            downloadHtmlAttachments: getOr(() => app.downloadHtmlAttachments(), null),
+            fetchInterval: getOr(() => app.fetchInterval(), null),
+            expandGroupAddresses: getOr(() => app.expandGroupAddresses(), null),
+            defaultMessageFormat: getOr(() => app.defaultMessageFormat(), null),
+            chooseSignatureWhenComposing: getOr(() => app.chooseSignatureWhenComposing(), null),
+            selectedSignature: getOr(() => { const sig = app.selectedSignature(); return sig ? sig.name() : null; }, null),
+            quoteOriginalMessage: getOr(() => app.quoteOriginalMessage(), null),
+            sameReplyFormat: getOr(() => app.sameReplyFormat(), null),
+            includeAllOriginalMessageText: getOr(() => app.includeAllOriginalMessageText(), null),
+            highlightSelectedConversation: getOr(() => app.highlightSelectedConversation(), null),
+            colorQuotedText: getOr(() => app.colorQuotedText(), null),
+            levelOneQuotingColor: getOr(() => app.levelOneQuotingColor(), null),
+            levelTwoQuotingColor: getOr(() => app.levelTwoQuotingColor(), null),
+            levelThreeQuotingColor: getOr(() => app.levelThreeQuotingColor(), null),
+            messageFont: getOr(() => app.messageFont(), null),
+            messageFontSize: getOr(() => app.messageFontSize(), null),
+            messageListFont: getOr(() => app.messageListFont(), null),
+            messageListFontSize: getOr(() => app.messageListFontSize(), null),
+            useFixedWidthFont: getOr(() => app.useFixedWidthFont(), null),
+            fixedWidthFont: getOr(() => app.fixedWidthFont(), null),
+            fixedWidthFontSize: getOr(() => app.fixedWidthFontSize(), null),
+            newMailSound: getOr(() => app.newMailSound(), null),
+            shouldPlayOtherMailSounds: getOr(() => app.shouldPlayOtherMailSounds(), null),
+            checkSpellingWhileTyping: getOr(() => app.checkSpellingWhileTyping(), null)
+        }
+    };
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="../mail/collections.ts" />
+/// <reference path="../mail/app.ts" />
+function readRulesList() {
+    const rules = Mail.getRules();
+    return {
+        mimeType: 'application/json',
+        text: {
+            count: rules.length,
+            rules: rules.map((r, i) => ({
+                uri: URIBuilder.rules(i),
+                name: getOr(() => r.name(), ''),
+                enabled: getOr(() => r.enabled(), false)
+            }))
+        }
+    };
+}
+function readRule(index) {
+    const rules = Mail.getRules();
+    if (index < 0 || index >= rules.length) {
+        return null;
+    }
+    const r = rules[index];
+    let conditions = [];
+    try {
+        const rawConditions = r.ruleConditions();
+        conditions = rawConditions.map(c => ({
+            header: getOr(() => c.header(), null),
+            qualifier: getOr(() => c.qualifier(), null),
+            ruleType: getOr(() => c.ruleType(), null),
+            expression: getOr(() => c.expression(), null)
         }));
-
-        const accounts = Mail.accounts().map(acc => ({
-            uri: `mailaccount://${encodeURIComponent(acc.name)}`,
+    }
+    catch {
+        // Ignore condition read errors
+    }
+    return {
+        mimeType: 'application/json',
+        text: {
+            index,
+            name: getOr(() => r.name(), null),
+            enabled: getOr(() => r.enabled(), null),
+            allConditionsMustBeMet: getOr(() => r.allConditionsMustBeMet(), null),
+            copyMessage: getOr(() => { const mb = r.copyMessage(); return mb ? mb.name() : null; }, null),
+            moveMessage: getOr(() => { const mb = r.moveMessage(); return mb ? mb.name() : null; }, null),
+            forwardMessage: getOr(() => r.forwardMessage(), null),
+            redirectMessage: getOr(() => r.redirectMessage(), null),
+            replyText: getOr(() => r.replyText(), null),
+            runScript: getOr(() => { const s = r.runScript(); return s && s.name ? s.name() : null; }, null),
+            highlightTextUsingColor: getOr(() => r.highlightTextUsingColor(), null),
+            deleteMessage: getOr(() => r.deleteMessage(), null),
+            markFlagged: getOr(() => r.markFlagged(), null),
+            markFlagIndex: getOr(() => r.markFlagIndex(), null),
+            markRead: getOr(() => r.markRead(), null),
+            playSound: getOr(() => r.playSound(), null),
+            stopEvaluatingRules: getOr(() => r.stopEvaluatingRules(), null),
+            ruleConditions: conditions
+        }
+    };
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="../mail/collections.ts" />
+/// <reference path="../mail/app.ts" />
+function readSignaturesList() {
+    const signatures = Mail.getSignatures();
+    return {
+        mimeType: 'application/json',
+        text: {
+            count: signatures.length,
+            signatures: signatures.map(s => ({
+                uri: URIBuilder.signatures(getOr(() => s.name(), '')),
+                name: getOr(() => s.name(), '')
+            }))
+        }
+    };
+}
+function readSignature(name) {
+    const signatures = Mail.getSignatures();
+    const sig = signatures.find(s => getOr(() => s.name(), '') === name);
+    if (!sig) {
+        return null;
+    }
+    return {
+        mimeType: 'application/json',
+        text: {
+            name: getOr(() => sig.name(), ''),
+            content: getOr(() => sig.content(), '')
+        }
+    };
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="../mail/collections.ts" />
+/// <reference path="../mail/app.ts" />
+function readAccountsList() {
+    const accounts = Mail.getAccounts();
+    return {
+        mimeType: 'application/json',
+        text: {
+            accounts: accounts.map(acc => ({
+                name: acc.name,
+                uri: URIBuilder.account(acc.name),
+                mailboxesUri: URIBuilder.accountMailboxes(acc.name)
+            }))
+        }
+    };
+}
+function readAccount(accountName) {
+    const account = Mail.getAccount(accountName);
+    if (!account) {
+        return null;
+    }
+    return {
+        mimeType: 'application/json',
+        text: {
+            name: account.name,
+            uri: URIBuilder.account(account.name),
+            mailboxesUri: URIBuilder.accountMailboxes(account.name),
+            emailAddresses: account.emailAddresses,
+            enabled: account.enabled,
+            fullName: account.fullName
+        }
+    };
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="../mail/collections.ts" />
+/// <reference path="../mail/app.ts" />
+// Read top-level mailboxes for an account
+function readAccountMailboxes(accountName) {
+    const account = Mail.getAccount(accountName);
+    if (!account)
+        return null;
+    const allMailboxes = account.getAllMailboxes();
+    const topLevel = account.getTopLevelMailboxes();
+    return {
+        mimeType: 'application/json',
+        text: {
+            accountUri: URIBuilder.account(accountName),
+            mailboxes: topLevel.map(mb => {
+                const pathParts = mb.path;
+                const mbPathStr = pathParts.join('/');
+                const hasChildren = allMailboxes.some(other => other.path.join('/').startsWith(mbPathStr + '/'));
+                return {
+                    name: mb.name,
+                    uri: URIBuilder.mailbox(accountName, pathParts),
+                    unreadCount: mb.unreadCount,
+                    messagesUri: URIBuilder.mailboxMessages(accountName, pathParts),
+                    mailboxesUri: URIBuilder.mailboxMailboxes(accountName, pathParts),
+                    hasChildren
+                };
+            })
+        }
+    };
+}
+// Read a specific mailbox info
+function readMailbox(accountName, pathParts) {
+    const mb = Mail.findMailboxByPath(accountName, pathParts);
+    if (!mb)
+        return null;
+    return {
+        mimeType: 'application/json',
+        text: {
+            name: mb.name,
+            uri: URIBuilder.mailbox(accountName, pathParts),
+            unreadCount: mb.unreadCount,
+            messagesUri: URIBuilder.mailboxMessages(accountName, pathParts),
+            mailboxesUri: URIBuilder.mailboxMailboxes(accountName, pathParts)
+        }
+    };
+}
+// Read child mailboxes of a specific mailbox
+function readMailboxChildren(accountName, pathParts) {
+    const account = Mail.getAccount(accountName);
+    if (!account)
+        return null;
+    const parentPath = pathParts.join('/');
+    const allMailboxes = account.getAllMailboxes();
+    // Find direct children (one level deeper)
+    const prefix = parentPath + '/';
+    const children = allMailboxes.filter(mb => {
+        const mbPath = mb.path.join('/');
+        if (!mbPath.startsWith(prefix))
+            return false;
+        const remainder = mbPath.slice(prefix.length);
+        return !remainder.includes('/'); // Direct child only
+    });
+    return {
+        mimeType: 'application/json',
+        text: {
+            parentUri: URIBuilder.mailbox(accountName, pathParts),
+            mailboxes: children.map(mb => {
+                const childPathParts = mb.path;
+                const mbPath = childPathParts.join('/');
+                const hasChildren = allMailboxes.some(other => other.path.join('/').startsWith(mbPath + '/'));
+                return {
+                    name: mb.name,
+                    uri: URIBuilder.mailbox(accountName, childPathParts),
+                    unreadCount: mb.unreadCount,
+                    messagesUri: URIBuilder.mailboxMessages(accountName, childPathParts),
+                    mailboxesUri: URIBuilder.mailboxMailboxes(accountName, childPathParts),
+                    hasChildren
+                };
+            })
+        }
+    };
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="../mail/collections.ts" />
+/// <reference path="../mail/app.ts" />
+// ============================================================================
+// Messages Resource Handler
+// Returns message listings and individual message details
+// ============================================================================
+// Read message listing for a mailbox
+function readMailboxMessages(accountName, pathParts, query) {
+    const mb = Mail.findMailboxByPath(accountName, pathParts);
+    if (!mb)
+        return null;
+    const messages = mb.getMessages({
+        limit: query.limit,
+        offset: query.offset,
+        unreadOnly: query.unread
+    });
+    return {
+        mimeType: 'application/json',
+        text: {
+            mailboxUri: URIBuilder.mailbox(accountName, pathParts),
+            limit: query.limit,
+            offset: query.offset,
+            unread: query.unread,
+            messages: messages.map(msg => msg.summary())
+        }
+    };
+}
+// Read a single message by ID
+function readMessage(accountName, pathParts, messageId) {
+    const msg = Mail.findMessageById(accountName, pathParts, messageId);
+    if (!msg)
+        return null;
+    return {
+        mimeType: 'application/json',
+        text: msg.full()
+    };
+}
+// Read message attachments
+function readMessageAttachments(accountName, pathParts, messageId) {
+    const msg = Mail.findMessageById(accountName, pathParts, messageId);
+    if (!msg)
+        return null;
+    return {
+        mimeType: 'application/json',
+        text: {
+            messageUri: URIBuilder.message(accountName, pathParts, messageId),
+            attachments: msg.getAttachments()
+        }
+    };
+}
+/// <reference path="../types/jxa.d.ts" />
+/// <reference path="../types/mail-app.d.ts" />
+/// <reference path="../types/mcp.d.ts" />
+/// <reference path="../core/uri-router.ts" />
+/// <reference path="../mail/collections.ts" />
+/// <reference path="../mail/app.ts" />
+/// <reference path="properties.ts" />
+/// <reference path="rules.ts" />
+/// <reference path="signatures.ts" />
+/// <reference path="accounts.ts" />
+/// <reference path="mailboxes.ts" />
+/// <reference path="messages.ts" />
+// ============================================================================
+// Resource Registry
+// Provides resource lister and reader for the MCP server
+// ============================================================================
+// List all top-level resources
+function listResources() {
+    const resources = [
+        { uri: 'mail://properties', name: 'App Properties', description: 'Mail.app settings and properties' },
+        { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
+        { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' },
+        { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' }
+    ];
+    // Add individual accounts
+    const accounts = Mail.getAccounts();
+    for (const acc of accounts) {
+        resources.push({
+            uri: URIBuilder.account(acc.name),
             name: acc.name,
             description: 'Mail account'
-        }));
-
-        return [...appResources, ...unified, ...accounts];
-    },
-
-    // Reader: app resources, unified mailboxes, accounts, or individual mailboxes
-    (uri) => {
-        const app = Mail.app;
-
-        // App properties: mail://properties
-        if (uri === 'mail://properties') {
-            const get = (fn) => { try { return fn(); } catch(e) { return null; } };
-            return {
-                mimeType: 'application/json',
-                text: {
-                    name: get(() => app.name()),
-                    version: get(() => app.version()),
-                    applicationVersion: get(() => app.applicationVersion()),
-                    frontmost: get(() => app.frontmost()),
-                    // Mail behavior
-                    alwaysBccMyself: get(() => app.alwaysBccMyself()),
-                    alwaysCcMyself: get(() => app.alwaysCcMyself()),
-                    downloadHtmlAttachments: get(() => app.downloadHtmlAttachments()),
-                    fetchInterval: get(() => app.fetchInterval()),
-                    expandGroupAddresses: get(() => app.expandGroupAddresses()),
-                    // Composing
-                    defaultMessageFormat: get(() => app.defaultMessageFormat()),
-                    chooseSignatureWhenComposing: get(() => app.chooseSignatureWhenComposing()),
-                    selectedSignature: get(() => app.selectedSignature()?.name()),
-                    quoteOriginalMessage: get(() => app.quoteOriginalMessage()),
-                    sameReplyFormat: get(() => app.sameReplyFormat()),
-                    includeAllOriginalMessageText: get(() => app.includeAllOriginalMessageText()),
-                    // Display
-                    highlightSelectedConversation: get(() => app.highlightSelectedConversation()),
-                    colorQuotedText: get(() => app.colorQuotedText()),
-                    levelOneQuotingColor: get(() => app.levelOneQuotingColor()),
-                    levelTwoQuotingColor: get(() => app.levelTwoQuotingColor()),
-                    levelThreeQuotingColor: get(() => app.levelThreeQuotingColor()),
-                    // Fonts
-                    messageFont: get(() => app.messageFont()),
-                    messageFontSize: get(() => app.messageFontSize()),
-                    messageListFont: get(() => app.messageListFont()),
-                    messageListFontSize: get(() => app.messageListFontSize()),
-                    useFixedWidthFont: get(() => app.useFixedWidthFont()),
-                    fixedWidthFont: get(() => app.fixedWidthFont()),
-                    fixedWidthFontSize: get(() => app.fixedWidthFontSize()),
-                    // Sounds
-                    newMailSound: get(() => app.newMailSound()),
-                    shouldPlayOtherMailSounds: get(() => app.shouldPlayOtherMailSounds()),
-                    // Spelling
-                    checkSpellingWhileTyping: get(() => app.checkSpellingWhileTyping())
-                }
-            };
-        }
-
-        // Rules: mail://rules or mail://rules/index
-        let match = uri.match(/^mail:\/\/rules(?:\/(\d+))?$/);
-        if (match) {
-            const rules = app.rules();
-            if (match[1] !== undefined) {
-                // Individual rule
-                const idx = parseInt(match[1], 10);
-                if (idx < 0 || idx >= rules.length) return null;
-                const r = rules[idx];
-                const get = (fn) => { try { return fn(); } catch(e) { return null; } };
-                let conditions = [];
-                try {
-                    conditions = r.ruleConditions().map(c => ({
-                        header: get(() => c.header()),
-                        qualifier: get(() => c.qualifier()),
-                        ruleType: get(() => c.ruleType()),
-                        expression: get(() => c.expression())
-                    }));
-                } catch(e) {}
-                return {
-                    mimeType: 'application/json',
-                    text: {
-                        index: idx,
-                        name: get(() => r.name()),
-                        enabled: get(() => r.enabled()),
-                        allConditionsMustBeMet: get(() => r.allConditionsMustBeMet()),
-                        copyMessage: get(() => r.copyMessage()?.name()),
-                        moveMessage: get(() => r.moveMessage()?.name()),
-                        forwardMessage: get(() => r.forwardMessage()),
-                        redirectMessage: get(() => r.redirectMessage()),
-                        replyText: get(() => r.replyText()),
-                        runScript: get(() => r.runScript()?.name()),
-                        highlightTextUsingColor: get(() => r.highlightTextUsingColor()),
-                        deleteMessage: get(() => r.deleteMessage()),
-                        markFlagged: get(() => r.markFlagged()),
-                        markFlagIndex: get(() => r.markFlagIndex()),
-                        markRead: get(() => r.markRead()),
-                        playSound: get(() => r.playSound()),
-                        stopEvaluatingRules: get(() => r.stopEvaluatingRules()),
-                        ruleConditions: conditions
-                    }
-                };
-            }
-            // List all rules
-            return {
-                mimeType: 'application/json',
-                text: {
-                    count: rules.length,
-                    rules: rules.map((r, i) => ({
-                        uri: `mail://rules/${i}`,
-                        name: r.name(),
-                        enabled: r.enabled()
-                    }))
-                }
-            };
-        }
-
-        // Signatures: mail://signatures or mail://signatures/name
-        match = uri.match(/^mail:\/\/signatures(?:\/(.+))?$/);
-        if (match) {
-            const sigs = app.signatures();
-            if (match[1] !== undefined) {
-                // Individual signature by name
-                const sigName = decodeURIComponent(match[1]);
-                const sig = sigs.find(s => s.name() === sigName);
-                if (!sig) return null;
-                return {
-                    mimeType: 'application/json',
-                    text: {
-                        name: sig.name(),
-                        content: sig.content()
-                    }
-                };
-            }
-            // List all signatures
-            return {
-                mimeType: 'application/json',
-                text: {
-                    count: sigs.length,
-                    signatures: sigs.map(s => ({
-                        uri: `mail://signatures/${encodeURIComponent(s.name())}`,
-                        name: s.name()
-                    }))
-                }
-            };
-        }
-
-        // Unified: unified://inbox, unified://sent, etc.
-        match = uri.match(/^unified:\/\/(\w+)$/);
-        if (match) {
-            const key = match[1];
-            const mailApp = Mail.app;
-            const mailboxMap = {
-                inbox: () => mailApp.inbox,
-                drafts: () => mailApp.drafts,
-                sent: () => mailApp.sentMailbox,
-                junk: () => mailApp.junkMailbox,
-                trash: () => mailApp.trash,
-                outbox: () => mailApp.outbox
-            };
-            const getter = mailboxMap[key];
-            if (!getter) return null;
-            try {
-                const mb = getter();
-                return {
-                    mimeType: 'application/json',
-                    text: {
-                        name: key,
-                        unreadCount: mb.unreadCount(),
-                        messageCount: mb.messages().length
-                    }
-                };
-            } catch (e) {
-                return { mimeType: 'application/json', text: { name: key, error: e.message } };
-            }
-        }
-
-        // Account: mailaccount://Name → top-level mailboxes only
-        match = uri.match(/^mailaccount:\/\/([^\/]+)$/);
-        if (match) {
-            const accountName = decodeURIComponent(match[1]);
-            const account = Mail.accounts().find(a => a.name === accountName);
-            if (!account) return null;
-            const allMailboxes = account.mailboxes();
-            const topLevel = allMailboxes.filter(mb => !mb.path.includes('/'));
-            const mailboxes = topLevel.map(mb => ({
-                uri: `mailbox://${encodeURIComponent(accountName)}/${encodeURIComponent(mb.path)}`,
-                name: mb.name,
-                unreadCount: mb.unreadCount,
-                hasChildren: allMailboxes.some(other => other.path.startsWith(mb.path + '/'))
-            }));
-            return { mimeType: 'application/json', text: { account: accountName, mailboxes } };
-        }
-
-        // Mailbox: mailbox://Account/Path → children if any, otherwise info
-        match = uri.match(/^mailbox:\/\/([^\/]+)\/(.+)$/);
-        if (match) {
-            const accountName = decodeURIComponent(match[1]);
-            const mailboxPath = decodeURIComponent(match[2]);
-            const mb = Mail.findMailbox(accountName, mailboxPath);
-            if (!mb) return null;
-
-            // Find direct children
-            const account = Mail.accounts().find(a => a.name === accountName);
-            const allMailboxes = account ? account.mailboxes() : [];
-            const prefix = mailboxPath + '/';
-            const children = allMailboxes.filter(other => {
-                if (!other.path.startsWith(prefix)) return false;
-                const remainder = other.path.slice(prefix.length);
-                return !remainder.includes('/'); // direct child only
-            });
-
-            if (children.length > 0) {
-                return {
-                    mimeType: 'application/json',
-                    text: {
-                        account: accountName,
-                        path: mb.path,
-                        unreadCount: mb.unreadCount,
-                        children: children.map(c => ({
-                            uri: `mailbox://${encodeURIComponent(accountName)}/${encodeURIComponent(c.path)}`,
-                            name: c.name,
-                            unreadCount: c.unreadCount,
-                            hasChildren: allMailboxes.some(other => other.path.startsWith(c.path + '/'))
-                        }))
-                    }
-                };
-            }
-
-            // Leaf mailbox - just info
-            return { mimeType: 'application/json', text: { account: accountName, path: mb.path, unreadCount: mb.unreadCount } };
-        }
-
-        return null;
-    }
-);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// === src/tools-messages.js (lines 2001-2400) ===
-// MCP Tools: Message operations
-// list, get, mark, flag, move, delete, send, check, selection, windows
-
-server.addTool({
-    name: 'list_messages',
-    description: 'List messages in a mailbox. Returns summary info with message:// URLs.',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            mailbox: { type: 'string', description: 'Mailbox name or path (e.g., "INBOX", "Archive/Projects")' },
-            account: { type: 'string', description: 'Account name (optional)' },
-            limit: { type: 'number', description: 'Max messages to return (default: 20)' },
-            unreadOnly: { type: 'boolean', description: 'Only return unread messages' }
-        },
-        required: ['mailbox']
-    },
-    handler: (args) => {
-        const mb = Mail.findMailboxByName(args.account, args.mailbox);
-        if (!mb) return server.error(`Mailbox not found: ${args.mailbox}`);
-
-        const messages = mb.messages({ limit: args.limit || 20, unreadOnly: args.unreadOnly });
-        return JSON.stringify(messages.map(m => m.props()), null, 2);
-    }
-});
-
-server.addTool({
-    name: 'get_message',
-    description: 'Get full details of a message including its content',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            url: { type: 'string', description: 'Message URL (message://...)' }
-        },
-        required: ['url']
-    },
-    handler: (args) => {
-        const msg = Mail.messageFromUrl(args.url);
-        if (!msg) return server.error(`Message not found: ${args.url}`);
-        return JSON.stringify(msg.props(true), null, 2);
-    }
-});
-
-server.addTool({
-    name: 'send_email',
-    description: 'Create and send an email message',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            to: { type: 'array', items: { type: 'string' }, description: 'Recipient addresses' },
-            cc: { type: 'array', items: { type: 'string' }, description: 'CC addresses' },
-            bcc: { type: 'array', items: { type: 'string' }, description: 'BCC addresses' },
-            subject: { type: 'string', description: 'Email subject' },
-            body: { type: 'string', description: 'Email body' },
-            sendNow: { type: 'boolean', description: 'Send immediately (default: true)' }
-        },
-        required: ['to', 'subject', 'body']
-    },
-    handler: (args) => {
-        const app = Mail.app;
-        const msg = app.OutgoingMessage({
-            subject: args.subject,
-            content: args.body,
-            visible: args.sendNow === false
         });
-        app.outgoingMessages.push(msg);
-
-        for (const addr of args.to) msg.toRecipients.push(app.ToRecipient({ address: addr }));
-        if (args.cc) for (const addr of args.cc) msg.ccRecipients.push(app.CcRecipient({ address: addr }));
-        if (args.bcc) for (const addr of args.bcc) msg.bccRecipients.push(app.BccRecipient({ address: addr }));
-
-        if (args.sendNow !== false) {
-            msg.send();
-            return `Email sent to ${args.to.join(', ')}`;
-        }
-        return `Draft created: ${args.subject}`;
     }
-});
-
-server.addTool({
-    name: 'mark_read',
-    description: 'Mark a message as read',
-    inputSchema: {
-        type: 'object',
-        properties: { url: { type: 'string', description: 'Message URL' } },
-        required: ['url']
-    },
-    handler: (args) => {
-        const msg = Mail.messageFromUrl(args.url);
-        if (!msg) return server.error(`Message not found: ${args.url}`);
-        msg.read = true;
-        return 'Marked as read';
-    }
-});
-
-server.addTool({
-    name: 'mark_unread',
-    description: 'Mark a message as unread',
-    inputSchema: {
-        type: 'object',
-        properties: { url: { type: 'string', description: 'Message URL' } },
-        required: ['url']
-    },
-    handler: (args) => {
-        const msg = Mail.messageFromUrl(args.url);
-        if (!msg) return server.error(`Message not found: ${args.url}`);
-        msg.read = false;
-        return 'Marked as unread';
-    }
-});
-
-server.addTool({
-    name: 'toggle_flag',
-    description: 'Toggle the flagged status of a message',
-    inputSchema: {
-        type: 'object',
-        properties: { url: { type: 'string', description: 'Message URL' } },
-        required: ['url']
-    },
-    handler: (args) => {
-        const msg = Mail.messageFromUrl(args.url);
-        if (!msg) return server.error(`Message not found: ${args.url}`);
-        msg.flagged = !msg.flagged;
-        return msg.flagged ? 'Flagged' : 'Unflagged';
-    }
-});
-
-server.addTool({
-    name: 'move_message',
-    description: 'Move a message to a different mailbox',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            url: { type: 'string', description: 'Message URL' },
-            toMailbox: { type: 'string', description: 'Destination mailbox' },
-            toAccount: { type: 'string', description: 'Destination account (optional)' }
-        },
-        required: ['url', 'toMailbox']
-    },
-    handler: (args) => {
-        const msg = Mail.messageFromUrl(args.url);
-        if (!msg) return server.error(`Message not found: ${args.url}`);
-
-        const dest = Mail.findMailboxByName(args.toAccount, args.toMailbox);
-        if (!dest) return server.error(`Mailbox not found: ${args.toMailbox}`);
-
-        Mail.move(msg, dest);
-        msg.cache(); // Update cache with new location
-        return `Moved to ${dest.path}`;
-    }
-});
-
-server.addTool({
-    name: 'delete_message',
-    description: 'Delete a message (moves to Trash)',
-    inputSchema: {
-        type: 'object',
-        properties: { url: { type: 'string', description: 'Message URL' } },
-        required: ['url']
-    },
-    handler: (args) => {
-        const msg = Mail.messageFromUrl(args.url);
-        if (!msg) return server.error(`Message not found: ${args.url}`);
-        Mail.delete(msg);
-        return 'Deleted';
-    }
-});
-
-server.addTool({
-    name: 'check_mail',
-    description: 'Check for new mail across all accounts',
-    inputSchema: { type: 'object', properties: {}, required: [] },
-    handler: () => {
-        Mail.checkForNewMail();
-        return 'Checking...';
-    }
-});
-
-server.addTool({
-    name: 'get_selection',
-    description: 'Get currently selected messages in Mail.app',
-    inputSchema: { type: 'object', properties: {}, required: [] },
-    handler: () => {
-        const app = Mail.app;
-        const selection = app.selection();
-        if (!selection || selection.length === 0) {
-            return JSON.stringify({ count: 0, messages: [] });
-        }
-        const messages = selection.map(m => Message(m).props());
-        return JSON.stringify({ count: messages.length, messages }, null, 2);
-    }
-});
-
-server.addTool({
-    name: 'get_windows',
-    description: 'Get info about open Mail windows',
-    inputSchema: { type: 'object', properties: {}, required: [] },
-    handler: () => {
-        const app = Mail.app;
-        const windows = [];
-        try {
-            for (const w of app.windows()) {
-                try {
-                    const info = { name: w.name(), id: w.id(), index: w.index() };
-                    try { info.visible = w.visible(); } catch(e) {}
-                    try { info.bounds = w.bounds(); } catch(e) {}
-                    // Message viewer windows have selectedMessages
-                    try {
-                        const msgs = w.selectedMessages();
-                        if (msgs && msgs.length > 0) {
-                            info.selectedMessages = msgs.map(m => Message(m).props());
-                        }
-                    } catch(e) {}
-                    windows.push(info);
-                } catch (e) {
-                    // Window reference became stale, skip it
-                }
+    return resources;
+}
+// Read a resource by URI
+function readResource(uri) {
+    const parsed = parseMailURI(uri);
+    switch (parsed.type) {
+        case 'properties':
+            return readProperties();
+        case 'rules':
+            if (parsed.index !== undefined) {
+                return readRule(parsed.index);
             }
-        } catch (e) {
-            return server.error('Failed to enumerate windows: ' + e.message);
-        }
-        return JSON.stringify(windows, null, 2);
-    }
-});
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// === src/tools-crud.js (lines 2401-2800) ===
-// MCP Tools: Attachments, Rules, and Signatures CRUD
-// Attachment handling with sandbox workaround
-// Full CRUD for mail rules and signatures
-
-server.addTool({
-    name: 'list_attachments',
-    description: 'List attachments of a message',
-    inputSchema: {
-        type: 'object',
-        properties: { url: { type: 'string', description: 'Message URL' } },
-        required: ['url']
-    },
-    handler: (args) => {
-        const msg = Mail.messageFromUrl(args.url);
-        if (!msg) return server.error(`Message not found: ${args.url}`);
-        const attachments = msg._jxa.mailAttachments().map((a, i) => ({
-            index: i,
-            name: a.name(),
-            mimeType: a.mimeType(),
-            fileSize: (() => { try { return a.fileSize(); } catch(e) { return null; } })(),
-            downloaded: a.downloaded()
-        }));
-        return JSON.stringify({ messageUrl: args.url, count: attachments.length, attachments }, null, 2);
-    }
-});
-
-server.addTool({
-    name: 'save_attachment',
-    description: 'Save a message attachment to disk. Returns the file path.',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            url: { type: 'string', description: 'Message URL' },
-            index: { type: 'number', description: 'Attachment index (from list_attachments)' },
-            destPath: { type: 'string', description: 'Destination path (optional, defaults to cache dir)' }
-        },
-        required: ['url', 'index']
-    },
-    handler: (args) => {
-        const msg = Mail.messageFromUrl(args.url);
-        if (!msg) return server.error(`Message not found: ${args.url}`);
-
-        const attachments = msg._jxa.mailAttachments();
-        if (args.index < 0 || args.index >= attachments.length) {
-            return server.error(`Invalid attachment index: ${args.index}`);
-        }
-
-        const attachment = attachments[args.index];
-        if (!attachment.downloaded()) {
-            return server.error(`Attachment not downloaded yet: ${attachment.name()}`);
-        }
-
-        const fileName = attachment.name();
-        const app = Application.currentApplication();
-        app.includeStandardAdditions = true;
-
-        // Get Mail's temp folder (sandbox-accessible)
-        const mailTempFolder = app.pathTo('temporary items', { from: 'user domain' });
-        const mailTempPath = $.NSString.alloc.initWithUTF8String(
-            mailTempFolder.toString()
-        ).stringByResolvingSymlinksInPath.js + '/';
-
-        // Save to Mail's temp folder first
-        const tempFile = mailTempPath + fileName;
-        attachment.saveIn(Path(tempFile));
-
-        // Determine final destination
-        const destPath = args.destPath || (ATTACHMENTS_DIR + '/' + fileName);
-
-        // Move from Mail's temp to destination (handles sandbox)
-        const shellEsc = s => "'" + s.replace(/'/g, "'\\''") + "'";
-        app.doShellScript('mv ' + shellEsc(tempFile) + ' ' + shellEsc(destPath));
-
-        return JSON.stringify({ saved: true, path: destPath, name: fileName }, null, 2);
-    }
-});
-
-// === Rule CRUD ===
-
-server.addTool({
-    name: 'create_rule',
-    description: 'Create a new mail rule',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            name: { type: 'string', description: 'Rule name' },
-            enabled: { type: 'boolean', description: 'Whether rule is enabled (default: true)' },
-            allConditionsMustBeMet: { type: 'boolean', description: 'All conditions must match (default: true)' },
-            conditions: {
-                type: 'array',
-                description: 'Rule conditions',
-                items: {
-                    type: 'object',
-                    properties: {
-                        ruleType: { type: 'string', description: 'Type: from header, to header, subject header, etc.' },
-                        qualifier: { type: 'string', description: 'Qualifier: does contain value, does not contain value, etc.' },
-                        expression: { type: 'string', description: 'Value to match' }
-                    }
-                }
-            },
-            // Actions
-            moveMessage: { type: 'string', description: 'Mailbox name to move message to' },
-            copyMessage: { type: 'string', description: 'Mailbox name to copy message to' },
-            markRead: { type: 'boolean', description: 'Mark message as read' },
-            markFlagged: { type: 'boolean', description: 'Mark message as flagged' },
-            deleteMessage: { type: 'boolean', description: 'Delete the message' },
-            stopEvaluatingRules: { type: 'boolean', description: 'Stop evaluating further rules' }
-        },
-        required: ['name']
-    },
-    handler: (args) => {
-        const app = Mail.app;
-
-        // Build rule properties
-        const props = {
-            name: args.name,
-            enabled: args.enabled !== false,
-            allConditionsMustBeMet: args.allConditionsMustBeMet !== false
-        };
-
-        // Add action properties
-        if (args.markRead !== undefined) props.markRead = args.markRead;
-        if (args.markFlagged !== undefined) props.markFlagged = args.markFlagged;
-        if (args.deleteMessage !== undefined) props.deleteMessage = args.deleteMessage;
-        if (args.stopEvaluatingRules !== undefined) props.stopEvaluatingRules = args.stopEvaluatingRules;
-
-        // Create the rule
-        const rule = app.make({ new: 'rule', withProperties: props });
-
-        // Set mailbox actions (need to find mailbox objects)
-        if (args.moveMessage) {
-            const mb = Mail.findMailboxByName(null, args.moveMessage);
-            if (mb) rule.moveMessage = mb._jxa;
-        }
-        if (args.copyMessage) {
-            const mb = Mail.findMailboxByName(null, args.copyMessage);
-            if (mb) rule.copyMessage = mb._jxa;
-        }
-
-        // Add conditions
-        if (args.conditions && args.conditions.length > 0) {
-            for (const cond of args.conditions) {
-                app.make({
-                    new: 'ruleCondition',
-                    at: rule.ruleConditions.end,
-                    withProperties: {
-                        ruleType: cond.ruleType || 'from header',
-                        qualifier: cond.qualifier || 'does contain value',
-                        expression: cond.expression || ''
-                    }
-                });
+            return readRulesList();
+        case 'signatures':
+            if (parsed.name !== undefined) {
+                return readSignature(parsed.name);
             }
-        }
-
-        return JSON.stringify({ created: true, name: args.name }, null, 2);
+            return readSignaturesList();
+        case 'accounts':
+            return readAccountsList();
+        case 'account':
+            return readAccount(parsed.account);
+        case 'account-mailboxes':
+            return readAccountMailboxes(parsed.account);
+        case 'mailbox':
+            return readMailbox(parsed.account, parsed.path);
+        case 'mailbox-mailboxes':
+            return readMailboxChildren(parsed.account, parsed.path);
+        case 'mailbox-messages':
+            return readMailboxMessages(parsed.account, parsed.path, parsed.query);
+        case 'message':
+            return readMessage(parsed.account, parsed.path, parsed.id);
+        case 'message-attachments':
+            return readMessageAttachments(parsed.account, parsed.path, parsed.id);
+        case 'unknown':
+        default:
+            return null;
     }
-});
-
-server.addTool({
-    name: 'update_rule',
-    description: 'Update an existing mail rule',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            name: { type: 'string', description: 'Current rule name' },
-            newName: { type: 'string', description: 'New name (optional)' },
-            enabled: { type: 'boolean', description: 'Enable/disable rule' }
-        },
-        required: ['name']
+}
+// Resource templates for discovery
+const resourceTemplates = [
+    {
+        uriTemplate: 'mail://accounts/{account}',
+        name: 'Account',
+        description: 'Mail account details'
     },
-    handler: (args) => {
-        const app = Mail.app;
-        // Find rule by iterating (byName can be unreliable)
-        let rule = null;
-        for (const r of app.rules()) {
-            try {
-                if (r.name() === args.name) {
-                    rule = r;
-                    break;
-                }
-            } catch (e) { /* skip invalid refs */ }
-        }
-        if (!rule) return server.error(`Rule not found: ${args.name}`);
-
-        // If renaming, do that first then get a fresh reference
-        const finalName = args.newName || args.name;
-        if (args.newName !== undefined) {
-            rule.name = args.newName;
-            // Re-fetch by new name since old reference is now invalid
-            rule = null;
-            for (const r of app.rules()) {
-                try {
-                    if (r.name() === args.newName) {
-                        rule = r;
-                        break;
-                    }
-                } catch (e) { /* skip */ }
-            }
-            if (!rule) return server.error(`Rename succeeded but couldn't re-fetch: ${args.newName}`);
-        }
-
-        // Now set other properties on the valid reference
-        if (args.enabled !== undefined) rule.enabled = args.enabled;
-
-        return JSON.stringify({ updated: true, name: finalName }, null, 2);
-    }
-});
-
-server.addTool({
-    name: 'delete_rule',
-    description: 'Delete a mail rule',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            name: { type: 'string', description: 'Rule name to delete' }
-        },
-        required: ['name']
+    {
+        uriTemplate: 'mail://accounts/{account}/mailboxes',
+        name: 'Account Mailboxes',
+        description: 'Top-level mailboxes for an account'
     },
-    handler: (args) => {
-        const app = Mail.app;
-        // Find rule by iterating (byName can be unreliable)
-        let rule = null;
-        for (const r of app.rules()) {
-            try {
-                if (r.name() === args.name) {
-                    rule = r;
-                    break;
-                }
-            } catch (e) { /* skip invalid refs */ }
-        }
-        if (!rule) return server.error(`Rule not found: ${args.name}`);
-
-        try {
-            app.delete(rule);
-            return JSON.stringify({ deleted: true, name: args.name }, null, 2);
-        } catch (e) {
-            return server.error(`Could not delete rule: ${e.message}`);
-        }
-    }
-});
-
-// === Signature CRUD ===
-
-server.addTool({
-    name: 'create_signature',
-    description: 'Create a new email signature',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            name: { type: 'string', description: 'Signature name' },
-            content: { type: 'string', description: 'Signature content (plain text)' }
-        },
-        required: ['name', 'content']
+    {
+        uriTemplate: 'mail://accounts/{account}/mailboxes/{+path}',
+        name: 'Mailbox',
+        description: 'Mailbox info (path is slash-separated for nested mailboxes)'
     },
-    handler: (args) => {
-        const app = Mail.app;
-        app.make({
-            new: 'signature',
-            withProperties: { name: args.name, content: args.content }
-        });
-        return JSON.stringify({ created: true, name: args.name }, null, 2);
-    }
-});
-
-server.addTool({
-    name: 'update_signature',
-    description: 'Update an existing email signature',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            name: { type: 'string', description: 'Current signature name' },
-            newName: { type: 'string', description: 'New name (optional)' },
-            content: { type: 'string', description: 'New content (optional)' }
-        },
-        required: ['name']
+    {
+        uriTemplate: 'mail://accounts/{account}/mailboxes/{+path}/mailboxes',
+        name: 'Child Mailboxes',
+        description: 'Child mailboxes of a mailbox'
     },
-    handler: (args) => {
-        const app = Mail.app;
-        // Find signature by iterating (byName can be unreliable)
-        let sig = null;
-        for (const s of app.signatures()) {
-            try {
-                if (s.name() === args.name) {
-                    sig = s;
-                    break;
-                }
-            } catch (e) { /* skip invalid refs */ }
-        }
-        if (!sig) return server.error(`Signature not found: ${args.name}`);
-
-        // If renaming, do that first then get a fresh reference
-        const finalName = args.newName || args.name;
-        if (args.newName !== undefined) {
-            sig.name = args.newName;
-            // Re-fetch by new name since old reference is now invalid
-            sig = null;
-            for (const s of app.signatures()) {
-                try {
-                    if (s.name() === args.newName) {
-                        sig = s;
-                        break;
-                    }
-                } catch (e) { /* skip */ }
-            }
-            if (!sig) return server.error(`Rename succeeded but couldn't re-fetch: ${args.newName}`);
-        }
-
-        // Now set other properties on the valid reference
-        if (args.content !== undefined) sig.content = args.content;
-
-        return JSON.stringify({ updated: true, name: finalName }, null, 2);
-    }
-});
-
-server.addTool({
-    name: 'delete_signature',
-    description: 'Delete an email signature',
-    inputSchema: {
-        type: 'object',
-        properties: {
-            name: { type: 'string', description: 'Signature name to delete' }
-        },
-        required: ['name']
+    {
+        uriTemplate: 'mail://accounts/{account}/mailboxes/{+path}/messages',
+        name: 'Messages',
+        description: 'Messages in a mailbox'
     },
-    handler: (args) => {
-        const app = Mail.app;
-        // Find signature by iterating (byName can be unreliable)
-        let sig = null;
-        for (const s of app.signatures()) {
-            try {
-                if (s.name() === args.name) {
-                    sig = s;
-                    break;
-                }
-            } catch (e) { /* skip invalid refs */ }
-        }
-        if (!sig) return server.error(`Signature not found: ${args.name}`);
-
-        try {
-            app.delete(sig);
-            return JSON.stringify({ deleted: true, name: args.name }, null, 2);
-        } catch (e) {
-            return server.error(`Could not delete signature: ${e.message}`);
-        }
+    {
+        uriTemplate: 'mail://accounts/{account}/mailboxes/{+path}/messages?limit={limit}&offset={offset}',
+        name: 'Paginated Messages',
+        description: 'Messages with pagination'
+    },
+    {
+        uriTemplate: 'mail://accounts/{account}/mailboxes/{+path}/messages?unread=true',
+        name: 'Unread Messages',
+        description: 'Only unread messages'
+    },
+    {
+        uriTemplate: 'mail://accounts/{account}/mailboxes/{+path}/messages/{id}',
+        name: 'Message',
+        description: 'Full message details'
+    },
+    {
+        uriTemplate: 'mail://accounts/{account}/mailboxes/{+path}/messages/{id}/attachments',
+        name: 'Attachments',
+        description: 'Message attachments list'
+    },
+    {
+        uriTemplate: 'mail://rules/{index}',
+        name: 'Rule',
+        description: 'Individual mail rule details'
+    },
+    {
+        uriTemplate: 'mail://signatures/{name}',
+        name: 'Signature',
+        description: 'Individual signature content'
     }
-});
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// === src/main.js (lines 2801-3200) ===
-// Entry point - start the MCP server
-
+];
+/// <reference path="types/jxa.d.ts" />
+/// <reference path="types/mail-app.d.ts" />
+/// <reference path="types/mcp.d.ts" />
+/// <reference path="core/uri-router.ts" />
+/// <reference path="core/mcp-server.ts" />
+/// <reference path="mail/cache.ts" />
+/// <reference path="mail/collections.ts" />
+/// <reference path="mail/message.ts" />
+/// <reference path="mail/mailbox.ts" />
+/// <reference path="mail/account.ts" />
+/// <reference path="mail/app.ts" />
+/// <reference path="resources/properties.ts" />
+/// <reference path="resources/rules.ts" />
+/// <reference path="resources/signatures.ts" />
+/// <reference path="resources/accounts.ts" />
+/// <reference path="resources/mailboxes.ts" />
+/// <reference path="resources/messages.ts" />
+/// <reference path="resources/index.ts" />
+// ============================================================================
+// Apple Mail MCP Server - Entry Point
+// Phase 1: Resources-only implementation
+// ============================================================================
+const server = new MCPServer("apple-mail-jxa", "1.0.0");
+// Register resource handlers
+server.setResources(listResources, readResource);
+server.setResourceTemplates(resourceTemplates);
+// Start the server
 server.run();
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

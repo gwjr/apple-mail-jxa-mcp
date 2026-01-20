@@ -5,6 +5,7 @@
 server.addTool({
     name: 'list_attachments',
     description: 'List attachments of a message',
+    annotations: { readOnlyHint: true },
     inputSchema: {
         type: 'object',
         properties: { url: { type: 'string', description: 'Message URL' } },
@@ -27,6 +28,7 @@ server.addTool({
 server.addTool({
     name: 'save_attachment',
     description: 'Save a message attachment to disk. Returns the file path.',
+    annotations: { openWorldHint: true },
     inputSchema: {
         type: 'object',
         properties: {
@@ -80,6 +82,7 @@ server.addTool({
 server.addTool({
     name: 'create_rule',
     description: 'Create a new mail rule',
+    annotations: { idempotentHint: false },
     inputSchema: {
         type: 'object',
         properties: {
@@ -159,6 +162,7 @@ server.addTool({
 server.addTool({
     name: 'update_rule',
     description: 'Update an existing mail rule',
+    annotations: { idempotentHint: true },
     inputSchema: {
         type: 'object',
         properties: {
@@ -209,6 +213,7 @@ server.addTool({
 server.addTool({
     name: 'delete_rule',
     description: 'Delete a mail rule',
+    annotations: { destructiveHint: true },
     inputSchema: {
         type: 'object',
         properties: {
@@ -244,6 +249,7 @@ server.addTool({
 server.addTool({
     name: 'create_signature',
     description: 'Create a new email signature',
+    annotations: { idempotentHint: false },
     inputSchema: {
         type: 'object',
         properties: {
@@ -265,6 +271,7 @@ server.addTool({
 server.addTool({
     name: 'update_signature',
     description: 'Update an existing email signature',
+    annotations: { idempotentHint: true },
     inputSchema: {
         type: 'object',
         properties: {
@@ -315,6 +322,7 @@ server.addTool({
 server.addTool({
     name: 'delete_signature',
     description: 'Delete an email signature',
+    annotations: { destructiveHint: true },
     inputSchema: {
         type: 'object',
         properties: {

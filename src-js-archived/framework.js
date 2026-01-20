@@ -17,6 +17,7 @@ function createMCPServer(options) {
     const toolHandlers = {};
     let resourceLister = null;
     let resourceReader = null;
+    let resourceTemplates = [];
 
     function log(msg) {
         if (!debug) return;
@@ -132,6 +133,11 @@ function createMCPServer(options) {
                 }
                 break;
 
+            case 'resources/templates/list':
+                log('Resource templates list');
+                sendResult(id, { resourceTemplates: resourceTemplates });
+                break;
+
             default:
                 if (id !== undefined && !method?.startsWith('notifications/')) {
                     sendError(id, -32601, 'Method not found: ' + method);
@@ -141,11 +147,14 @@ function createMCPServer(options) {
 
     return {
         addTool: function(def) {
-            tools.push({
+            const tool = {
                 name: def.name,
                 description: def.description || '',
                 inputSchema: def.inputSchema || { type: 'object', properties: {}, required: [] }
-            });
+            };
+            // Add MCP tool annotations if provided
+            if (def.annotations) tool.annotations = def.annotations;
+            tools.push(tool);
             toolHandlers[def.name] = def.handler;
             return this;
         },
@@ -153,6 +162,11 @@ function createMCPServer(options) {
         setResources: function(lister, reader) {
             resourceLister = lister;
             resourceReader = reader;
+            return this;
+        },
+
+        setResourceTemplates: function(templates) {
+            resourceTemplates = templates;
             return this;
         },
 

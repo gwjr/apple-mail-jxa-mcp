@@ -55,30 +55,31 @@ function Message(jxaMsg) {
 
         props(full) {
             self.cache();
+            const get = (name, fn) => { try { return fn(); } catch(e) { return null; } };
             const p = {
                 url: self.url,
-                subject: self.subject,
-                sender: self.sender,
-                dateReceived: self.dateReceived,
-                read: self.read,
-                flagged: self.flagged
+                subject: get('subject', () => self.subject),
+                sender: get('sender', () => self.sender),
+                dateReceived: get('dateReceived', () => self.dateReceived),
+                read: get('read', () => self.read),
+                flagged: get('flagged', () => self.flagged)
             };
             if (full) {
-                p.dateSent = self.dateSent;
-                p.replyTo = jxaMsg.replyTo();
-                p.junk = jxaMsg.junkMailStatus();
-                p.mailbox = self.mailbox.path;
-                p.account = self.mailbox.accountName;
-                p.content = jxaMsg.content();
-                p.toRecipients = jxaMsg.toRecipients().map(r => ({ name: r.name(), address: r.address() }));
-                p.ccRecipients = jxaMsg.ccRecipients().map(r => ({ name: r.name(), address: r.address() }));
-                p.attachments = jxaMsg.mailAttachments().map((a, i) => ({
+                p.dateSent = get('dateSent', () => self.dateSent);
+                p.replyTo = get('replyTo', () => jxaMsg.replyTo());
+                p.junk = get('junk', () => jxaMsg.junkMailStatus());
+                p.mailbox = get('mailbox', () => self.mailbox.path);
+                p.account = get('account', () => self.mailbox.accountName);
+                p.content = get('content', () => jxaMsg.content());
+                p.toRecipients = get('toRecipients', () => jxaMsg.toRecipients().map(r => ({ name: r.name(), address: r.address() })));
+                p.ccRecipients = get('ccRecipients', () => jxaMsg.ccRecipients().map(r => ({ name: r.name(), address: r.address() })));
+                p.attachments = get('attachments', () => jxaMsg.mailAttachments().map((a, i) => ({
                     index: i,
                     name: a.name(),
                     mimeType: a.mimeType(),
                     fileSize: (() => { try { return a.fileSize(); } catch(e) { return null; } })(),
                     downloaded: a.downloaded()
-                }));
+                })));
             }
             return p;
         }
