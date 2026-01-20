@@ -33,6 +33,12 @@ type JXAAccessor<T, JXAName extends string> = {
   readonly _jxaName: JXAName;
 };
 
+type JXALazyAccessor<T, JXAName extends string> = {
+  readonly _lazyAccessor: true;
+  readonly _type: T;
+  readonly _jxaName: JXAName;
+};
+
 type JXACollection<ElementBase, JXAName extends string, Addressing extends readonly AddressingMode[]> = {
   readonly _collection: true;
   readonly _elementBase: ElementBase;
@@ -56,6 +62,16 @@ function accessor<T, JXAName extends string>(
   };
 }
 
+function lazyAccessor<T, JXAName extends string>(
+  jxaName: JXAName
+): JXALazyAccessor<T, JXAName> {
+  return {
+    _lazyAccessor: true,
+    _type: undefined as any as T,
+    _jxaName: jxaName
+  };
+}
+
 function collection<ElementBase, JXAName extends string, Addressing extends readonly AddressingMode[]>(
   jxaName: JXAName,
   elementBase: ElementBase,
@@ -74,8 +90,9 @@ function collection<ElementBase, JXAName extends string, Addressing extends read
 // ============================================================================
 
 // Lower accessor/collection to concrete type
-type Lower<A> = 
+type Lower<A> =
   A extends JXAAccessor<infer T, any> ? T :
+  A extends JXALazyAccessor<infer T, any> ? Specifier<T> :  // lazy stays as specifier
   A extends JXACollection<infer ElementBase, any, any> ? CollectionSpecifier<Derived<ElementBase>> :
   A;
 
@@ -161,20 +178,26 @@ function createDerived<Base extends Record<string, any>>(
       for (const [key, descriptor] of Object.entries(schema)) {
         if (this._isAccessor(descriptor)) {
           this._defineAccessorProperty(key, descriptor);
+        } else if (this._isLazyAccessor(descriptor)) {
+          this._defineLazyAccessorProperty(key, descriptor);
         } else if (this._isCollection(descriptor)) {
           this._defineCollectionProperty(key, descriptor);
         }
       }
     }
-    
+
     private _isAccessor(desc: any): desc is JXAAccessor<any, any> {
       return desc && desc._accessor === true;
     }
-    
+
+    private _isLazyAccessor(desc: any): desc is JXALazyAccessor<any, any> {
+      return desc && desc._lazyAccessor === true;
+    }
+
     private _isCollection(desc: any): desc is JXACollection<any, any, any> {
       return desc && desc._collection === true;
     }
-    
+
     private _defineAccessorProperty(key: string, descriptor: JXAAccessor<any, any>) {
       Object.defineProperty(this, key, {
         get() {
@@ -184,7 +207,23 @@ function createDerived<Base extends Record<string, any>>(
         enumerable: true
       });
     }
-    
+
+    private _defineLazyAccessorProperty(key: string, descriptor: JXALazyAccessor<any, any>) {
+      const self = this;
+      Object.defineProperty(this, key, {
+        get() {
+          const uri = self._uri
+            ? `${self._uri}/${key}`
+            : `${typeName.toLowerCase()}://.../${key}`;
+          return scalarSpecifier(uri, () => {
+            const value = self._jxa[descriptor._jxaName]();
+            return self._convertValue(value);
+          });
+        },
+        enumerable: true
+      });
+    }
+
     private _defineCollectionProperty(key: string, descriptor: JXACollection<any, any, any>) {
       const self = this;
       Object.defineProperty(this, key, {
@@ -251,7 +290,8 @@ function createElementSpecifier<Base extends Record<string, any>>(
   
   // Add lifted property specifiers
   for (const [key, descriptor] of Object.entries(schema)) {
-    if ('_accessor' in (descriptor as any)) {
+    if ('_accessor' in (descriptor as any) || '_lazyAccessor' in (descriptor as any)) {
+      // Both accessor and lazyAccessor lift to Specifier<T> on a Specifier
       Object.defineProperty(spec, key, {
         get() {
           const jxaName = (descriptor as any)._jxaName;
@@ -339,8 +379,25 @@ function createCollectionSpecifier<
 // Schema Definitions
 // ============================================================================
 
+const MessageBase = {
+  id: accessor<number, 'id'>('id'),
+  messageId: accessor<string, 'messageId'>('messageId'),
+  subject: accessor<string, 'subject'>('subject'),
+  sender: accessor<string, 'sender'>('sender'),
+  replyTo: accessor<string, 'replyTo'>('replyTo'),
+  dateSent: accessor<Date, 'dateSent'>('dateSent'),
+  dateReceived: accessor<Date, 'dateReceived'>('dateReceived'),
+  content: lazyAccessor<string, 'content'>('content'),  // lazy - expensive to fetch
+  readStatus: accessor<boolean, 'readStatus'>('readStatus'),
+  flaggedStatus: accessor<boolean, 'flaggedStatus'>('flaggedStatus'),
+  junkMailStatus: accessor<boolean, 'junkMailStatus'>('junkMailStatus'),
+  messageSize: accessor<number, 'messageSize'>('messageSize'),
+} as const;
+
 const MailboxBase = {
-  name: accessor<string, 'name'>('name')
+  name: accessor<string, 'name'>('name'),
+  unreadCount: accessor<number, 'unreadCount'>('unreadCount'),
+  messages: collection('messages', MessageBase, ['index', 'id'] as const)
 } as const;
 
 const AccountBase = {

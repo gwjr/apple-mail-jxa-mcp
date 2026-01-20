@@ -28,6 +28,13 @@ function accessor(jxaName) {
         _jxaName: jxaName
     };
 }
+function lazyAccessor(jxaName) {
+    return {
+        _lazyAccessor: true,
+        _type: undefined,
+        _jxaName: jxaName
+    };
+}
 function collection(jxaName, elementBase, addressing) {
     return {
         _collection: true,
@@ -56,6 +63,9 @@ function createDerived(schema, typeName) {
                 if (this._isAccessor(descriptor)) {
                     this._defineAccessorProperty(key, descriptor);
                 }
+                else if (this._isLazyAccessor(descriptor)) {
+                    this._defineLazyAccessorProperty(key, descriptor);
+                }
                 else if (this._isCollection(descriptor)) {
                     this._defineCollectionProperty(key, descriptor);
                 }
@@ -63,6 +73,9 @@ function createDerived(schema, typeName) {
         }
         _isAccessor(desc) {
             return desc && desc._accessor === true;
+        }
+        _isLazyAccessor(desc) {
+            return desc && desc._lazyAccessor === true;
         }
         _isCollection(desc) {
             return desc && desc._collection === true;
@@ -72,6 +85,21 @@ function createDerived(schema, typeName) {
                 get() {
                     const value = this._jxa[descriptor._jxaName]();
                     return this._convertValue(value);
+                },
+                enumerable: true
+            });
+        }
+        _defineLazyAccessorProperty(key, descriptor) {
+            const self = this;
+            Object.defineProperty(this, key, {
+                get() {
+                    const uri = self._uri
+                        ? `${self._uri}/${key}`
+                        : `${typeName.toLowerCase()}://.../${key}`;
+                    return scalarSpecifier(uri, () => {
+                        const value = self._jxa[descriptor._jxaName]();
+                        return self._convertValue(value);
+                    });
                 },
                 enumerable: true
             });
@@ -124,7 +152,8 @@ function createElementSpecifier(uri, jxa, schema, typeName) {
     };
     // Add lifted property specifiers
     for (const [key, descriptor] of Object.entries(schema)) {
-        if ('_accessor' in descriptor) {
+        if ('_accessor' in descriptor || '_lazyAccessor' in descriptor) {
+            // Both accessor and lazyAccessor lift to Specifier<T> on a Specifier
             Object.defineProperty(spec, key, {
                 get() {
                     const jxaName = descriptor._jxaName;
@@ -182,8 +211,24 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
 // ============================================================================
 // Schema Definitions
 // ============================================================================
+const MessageBase = {
+    id: accessor('id'),
+    messageId: accessor('messageId'),
+    subject: accessor('subject'),
+    sender: accessor('sender'),
+    replyTo: accessor('replyTo'),
+    dateSent: accessor('dateSent'),
+    dateReceived: accessor('dateReceived'),
+    content: lazyAccessor('content'), // lazy - expensive to fetch
+    readStatus: accessor('readStatus'),
+    flaggedStatus: accessor('flaggedStatus'),
+    junkMailStatus: accessor('junkMailStatus'),
+    messageSize: accessor('messageSize'),
+};
 const MailboxBase = {
-    name: accessor('name')
+    name: accessor('name'),
+    unreadCount: accessor('unreadCount'),
+    messages: collection('messages', MessageBase, ['index', 'id'])
 };
 const AccountBase = {
     id: accessor('id'),
