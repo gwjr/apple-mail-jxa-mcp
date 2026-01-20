@@ -34,7 +34,8 @@ const Mail = {
     messageFromUrl(url) {
         const match = url.match(/^message:\/\/<(.+)>$/);
         if (!match) return null;
-        const messageId = match[1].replace(/%23/g, '#').replace(/%20/g, ' ').replace(/%25/g, '%');
+        // Decode URL escapes (must decode %25 first to handle literal % in message IDs)
+        const messageId = match[1].replace(/%25/g, '%').replace(/%23/g, '#').replace(/%20/g, ' ');
 
         // 1. Cache lookup
         const cached = Cache.lookup(messageId);

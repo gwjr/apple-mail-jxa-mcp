@@ -433,8 +433,10 @@ const Cache = {
     sql(query) {
         const app = Application.currentApplication();
         app.includeStandardAdditions = true;
+        // Shell-safe escaping: single quotes prevent all interpolation
+        const shellEsc = s => "'" + s.replace(/'/g, "'\\''") + "'";
         try {
-            return app.doShellScript(`sqlite3 "${CACHE_DB}" "${query.replace(/"/g, '\\"')}"`);
+            return app.doShellScript('sqlite3 ' + shellEsc(CACHE_DB) + ' ' + shellEsc(query));
         } catch (e) {
             return null;
         }
@@ -463,8 +465,6 @@ const Cache = {
 };
 
 Cache.init();
-
-
 
 
 
@@ -1235,7 +1235,8 @@ const Mail = {
     messageFromUrl(url) {
         const match = url.match(/^message:\/\/<(.+)>$/);
         if (!match) return null;
-        const messageId = match[1].replace(/%23/g, '#').replace(/%20/g, ' ').replace(/%25/g, '%');
+        // Decode URL escapes (must decode %25 first to handle literal % in message IDs)
+        const messageId = match[1].replace(/%25/g, '%').replace(/%23/g, '#').replace(/%20/g, ' ');
 
         // 1. Cache lookup
         const cached = Cache.lookup(messageId);
@@ -1282,7 +1283,6 @@ const Mail = {
     move(msg, toMailbox) { this.app.move(msg._jxa, { to: toMailbox._jxa }); },
     delete(msg) { this.app.delete(msg._jxa); }
 };
-
 
 
 

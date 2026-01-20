@@ -32,8 +32,10 @@ const Cache = {
     sql(query) {
         const app = Application.currentApplication();
         app.includeStandardAdditions = true;
+        // Shell-safe escaping: single quotes prevent all interpolation
+        const shellEsc = s => "'" + s.replace(/'/g, "'\\''") + "'";
         try {
-            return app.doShellScript(`sqlite3 "${CACHE_DB}" "${query.replace(/"/g, '\\"')}"`);
+            return app.doShellScript('sqlite3 ' + shellEsc(CACHE_DB) + ' ' + shellEsc(query));
         } catch (e) {
             return null;
         }
