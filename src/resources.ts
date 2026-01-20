@@ -7,12 +7,14 @@
 function readResource(uri: string): { mimeType: string; text: string | object; fixedUri?: string } | null {
   const spec = specifierFromURI(uri);
   if (!spec.ok) {
-    return { mimeType: 'text/plain', text: spec.error };
+    // Return null to trigger JSON-RPC error response
+    return null;
   }
 
   const result = spec.value.resolve();
   if (!result.ok) {
-    return { mimeType: 'text/plain', text: result.error };
+    // Return null to trigger JSON-RPC error response
+    return null;
   }
 
   // Try to get a stable reference URI via fix()

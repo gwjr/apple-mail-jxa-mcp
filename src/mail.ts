@@ -155,6 +155,12 @@ const AccountSchema = {
   fullName: t.string,
   emailAddresses: t.array(t.string),
   mailboxes: collection(MailboxSchema, [by.name, by.index]),
+  // Virtual mailboxes - declarative instead of hooks
+  inbox: accountScopedMailbox('inbox'),
+  sent: accountScopedMailbox('sentMailbox'),
+  drafts: accountScopedMailbox('draftsMailbox'),
+  junk: accountScopedMailbox('junkMailbox'),
+  trash: accountScopedMailbox('trashMailbox'),
 } as const;
 
 const StandardMailboxSchema = {
@@ -173,6 +179,7 @@ const MailAppSchema = {
   outbox: standardMailbox('outbox'),
   sent: standardMailbox('sentMailbox'),
   trash: standardMailbox('trashMailbox'),
+  settings: namespace(SettingsSchema),
 } as const;
 
 // ============================================================================
@@ -260,43 +267,17 @@ function getMailApp() {
   return _mailApp;
 }
 
-registerScheme('mail', getMailApp);
-
-// ============================================================================
-// Account Standard Mailbox Navigation
-// ============================================================================
-
-const accountStandardMailboxes: Record<string, string> = {
-  inbox: 'inbox',
-  sent: 'sentMailbox',
-  drafts: 'draftsMailbox',
-  junk: 'junkMailbox',
-  trash: 'trashMailbox',
-};
-
-registerCompletionHook((specifier: any, partial: string) => {
-  if (!specifier?.uri?.match(/^mail:\/\/accounts\[\d+\]$/)) return [];
-  return Object.keys(accountStandardMailboxes)
-    .filter(name => name.startsWith(partial.toLowerCase()))
-    .map(name => ({ value: `${name}/`, label: name, description: 'Standard mailbox' }));
-});
-
-registerNavigationHook((parent: any, name: string, uri: string) => {
-  const jxaAppName = accountStandardMailboxes[name];
-  if (!jxaAppName || !parent?._isSpecifier) return undefined;
-  try {
-    const parentResult = parent.resolve();
-    if (!parentResult.ok) return undefined;
-    const accountId = parentResult.value.id;
-    if (!accountId) return undefined;
-    const jxa = Application('Mail');
-    const appMailbox = jxa[jxaAppName]();
-    const accountMailbox = appMailbox.mailboxes().find((m: any) => {
-      try { return m.account().id() === accountId; } catch { return false; }
-    });
-    if (!accountMailbox) return undefined;
-    return createSchemaSpecifier(uri, accountMailbox, MailboxSchema, 'Mailbox');
-  } catch { return undefined; }
+registerScheme('mail', getMailApp, MailAppSchema, {
+  StandardMailbox: StandardMailboxSchema,
+  Mailbox: MailboxSchema,
+  Settings: SettingsSchema,
+  Account: AccountSchema,
+  Message: MessageSchema,
+  Recipient: RecipientSchema,
+  Attachment: AttachmentSchema,
+  Rule: RuleSchema,
+  RuleCondition: RuleConditionSchema,
+  Signature: SignatureSchema,
 });
 
 // ============================================================================

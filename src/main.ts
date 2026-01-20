@@ -21,5 +21,7 @@ const server = new MCPServer("apple-mail-jxa", "1.0.0");
 server.setResources(listResources, readResource);
 server.setResourceTemplates(resourceTemplates);
 
-// Start the server
-server.run();
+// Start the server (unless loaded as a library)
+if (!(globalThis as any).__LIBRARY_MODE__) {
+  server.run();
+}

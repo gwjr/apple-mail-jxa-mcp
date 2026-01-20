@@ -50,9 +50,22 @@ function computed<T>(fn: (jxa: any) => T): { _computed: true; _fn: (jxa: any) =>
   return { _computed: true, _fn: fn };
 }
 
-// Standard mailbox marker
+// Standard mailbox marker (app-level aggregate)
 function standardMailbox<N extends string>(jxaName: N): { _stdMailbox: true; _jxaName: N } {
   return { _stdMailbox: true, _jxaName: jxaName };
+}
+
+// Account-scoped mailbox marker (virtual navigation to account's standard mailbox)
+function accountScopedMailbox<N extends string>(jxaProperty: N): { _accountMailbox: true; _jxaProperty: N } {
+  return { _accountMailbox: true, _jxaProperty: jxaProperty };
+}
+
+// Virtual namespace marker (for object-like navigation with children, e.g., settings)
+function namespace<S, N extends string>(
+  schema: S,
+  jxaProperty?: N
+): { _namespace: true; _schema: S; _jxaProperty?: N } {
+  return { _namespace: true, _schema: schema, _jxaProperty: jxaProperty };
 }
 
 // Extract addressing modes from markers

@@ -10,6 +10,7 @@
     "src/framework/schema.ts",
     "src/framework/specifier.ts",
     "src/framework/runtime.ts",
+    "src/framework/routes.ts",
     "src/framework/uri.ts",
     "src/framework-extras/completions.ts",
     "src/mail.ts",

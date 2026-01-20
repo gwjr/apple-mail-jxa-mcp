@@ -2,10 +2,12 @@
 /// <reference path="../framework/specifier.ts" />
 /// <reference path="../framework/runtime.ts" />
 /// <reference path="../framework/uri.ts" />
+/// <reference path="../framework/routes.ts" />
 
 // ============================================================================
 // URI Completions Support
 // Autocomplete functionality for partial URIs
+// Route-table based for fast, schema-driven completions
 // ============================================================================
 
 // ============================================================================
@@ -29,259 +31,116 @@ function getCompletions(partial: string): Completion[] {
   const scheme = schemePartial;
   const path = pathPart || '';
 
+  const routes = getRoutesForScheme(scheme);
+  if (!routes) return [];
+
   // Check if we're in a query string
   const queryIdx = path.indexOf('?');
   if (queryIdx !== -1) {
-    return getQueryCompletions(scheme, path.slice(0, queryIdx), path.slice(queryIdx + 1));
+    return getRouteQueryCompletions(scheme, path.slice(0, queryIdx), path.slice(queryIdx + 1), routes);
   }
 
-  // Path completion
-  return getPathCompletions(scheme, path);
+  return getRouteBasedPathCompletions(scheme, path, routes);
 }
 
 // ============================================================================
-// Path Completions
+// Route-Table Based Path Completions
 // ============================================================================
 
-function getPathCompletions(scheme: string, path: string): Completion[] {
+function getRouteBasedPathCompletions(scheme: string, path: string, routes: RouteTable): Completion[] {
   const completions: Completion[] = [];
 
-  // Split path and find the partial segment being typed
+  // Split path to find partial segment
   const segments = path.split('/');
   const partialSegment = segments.pop() || '';
   const completePath = segments.join('/');
 
-  // Resolve the parent specifier
+  // Parse parent path to find current route node
   const parentUri = `${scheme}://${completePath}`;
-  const parentResult = specifierFromURI(parentUri);
-  if (!parentResult.ok) return [];
+  const parseResult = parseURIWithRoutes(parentUri, routes);
 
-  const parent = parentResult.value as any;
+  if (!parseResult.ok) return [];
 
-  // Check if partial matches a property exactly - if so, navigate into it
-  if (partialSegment && parent[partialSegment] !== undefined) {
-    const child = parent[partialSegment];
-    // If it's a collection, suggest addressing
-    if (isCollectionForCompletion(child)) {
-      return getCollectionCompletions(child, '');
+  const currentNode = parseResult.route;
+
+  // Get children from route table
+  const children = isRootEntry(currentNode.entry)
+    ? currentNode.children
+    : getRouteChildren(currentNode, routes);
+
+  // Add matching route children
+  for (const [name, node] of Object.entries(children)) {
+    if (!name.toLowerCase().startsWith(partialSegment.toLowerCase())) continue;
+
+    const entry = node.entry;
+    let description: string;
+    let suffix = '';
+
+    if (isCollectionEntry(entry)) {
+      suffix = '/';
+      description = 'Collection';
+    } else if (isVirtualPropEntry(entry)) {
+      suffix = '/';
+      description = entry.accountScoped ? 'Account mailbox' : 'Mailbox';
+    } else if (isVirtualCtxEntry(entry)) {
+      suffix = '/';
+      description = 'Context';
+    } else if (isPropertyEntry(entry)) {
+      description = `${entry.valueType} property`;
+      if (entry.lazy) description += ' (lazy)';
+      if (entry.rw) description += ' (rw)';
+    } else if (isComputedEntry(entry)) {
+      description = 'Computed property';
+    } else {
+      description = 'Entry';
     }
-    // If it's a navigable specifier, suggest its properties
-    if (child._isSpecifier) {
-      return getPropertyCompletions(child, '');
-    }
+
+    completions.push({
+      value: name + suffix,
+      label: name,
+      description,
+    });
   }
 
-  // Check if parent is a collection - suggest addressing
-  if (isCollectionForCompletion(parent)) {
-    return getCollectionCompletions(parent, partialSegment);
-  }
+  // If current node is a collection, add addressing options and real item names
+  if (isCollectionEntry(currentNode.entry)) {
+    const collEntry = currentNode.entry;
 
-  // Otherwise suggest properties matching partial
-  return getPropertyCompletions(parent, partialSegment);
-}
-
-// ============================================================================
-// Collection Completions
-// ============================================================================
-
-function isCollectionForCompletion(obj: any): boolean {
-  return obj && (typeof obj.byName === 'function' || typeof obj.byIndex === 'function' || typeof obj.byId === 'function');
-}
-
-function getCollectionCompletions(collection: any, partial: string): Completion[] {
-  const completions: Completion[] = [];
-
-  // Favor name-based addressing - resolve and get actual names
-  if (typeof collection.byName === 'function') {
-    try {
-      const resolved = collection.resolve();
-      if (resolved.ok && Array.isArray(resolved.value)) {
-        for (const item of resolved.value.slice(0, 10)) {
-          const name = item.name;
-          if (name && String(name).toLowerCase().startsWith(partial.toLowerCase())) {
-            completions.push({
-              value: encodeURIComponent(String(name)),
-              label: String(name),
-              description: 'By name'
-            });
+    // Add real names from resolved collection (if accessible)
+    if (collEntry.addressing.includes('name') || collEntry.addressing.includes('id')) {
+      try {
+        const resolved = specifierFromURI(parentUri);
+        if (resolved.ok && typeof resolved.value.resolve === 'function') {
+          const items = resolved.value.resolve();
+          if (items.ok && Array.isArray(items.value)) {
+            for (const item of items.value.slice(0, 10)) {
+              const itemName = item.name;
+              if (itemName && String(itemName).toLowerCase().startsWith(partialSegment.toLowerCase())) {
+                completions.push({
+                  value: encodeURIComponent(String(itemName)),
+                  label: String(itemName),
+                  description: 'By name',
+                });
+              }
+            }
           }
         }
-      }
-    } catch { /* ignore */ }
-  }
-
-  // ID addressing if no name addressing
-  if (typeof collection.byId === 'function' && typeof collection.byName !== 'function') {
-    try {
-      const resolved = collection.resolve();
-      if (resolved.ok && Array.isArray(resolved.value)) {
-        for (const item of resolved.value.slice(0, 10)) {
-          const id = item.id;
-          if (id && String(id).startsWith(partial)) {
-            completions.push({
-              value: String(id),
-              label: String(id),
-              description: 'By ID'
-            });
-          }
-        }
-      }
-    } catch { /* ignore */ }
-  }
-
-  // Index addressing - show if typing bracket or no other completions
-  if (typeof collection.byIndex === 'function') {
-    if (partial.match(/^\[?\d*\]?$/) || completions.length === 0) {
-      completions.push({ value: '[0]', label: '[index]', description: 'Access by index' });
+      } catch { /* ignore resolution errors */ }
     }
-  }
 
-  // Query option
-  if (partial === '' || partial === '?') {
-    completions.push({ value: '?', label: '?', description: 'Add filter/sort/pagination' });
-  }
-
-  return completions;
-}
-
-// ============================================================================
-// Property Completions
-// ============================================================================
-
-function getPropertyCompletions(specifier: any, partial: string): Completion[] {
-  const completions: Completion[] = [];
-
-  // Get all enumerable properties
-  for (const key of Object.keys(specifier)) {
-    if (key.startsWith('_') || key === 'uri' || key === 'resolve') continue;
-    if (!key.toLowerCase().startsWith(partial.toLowerCase())) continue;
-
-    const value = specifier[key];
-    if (typeof value === 'function') continue;
-
-    if (isCollectionForCompletion(value)) {
-      completions.push({ value: `${key}/`, label: key, description: 'Collection' });
-    } else if (value && value._isSpecifier && hasNavigableChildren(value)) {
-      completions.push({ value: `${key}/`, label: key, description: 'Navigable' });
-    } else {
-      completions.push({ value: key, label: key, description: 'Property' });
-    }
-  }
-
-  // Add completions from hooks
-  for (const hook of completionHooks) {
-    try {
-      const extra = hook(specifier, partial);
-      for (const c of extra) {
-        if (c.label && c.label.toLowerCase().startsWith(partial.toLowerCase())) {
-          completions.push(c);
-        }
-      }
-    } catch { /* ignore */ }
-  }
-
-  return completions;
-}
-
-function hasNavigableChildren(specifier: any): boolean {
-  for (const key of Object.keys(specifier)) {
-    if (key.startsWith('_') || key === 'uri' || key === 'resolve') continue;
-    if (typeof specifier[key] !== 'function') return true;
-  }
-  return false;
-}
-
-// ============================================================================
-// Query Completions
-// ============================================================================
-
-function getQueryCompletions(scheme: string, basePath: string, query: string): Completion[] {
-  const completions: Completion[] = [];
-
-  // Resolve to get the collection and a sample element
-  const spec = specifierFromURI(`${scheme}://${basePath}`);
-  if (!spec.ok || !isCollectionForCompletion(spec.value)) return [];
-
-  const collection = spec.value;
-
-  // Parse current query
-  const params = query.split('&');
-  const lastParam = params[params.length - 1] || '';
-
-  // Standard query params
-  if (!lastParam.includes('=') || lastParam === '') {
-    if ('sort'.startsWith(lastParam)) completions.push({ value: 'sort=', label: 'sort', description: 'Sort results' });
-    if ('limit'.startsWith(lastParam)) completions.push({ value: 'limit=', label: 'limit', description: 'Limit count' });
-    if ('offset'.startsWith(lastParam)) completions.push({ value: 'offset=', label: 'offset', description: 'Skip N' });
-    if ('expand'.startsWith(lastParam)) completions.push({ value: 'expand=', label: 'expand', description: 'Expand lazy props' });
-  }
-
-  // Get a sample element to find filterable properties
-  let sampleElement: any = null;
-  try {
-    const resolved = collection.resolve();
-    if (resolved.ok && resolved.value.length > 0) {
-      sampleElement = resolved.value[0];
-    }
-  } catch { /* ignore */ }
-
-  if (!sampleElement) return completions;
-
-  // Property name completion for filters
-  if (!lastParam.includes('=') && !lastParam.includes('.')) {
-    for (const key of Object.keys(sampleElement)) {
-      if (key.startsWith('_')) continue;
-      const val = sampleElement[key];
-      if (typeof val !== 'function' && !isCollectionForCompletion(val) && !(val && val._isSpecifier)) {
-        if (key.startsWith(lastParam)) {
-          completions.push({ value: `${key}=`, label: key, description: `Filter by ${key}` });
-        }
+    // Add index notation
+    if (collEntry.addressing.includes('index')) {
+      if (partialSegment.match(/^\[?\d*\]?$/) || completions.length === 0) {
+        completions.push({ value: '[0]', label: '[index]', description: 'Access by index' });
       }
     }
-  }
 
-  // Operator completion (property.xxx)
-  const dotMatch = lastParam.match(/^(\w+)\.(\w*)$/);
-  if (dotMatch) {
-    const [, , opPartial] = dotMatch;
-    const operators = ['contains', 'startsWith', 'gt', 'lt'];
-    for (const op of operators) {
-      if (op.startsWith(opPartial)) {
-        completions.push({ value: `${dotMatch[1]}.${op}=`, label: op, description: `${op} operator` });
-      }
-    }
-  }
-
-  // Sort value completion
-  if (lastParam.startsWith('sort=')) {
-    const sortVal = lastParam.slice(5);
-    if (!sortVal.includes('.')) {
-      for (const key of Object.keys(sampleElement)) {
-        if (key.startsWith('_')) continue;
-        const val = sampleElement[key];
-        if (typeof val !== 'function' && !isCollectionForCompletion(val) && key.startsWith(sortVal)) {
-          completions.push({ value: `sort=${key}.`, label: key, description: `Sort by ${key}` });
-        }
-      }
-    } else {
-      const [prop] = sortVal.split('.');
-      const dir = sortVal.split('.')[1] || '';
-      if ('asc'.startsWith(dir)) completions.push({ value: `sort=${prop}.asc`, label: 'asc', description: 'Ascending' });
-      if ('desc'.startsWith(dir)) completions.push({ value: `sort=${prop}.desc`, label: 'desc', description: 'Descending' });
-    }
-  }
-
-  // Expand value completion - find lazy specifier properties
-  if (lastParam.startsWith('expand=')) {
-    const expandVal = lastParam.slice(7);
-    for (const key of Object.keys(sampleElement)) {
-      if (key.startsWith('_')) continue;
-      const val = sampleElement[key];
-      if (val && val._isSpecifier && key.startsWith(expandVal)) {
-        completions.push({ value: `expand=${key}`, label: key, description: 'Expand lazy property' });
-      }
+    // Add query option
+    if (partialSegment === '' || partialSegment === '?') {
+      completions.push({ value: '?', label: '?', description: 'Add filter/sort/pagination' });
     }
   }
 
   return completions;
 }
+
