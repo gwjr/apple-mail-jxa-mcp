@@ -18,7 +18,11 @@
     "src/types/mail-app.d.ts",
     "src/types/mcp.d.ts",
     "src/core/mcp-server.ts",
-    "src/framework.ts",
+    "src/framework/schema.ts",
+    "src/framework/specifier.ts",
+    "src/framework/runtime.ts",
+    "src/framework/uri.ts",
+    "src/framework-extras/completions.ts",
     "src/mail.ts",
     "src/resources.ts",
     "src/main.ts"

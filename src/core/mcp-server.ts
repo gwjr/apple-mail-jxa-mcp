@@ -1,7 +1,6 @@
 /// <reference path="../types/jxa.d.ts" />
 /// <reference path="../types/mail-app.d.ts" />
 /// <reference path="../types/mcp.d.ts" />
-/// <reference path="uri-router.ts" />
 
 // ============================================================================
 // MCP Server Implementation with Resources Support

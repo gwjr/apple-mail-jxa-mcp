@@ -1,468 +1,307 @@
 /// <reference path="./types/jxa.d.ts" />
 /// <reference path="./types/mail-app.d.ts" />
+/// <reference path="./framework/schema.ts" />
+/// <reference path="./framework/specifier.ts" />
+/// <reference path="./framework/runtime.ts" />
+/// <reference path="./framework/uri.ts" />
+/// <reference path="./framework-extras/completions.ts" />
 
 // ============================================================================
-// Email Address Parsing (JS-based, no extra Apple Events)
+// Email Address Parsing
 // ============================================================================
 
 type ParsedEmailAddress = { name: string; address: string };
 
 function parseEmailAddress(raw: string): ParsedEmailAddress {
   if (!raw) return { name: '', address: '' };
-
-  // Format: "Name" <email@domain.com> or Name <email@domain.com> or just email@domain.com
   const match = raw.match(/^(?:"?([^"<]*)"?\s*)?<?([^>]+)>?$/);
   if (match) {
     const name = (match[1] || '').trim();
     const address = (match[2] || '').trim();
-    // If no name but we have something that looks like an email, check if address has a name component
-    if (!name && address.includes('@')) {
-      return { name: '', address };
-    }
-    // If the "address" doesn't have @, it might just be a name
-    if (!address.includes('@')) {
-      return { name: address, address: '' };
-    }
+    if (!name && address.includes('@')) return { name: '', address };
+    if (!address.includes('@')) return { name: address, address: '' };
     return { name, address };
   }
-  // Fallback: treat the whole thing as the address
   return { name: '', address: raw.trim() };
 }
 
 // ============================================================================
-// Apple Mail Schema Definitions
+// Schema Definitions - Using New Simplified Syntax
 // ============================================================================
 
-// ============================================================================
-// Settings Schema (app-level preferences)
-// ============================================================================
-
-const SettingsBase = {
+const SettingsSchema = {
   // App info
-  name: accessor<string, 'name'>('name'),
-  version: accessor<string, 'version'>('version'),
-  frontmost: accessor<boolean, 'frontmost'>('frontmost'),
+  name: t.string,
+  version: t.string,
+  frontmost: t.boolean,
   // Behavior
-  alwaysBccMyself: accessor<boolean, 'alwaysBccMyself'>('alwaysBccMyself'),
-  alwaysCcMyself: accessor<boolean, 'alwaysCcMyself'>('alwaysCcMyself'),
-  downloadHtmlAttachments: accessor<boolean, 'downloadHtmlAttachments'>('downloadHtmlAttachments'),
-  fetchInterval: accessor<number, 'fetchInterval'>('fetchInterval'),
-  expandGroupAddresses: accessor<boolean, 'expandGroupAddresses'>('expandGroupAddresses'),
+  alwaysBccMyself: t.boolean,
+  alwaysCcMyself: t.boolean,
+  downloadHtmlAttachments: t.boolean,
+  fetchInterval: t.number,
+  expandGroupAddresses: t.boolean,
   // Composing
-  defaultMessageFormat: accessor<string, 'defaultMessageFormat'>('defaultMessageFormat'),
-  chooseSignatureWhenComposing: accessor<boolean, 'chooseSignatureWhenComposing'>('chooseSignatureWhenComposing'),
-  quoteOriginalMessage: accessor<boolean, 'quoteOriginalMessage'>('quoteOriginalMessage'),
-  sameReplyFormat: accessor<boolean, 'sameReplyFormat'>('sameReplyFormat'),
-  includeAllOriginalMessageText: accessor<boolean, 'includeAllOriginalMessageText'>('includeAllOriginalMessageText'),
+  defaultMessageFormat: t.string,
+  chooseSignatureWhenComposing: t.boolean,
+  quoteOriginalMessage: t.boolean,
+  sameReplyFormat: t.boolean,
+  includeAllOriginalMessageText: t.boolean,
   // Display
-  highlightSelectedConversation: accessor<boolean, 'highlightSelectedConversation'>('highlightSelectedConversation'),
-  colorQuotedText: accessor<boolean, 'colorQuotedText'>('colorQuotedText'),
-  levelOneQuotingColor: accessor<string, 'levelOneQuotingColor'>('levelOneQuotingColor'),
-  levelTwoQuotingColor: accessor<string, 'levelTwoQuotingColor'>('levelTwoQuotingColor'),
-  levelThreeQuotingColor: accessor<string, 'levelThreeQuotingColor'>('levelThreeQuotingColor'),
+  highlightSelectedConversation: t.boolean,
+  colorQuotedText: t.boolean,
+  levelOneQuotingColor: t.string,
+  levelTwoQuotingColor: t.string,
+  levelThreeQuotingColor: t.string,
   // Fonts
-  messageFont: accessor<string, 'messageFont'>('messageFont'),
-  messageFontSize: accessor<number, 'messageFontSize'>('messageFontSize'),
-  messageListFont: accessor<string, 'messageListFont'>('messageListFont'),
-  messageListFontSize: accessor<number, 'messageListFontSize'>('messageListFontSize'),
-  useFixedWidthFont: accessor<boolean, 'useFixedWidthFont'>('useFixedWidthFont'),
-  fixedWidthFont: accessor<string, 'fixedWidthFont'>('fixedWidthFont'),
-  fixedWidthFontSize: accessor<number, 'fixedWidthFontSize'>('fixedWidthFontSize'),
+  messageFont: t.string,
+  messageFontSize: t.number,
+  messageListFont: t.string,
+  messageListFontSize: t.number,
+  useFixedWidthFont: t.boolean,
+  fixedWidthFont: t.string,
+  fixedWidthFontSize: t.number,
   // Sounds
-  newMailSound: accessor<string, 'newMailSound'>('newMailSound'),
-  shouldPlayOtherMailSounds: accessor<boolean, 'shouldPlayOtherMailSounds'>('shouldPlayOtherMailSounds'),
+  newMailSound: t.string,
+  shouldPlayOtherMailSounds: t.boolean,
   // Spelling
-  checkSpellingWhileTyping: accessor<boolean, 'checkSpellingWhileTyping'>('checkSpellingWhileTyping'),
+  checkSpellingWhileTyping: t.boolean,
 } as const;
 
-// ============================================================================
-// Rule Condition Schema
-// ============================================================================
-
-const RuleConditionBase = {
-  header: accessor<string, 'header'>('header'),
-  qualifier: accessor<string, 'qualifier'>('qualifier'),
-  ruleType: accessor<string, 'ruleType'>('ruleType'),
-  expression: accessor<string, 'expression'>('expression'),
+const RuleConditionSchema = {
+  header: t.string,
+  qualifier: t.string,
+  ruleType: t.string,
+  expression: t.string,
 } as const;
 
-// ============================================================================
-// Rule Schema
-// ============================================================================
-
-const RuleBase = {
-  name: accessor<string, 'name'>('name'),
-  enabled: accessor<boolean, 'enabled'>('enabled'),
-  allConditionsMustBeMet: accessor<boolean, 'allConditionsMustBeMet'>('allConditionsMustBeMet'),
-  // Actions - simple properties
-  deleteMessage: accessor<boolean, 'deleteMessage'>('deleteMessage'),
-  markRead: accessor<boolean, 'markRead'>('markRead'),
-  markFlagged: accessor<boolean, 'markFlagged'>('markFlagged'),
-  markFlagIndex: accessor<number, 'markFlagIndex'>('markFlagIndex'),
-  stopEvaluatingRules: accessor<boolean, 'stopEvaluatingRules'>('stopEvaluatingRules'),
-  // Actions - string properties
-  forwardMessage: accessor<string, 'forwardMessage'>('forwardMessage'),
-  redirectMessage: accessor<string, 'redirectMessage'>('redirectMessage'),
-  replyText: accessor<string, 'replyText'>('replyText'),
-  playSound: accessor<string, 'playSound'>('playSound'),
-  highlightTextUsingColor: accessor<string, 'highlightTextUsingColor'>('highlightTextUsingColor'),
-  // Mailbox actions (computed to get mailbox name, lazy to avoid upfront resolution)
+const RuleSchema = {
+  name: t.string,
+  enabled: t.boolean,
+  allConditionsMustBeMet: t.boolean,
+  deleteMessage: t.boolean,
+  markRead: t.boolean,
+  markFlagged: t.boolean,
+  markFlagIndex: t.number,
+  stopEvaluatingRules: t.boolean,
+  forwardMessage: t.string,
+  redirectMessage: t.string,
+  replyText: t.string,
+  playSound: t.string,
+  highlightTextUsingColor: t.string,
   copyMessage: computed<string | null>((jxa) => {
-    try { const mb = jxa.copyMessage(); return mb ? mb.name() : null; } catch { return null; }
+    try {
+      const mailbox = jxa.copyMessage();
+      return mailbox ? mailbox.name() : null;
+    } catch {
+      return null;
+    }
   }),
   moveMessage: computed<string | null>((jxa) => {
-    try { const mb = jxa.moveMessage(); return mb ? mb.name() : null; } catch { return null; }
+    try {
+      const mailbox = jxa.moveMessage();
+      return mailbox ? mailbox.name() : null;
+    } catch {
+      return null;
+    }
   }),
-  // Conditions collection
-  ruleConditions: collection('ruleConditions', RuleConditionBase, ['index'] as const),
+  ruleConditions: collection(RuleConditionSchema, [by.index]),
 } as const;
 
-// ============================================================================
-// Signature Schema
-// ============================================================================
-
-const SignatureBase = {
-  name: accessor<string, 'name'>('name'),
-  content: lazyAccessor<string, 'content'>('content'),  // lazy - can be large
+const SignatureSchema = {
+  name: t.string,
+  content: lazy(t.string),
 } as const;
 
-// ============================================================================
-// Recipient Schema
-// ============================================================================
-
-const RecipientBase = {
-  name: accessor<string, 'name'>('name'),
-  address: accessor<string, 'address'>('address'),
+const RecipientSchema = {
+  name: t.string,
+  address: t.string,
 } as const;
 
-const AttachmentBase = {
-  id: accessor<string, 'id'>('id'),
-  name: accessor<string, 'name'>('name'),
-  fileSize: accessor<number, 'fileSize'>('fileSize'),
+const AttachmentSchema = {
+  id: t.string,
+  name: t.string,
+  fileSize: t.number,
 } as const;
 
-const MessageBase = {
-  id: accessor<number, 'id'>('id'),
-  messageId: accessor<string, 'messageId'>('messageId'),
-  subject: accessor<string, 'subject'>('subject'),
+const MessageSchema = {
+  id: t.number,
+  messageId: t.string,
+  subject: t.string,
   sender: computed<ParsedEmailAddress>((jxa) => parseEmailAddress(str(jxa.sender()))),
   replyTo: computed<ParsedEmailAddress>((jxa) => parseEmailAddress(str(jxa.replyTo()))),
-  dateSent: accessor<Date, 'dateSent'>('dateSent'),
-  dateReceived: accessor<Date, 'dateReceived'>('dateReceived'),
-  content: lazyAccessor<string, 'content'>('content'),  // lazy - expensive to fetch
-  readStatus: accessor<boolean, 'readStatus'>('readStatus'),
-  flaggedStatus: accessor<boolean, 'flaggedStatus'>('flaggedStatus'),
-  junkMailStatus: accessor<boolean, 'junkMailStatus'>('junkMailStatus'),
-  messageSize: accessor<number, 'messageSize'>('messageSize'),
-  toRecipients: collection('toRecipients', RecipientBase, ['name', 'index'] as const),
-  ccRecipients: collection('ccRecipients', RecipientBase, ['name', 'index'] as const),
-  bccRecipients: collection('bccRecipients', RecipientBase, ['name', 'index'] as const),
-  attachments: collection('mailAttachments', AttachmentBase, ['name', 'index', 'id'] as const),
+  dateSent: t.date,
+  dateReceived: t.date,
+  content: lazy(t.string),
+  readStatus: t.boolean,
+  flaggedStatus: t.boolean,
+  junkMailStatus: t.boolean,
+  messageSize: t.number,
+  toRecipients: collection(RecipientSchema, [by.name, by.index]),
+  ccRecipients: collection(RecipientSchema, [by.name, by.index]),
+  bccRecipients: collection(RecipientSchema, [by.name, by.index]),
+  attachments: jxa(collection(AttachmentSchema, [by.name, by.index, by.id]), 'mailAttachments'),
 } as const;
 
-const MailboxBase: any = {
-  name: accessor<string, 'name'>('name'),
-  unreadCount: accessor<number, 'unreadCount'>('unreadCount'),
-  messages: collection('messages', MessageBase, ['index', 'id'] as const)
+const MailboxSchema: any = {
+  name: t.string,
+  unreadCount: t.number,
+  messages: collection(MessageSchema, [by.index, by.id]),
 };
-// Self-referential: mailboxes contain mailboxes
-MailboxBase.mailboxes = collection('mailboxes', MailboxBase, ['name', 'index'] as const);
+MailboxSchema.mailboxes = collection(MailboxSchema, [by.name, by.index]);
 
-const AccountBase = {
-  id: accessor<string, 'id'>('id'),
-  name: accessor<string, 'name'>('name'),
-  fullName: accessor<string, 'fullName'>('fullName'),
-  emailAddresses: accessor<string[], 'emailAddresses'>('emailAddresses'),
-  mailboxes: collection('mailboxes', MailboxBase, ['name', 'index'] as const)
+const AccountSchema = {
+  id: t.string,
+  name: t.string,
+  fullName: t.string,
+  emailAddresses: t.array(t.string),
+  mailboxes: collection(MailboxSchema, [by.name, by.index]),
 } as const;
 
-// Standard mailbox schemas (same structure as Mailbox but different accessors)
-const StandardMailboxBase = {
-  name: accessor<string, 'name'>('name'),
-  unreadCount: accessor<number, 'unreadCount'>('unreadCount'),
-  messages: collection('messages', MessageBase, ['index', 'id'] as const)
+const StandardMailboxSchema = {
+  name: t.string,
+  unreadCount: t.number,
+  messages: collection(MessageSchema, [by.index, by.id]),
 } as const;
 
-const MailAppBase = {
-  accounts: collection('accounts', AccountBase, ['name', 'index', 'id'] as const),
-  rules: collection('rules', RuleBase, ['name', 'index'] as const),
-  signatures: collection('signatures', SignatureBase, ['name', 'index'] as const),
-  // Standard mailboxes (aggregate across all accounts)
-  inbox: { _standardMailbox: true, _jxaName: 'inbox' },
-  drafts: { _standardMailbox: true, _jxaName: 'draftsMailbox' },
-  junk: { _standardMailbox: true, _jxaName: 'junkMailbox' },
-  outbox: { _standardMailbox: true, _jxaName: 'outbox' },
-  sent: { _standardMailbox: true, _jxaName: 'sentMailbox' },
-  trash: { _standardMailbox: true, _jxaName: 'trashMailbox' }
+const MailAppSchema = {
+  accounts: collection(AccountSchema, [by.name, by.index, by.id]),
+  rules: collection(RuleSchema, [by.name, by.index]),
+  signatures: collection(SignatureSchema, [by.name, by.index]),
+  inbox: standardMailbox('inbox'),
+  drafts: standardMailbox('draftsMailbox'),
+  junk: standardMailbox('junkMailbox'),
+  outbox: standardMailbox('outbox'),
+  sent: standardMailbox('sentMailbox'),
+  trash: standardMailbox('trashMailbox'),
 } as const;
 
 // ============================================================================
-// Create Derived Types
+// Derived Classes
 // ============================================================================
 
-const Settings = createDerived(SettingsBase, 'Settings');
-const RuleCondition = createDerived(RuleConditionBase, 'RuleCondition');
-const Rule = createDerived(RuleBase, 'Rule');
-const Signature = createDerived(SignatureBase, 'Signature');
-const Recipient = createDerived(RecipientBase, 'Recipient');
-const Attachment = createDerived(AttachmentBase, 'Attachment');
-const Message = createDerived(MessageBase, 'Message');
-const Mailbox = createDerived(MailboxBase, 'Mailbox');
-const Account = createDerived(AccountBase, 'Account');
+const Settings = createDerived(SettingsSchema, 'Settings');
+const RuleCondition = createDerived(RuleConditionSchema, 'RuleCondition');
+const Rule = createDerived(RuleSchema, 'Rule');
+const Signature = createDerived(SignatureSchema, 'Signature');
+const Recipient = createDerived(RecipientSchema, 'Recipient');
+const Attachment = createDerived(AttachmentSchema, 'Attachment');
+const Message = createDerived(MessageSchema, 'Message');
+const Mailbox = createDerived(MailboxSchema, 'Mailbox');
+const Account = createDerived(AccountSchema, 'Account');
+const MailApp = createDerived(MailAppSchema, 'Mail');
+const StandardMailbox = createDerived(StandardMailboxSchema, 'StandardMailbox');
 
 // ============================================================================
-// Type Aliases for Export
+// Specifier Helpers
 // ============================================================================
 
-type Settings = InstanceType<typeof Settings>;
-type RuleCondition = InstanceType<typeof RuleCondition>;
-type Rule = InstanceType<typeof Rule>;
-type Signature = InstanceType<typeof Signature>;
-type Recipient = InstanceType<typeof Recipient>;
-type Attachment = InstanceType<typeof Attachment>;
-type Message = InstanceType<typeof Message>;
-type Mailbox = InstanceType<typeof Mailbox>;
-type Account = InstanceType<typeof Account>;
+function createSchemaSpecifier(uri: string, jxa: any, schema: any, typeName: string): any {
+  const DerivedClass = createDerived(schema, typeName);
+  const spec: any = {
+    _isSpecifier: true, uri,
+    resolve: () => tryResolve(() => DerivedClass.fromJXA(jxa, uri), uri),
+    fix: () => ({ ok: true, value: spec }),
+  };
+  for (const [key, descriptor] of Object.entries(schema)) {
+    const jxaName = getJxaName(descriptor, key);
+    if (descriptor && '_t' in (descriptor as any)) {
+      Object.defineProperty(spec, key, {
+        get() { return scalarSpec(`${uri}/${key}`, () => jxa[jxaName]() ?? ''); },
+        enumerable: true
+      });
+    } else if (descriptor && '_coll' in (descriptor as any)) {
+      const desc = descriptor as any;
+      Object.defineProperty(spec, key, {
+        get() { return createCollSpec(`${uri}/${key}`, jxa[jxaName], desc._schema, getAddressingModes(desc._addressing), `${typeName}_${key}`, desc._opts); },
+        enumerable: true
+      });
+    }
+  }
+  return spec;
+}
 
 // ============================================================================
 // Entry Point
 // ============================================================================
 
-const MailApp = createDerived(MailAppBase, 'Mail');
-type MailApp = InstanceType<typeof MailApp>;
-
-// Create derived type for standard mailboxes
-const StandardMailbox = createDerived(StandardMailboxBase, 'StandardMailbox');
-
-// Helper to create standard mailbox specifier
-function createStandardMailboxSpecifier(
-  uri: string,
-  jxaMailbox: any
-): any {
-  const spec: any = {
-    _isSpecifier: true,
-    uri,
-    resolve(): Result<any> {
-      return tryResolve(() => StandardMailbox.fromJXA(jxaMailbox, uri), uri);
-    }
-  };
-
-  // Add properties from StandardMailboxBase
-  for (const [key, descriptor] of Object.entries(StandardMailboxBase)) {
-    if ('_accessor' in (descriptor as any)) {
-      Object.defineProperty(spec, key, {
-        get() {
-          const jxaName = (descriptor as any)._jxaName;
-          return scalarSpecifier(`${uri}/${key}`, () => {
-            const value = jxaMailbox[jxaName]();
-            return value == null ? '' : value;
-          });
-        },
-        enumerable: true
-      });
-    } else if ('_collection' in (descriptor as any)) {
-      Object.defineProperty(spec, key, {
-        get() {
-          const desc = descriptor as any;
-          return createCollectionSpecifier(
-            `${uri}/${key}`,
-            jxaMailbox[desc._jxaName],
-            desc._elementBase,
-            desc._addressing,
-            'StandardMailbox_' + key
-          );
-        },
-        enumerable: true
-      });
-    }
-  }
-
-  return spec;
-}
-
-// Helper to create settings specifier (singleton, not a collection)
-function createSettingsSpecifier(uri: string, jxaApp: any): any {
-  const spec: any = {
-    _isSpecifier: true,
-    uri,
-    resolve(): Result<any> {
-      return tryResolve(() => Settings.fromJXA(jxaApp, uri), uri);
-    },
-    fix(): Result<any> {
-      return { ok: true, value: spec };  // Settings is a singleton, already stable
-    }
-  };
-
-  // Add properties from SettingsBase as navigable specifiers
-  for (const [key, descriptor] of Object.entries(SettingsBase)) {
-    if ('_accessor' in (descriptor as any)) {
-      Object.defineProperty(spec, key, {
-        get() {
-          const jxaName = (descriptor as any)._jxaName;
-          return scalarSpecifier(`${uri}/${key}`, () => {
-            const value = jxaApp[jxaName]();
-            return value == null ? '' : value;
-          });
-        },
-        enumerable: true
-      });
-    }
-  }
-
-  return spec;
-}
-
-// Lazily initialized app specifier
 let _mailApp: any = null;
 function getMailApp() {
-  if (!_mailApp) {
-    const jxa = Application('Mail');
-    const app = MailApp.fromJXA(jxa, 'mail://');
-    // Add specifier-like properties
-    (app as any).uri = 'mail://';
-    (app as any)._isSpecifier = true;
-    (app as any).resolve = () => ({ ok: true, value: app });
+  if (_mailApp) return _mailApp;
 
-    // Add standard mailbox specifiers
-    const standardMailboxes = [
-      { name: 'inbox', jxaName: 'inbox' },
-      { name: 'drafts', jxaName: 'draftsMailbox' },
-      { name: 'junk', jxaName: 'junkMailbox' },
-      { name: 'outbox', jxaName: 'outbox' },
-      { name: 'sent', jxaName: 'sentMailbox' },
-      { name: 'trash', jxaName: 'trashMailbox' }
-    ];
+  const jxa = Application('Mail');
+  const app = MailApp.fromJXA(jxa, 'mail://');
+  (app as any).uri = 'mail://';
+  (app as any)._isSpecifier = true;
+  (app as any).resolve = () => ({ ok: true, value: app });
 
-    for (const { name, jxaName } of standardMailboxes) {
-      Object.defineProperty(app, name, {
-        get() {
-          return createStandardMailboxSpecifier(`mail://${name}`, jxa[jxaName]);
-        },
-        enumerable: true
-      });
-    }
-
-    // Add settings specifier (app-level preferences)
-    Object.defineProperty(app, 'settings', {
-      get() {
-        return createSettingsSpecifier('mail://settings', jxa);
-      },
+  // Standard mailboxes
+  const standardMailboxes = [
+    { name: 'inbox', jxaName: 'inbox' },
+    { name: 'drafts', jxaName: 'draftsMailbox' },
+    { name: 'junk', jxaName: 'junkMailbox' },
+    { name: 'outbox', jxaName: 'outbox' },
+    { name: 'sent', jxaName: 'sentMailbox' },
+    { name: 'trash', jxaName: 'trashMailbox' },
+  ];
+  for (const { name, jxaName } of standardMailboxes) {
+    Object.defineProperty(app, name, {
+      get() { return createSchemaSpecifier(`mail://${name}`, jxa[jxaName], StandardMailboxSchema, 'StandardMailbox'); },
       enumerable: true
     });
-
-    _mailApp = app;
   }
+
+  // Settings
+  Object.defineProperty(app, 'settings', {
+    get() { return createSchemaSpecifier('mail://settings', jxa, SettingsSchema, 'Settings'); },
+    enumerable: true
+  });
+
+  _mailApp = app;
   return _mailApp;
 }
 
-// Register mail:// scheme
 registerScheme('mail', getMailApp);
 
-// Standard mailbox aliases for accounts
-// Handles mail://accounts[X]/inbox, /sent, /drafts, /junk, /trash
+// ============================================================================
+// Account Standard Mailbox Navigation
+// ============================================================================
+
 const accountStandardMailboxes: Record<string, string> = {
   inbox: 'inbox',
   sent: 'sentMailbox',
   drafts: 'draftsMailbox',
   junk: 'junkMailbox',
-  trash: 'trashMailbox'
+  trash: 'trashMailbox',
 };
 
-// Completion hook for account standard mailboxes
 registerCompletionHook((specifier: any, partial: string) => {
-  // Only applies to account specifiers (check if URI matches accounts[X])
-  if (!specifier || !specifier.uri || !specifier.uri.match(/^mail:\/\/accounts\[\d+\]$/)) {
-    return [];
-  }
-
+  if (!specifier?.uri?.match(/^mail:\/\/accounts\[\d+\]$/)) return [];
   return Object.keys(accountStandardMailboxes)
     .filter(name => name.startsWith(partial.toLowerCase()))
-    .map(name => ({
-      value: `${name}/`,
-      label: name,
-      description: 'Standard mailbox'
-    }));
+    .map(name => ({ value: `${name}/`, label: name, description: 'Standard mailbox' }));
 });
 
 registerNavigationHook((parent: any, name: string, uri: string) => {
-  // Check if this is an account specifier navigating to a standard mailbox
   const jxaAppName = accountStandardMailboxes[name];
-  if (!jxaAppName) return undefined;
-
-  // Check if parent has an id (accounts have id)
-  if (!parent || !parent._isSpecifier) return undefined;
-
-  // Try to get the account's JXA object and find its standard mailbox
+  if (!jxaAppName || !parent?._isSpecifier) return undefined;
   try {
     const parentResult = parent.resolve();
     if (!parentResult.ok) return undefined;
-
     const accountId = parentResult.value.id;
     if (!accountId) return undefined;
-
-    // Get the app-level standard mailbox and find the one for this account
     const jxa = Application('Mail');
     const appMailbox = jxa[jxaAppName]();
     const accountMailbox = appMailbox.mailboxes().find((m: any) => {
-      try {
-        return m.account().id() === accountId;
-      } catch {
-        return false;
-      }
+      try { return m.account().id() === accountId; } catch { return false; }
     });
-
     if (!accountMailbox) return undefined;
-
-    // Create a mailbox specifier for it
-    return createMailboxSpecifier(uri, accountMailbox);
-  } catch {
-    return undefined;
-  }
+    return createSchemaSpecifier(uri, accountMailbox, MailboxSchema, 'Mailbox');
+  } catch { return undefined; }
 });
 
-// Helper to create a mailbox specifier for a JXA mailbox
-function createMailboxSpecifier(uri: string, jxaMailbox: any): any {
-  const spec: any = {
-    _isSpecifier: true,
-    uri,
-    resolve(): Result<any> {
-      return tryResolve(() => Mailbox.fromJXA(jxaMailbox, uri), uri);
-    }
-  };
+// ============================================================================
+// Exports
+// ============================================================================
 
-  // Add properties from MailboxBase
-  for (const [key, descriptor] of Object.entries(MailboxBase)) {
-    if ('_accessor' in (descriptor as any)) {
-      Object.defineProperty(spec, key, {
-        get() {
-          const jxaName = (descriptor as any)._jxaName;
-          return scalarSpecifier(`${uri}/${key}`, () => {
-            const value = jxaMailbox[jxaName]();
-            return value == null ? '' : value;
-          });
-        },
-        enumerable: true
-      });
-    } else if ('_collection' in (descriptor as any)) {
-      Object.defineProperty(spec, key, {
-        get() {
-          const desc = descriptor as any;
-          return createCollectionSpecifier(
-            `${uri}/${key}`,
-            jxaMailbox[desc._jxaName],
-            desc._elementBase,
-            desc._addressing,
-            'Mailbox_' + key
-          );
-        },
-        enumerable: true
-      });
-    }
-  }
-
-  return spec;
-}
-
-// Export for JXA
 (globalThis as any).specifierFromURI = specifierFromURI;
 (globalThis as any).getCompletions = getCompletions;
