@@ -211,6 +211,15 @@ function createCollectionSpecifier(uri, jxaCollection, elementBase, addressing, 
 // ============================================================================
 // Schema Definitions
 // ============================================================================
+const RecipientBase = {
+    name: accessor('name'),
+    address: accessor('address'),
+};
+const AttachmentBase = {
+    id: accessor('id'),
+    name: accessor('name'),
+    fileSize: accessor('fileSize'),
+};
 const MessageBase = {
     id: accessor('id'),
     messageId: accessor('messageId'),
@@ -224,6 +233,10 @@ const MessageBase = {
     flaggedStatus: accessor('flaggedStatus'),
     junkMailStatus: accessor('junkMailStatus'),
     messageSize: accessor('messageSize'),
+    toRecipients: collection('toRecipients', RecipientBase, ['name', 'index']),
+    ccRecipients: collection('ccRecipients', RecipientBase, ['name', 'index']),
+    bccRecipients: collection('bccRecipients', RecipientBase, ['name', 'index']),
+    attachments: collection('mailAttachments', AttachmentBase, ['name', 'index', 'id']),
 };
 const MailboxBase = {
     name: accessor('name'),

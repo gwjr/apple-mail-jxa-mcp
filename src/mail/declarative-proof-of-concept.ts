@@ -379,6 +379,17 @@ function createCollectionSpecifier<
 // Schema Definitions
 // ============================================================================
 
+const RecipientBase = {
+  name: accessor<string, 'name'>('name'),
+  address: accessor<string, 'address'>('address'),
+} as const;
+
+const AttachmentBase = {
+  id: accessor<string, 'id'>('id'),
+  name: accessor<string, 'name'>('name'),
+  fileSize: accessor<number, 'fileSize'>('fileSize'),
+} as const;
+
 const MessageBase = {
   id: accessor<number, 'id'>('id'),
   messageId: accessor<string, 'messageId'>('messageId'),
@@ -392,6 +403,10 @@ const MessageBase = {
   flaggedStatus: accessor<boolean, 'flaggedStatus'>('flaggedStatus'),
   junkMailStatus: accessor<boolean, 'junkMailStatus'>('junkMailStatus'),
   messageSize: accessor<number, 'messageSize'>('messageSize'),
+  toRecipients: collection('toRecipients', RecipientBase, ['name', 'index'] as const),
+  ccRecipients: collection('ccRecipients', RecipientBase, ['name', 'index'] as const),
+  bccRecipients: collection('bccRecipients', RecipientBase, ['name', 'index'] as const),
+  attachments: collection('mailAttachments', AttachmentBase, ['name', 'index', 'id'] as const),
 } as const;
 
 const MailboxBase = {

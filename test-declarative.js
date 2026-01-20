@@ -69,6 +69,22 @@ if (mailboxesResult.ok) {
       // Now resolve content separately
       const contentResult = msgResult.value.content.resolve();
       console.log('  content length:', contentResult.ok ? contentResult.value.length : contentResult.error);
+
+      // Test recipients
+      console.log('\n=== Recipients ===');
+      const toResult = msgResult.value.toRecipients.resolve();
+      if (toResult.ok && toResult.value.length > 0) {
+        console.log('To:', toResult.value.map(r => `${r.name} <${r.address}>`).join(', '));
+      }
+
+      // Test attachments
+      const attResult = msgResult.value.attachments.resolve();
+      if (attResult.ok) {
+        console.log('Attachments:', attResult.value.length);
+        if (attResult.value.length > 0) {
+          console.log('First:', attResult.value[0].name, attResult.value[0].fileSize, 'bytes');
+        }
+      }
     }
   } else {
     console.log('No mailbox with unread messages found');
