@@ -24,6 +24,7 @@
     "src/framework/uri.ts",
     "src/mail.ts",
     "src/resources.ts",
+    "src/tools.ts",
     "src/main.ts"
   ]
 }
