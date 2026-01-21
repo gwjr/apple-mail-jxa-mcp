@@ -92,6 +92,9 @@ function runTest() {
   const delegate = createMockDelegate(mockMailData, 'mail');
   const mail = getMailApp(delegate);
 
+  // Register the mail scheme for URI resolution
+  registerScheme('mail', () => createMockDelegate(mockMailData, 'mail'), MailApplicationProto);
+
   // Navigate to first message
   const message1 = mail.accounts.byIndex(0).mailboxes.byName('INBOX').messages.byIndex(0);
 
@@ -175,6 +178,93 @@ function runTest() {
   // Access single message through account inbox
   const firstMsg = account.inbox.messages.byIndex(0);
   console.log('account.inbox.messages.byIndex(0).subject:', firstMsg.subject.resolve());
+
+  console.log('\n--- URI Resolution Test (jxaName) ---');
+
+  // Test 1: mail.drafts URI should use schema name, not JXA name
+  const draftsUri = mail.drafts.specifier().uri;
+  console.log('mail.drafts.specifier().uri:', draftsUri);
+  const draftsUriExpected = draftsUri === 'mail://drafts';
+  console.log('  Uses schema name (drafts, not draftsMailbox):', draftsUriExpected ? 'PASS' : 'FAIL');
+
+  // Test 2: resolveURI('mail://drafts') should resolve successfully
+  const resolvedDrafts = resolveURI('mail://drafts');
+  if (resolvedDrafts.ok) {
+    console.log('resolveURI("mail://drafts"):');
+    console.log('  Resolved:', 'PASS');
+    console.log('  name.resolve():', resolvedDrafts.value.name.resolve());
+    // Verify it matches direct access
+    const directDraftsName = mail.drafts.name.resolve();
+    console.log('  Matches mail.drafts:', resolvedDrafts.value.name.resolve() === directDraftsName ? 'PASS' : 'FAIL');
+  } else {
+    console.log('resolveURI("mail://drafts"): FAIL -', resolvedDrafts.error);
+  }
+
+  // Test 3: Round-trip - resolveURI(mail.drafts.specifier().uri) should work
+  const roundTripDrafts = resolveURI(mail.drafts.specifier().uri);
+  if (roundTripDrafts.ok) {
+    console.log('Round-trip resolveURI(mail.drafts.specifier().uri):');
+    console.log('  Resolved:', 'PASS');
+    console.log('  name.resolve():', roundTripDrafts.value.name.resolve());
+  } else {
+    console.log('Round-trip resolveURI(mail.drafts.specifier().uri): FAIL -', roundTripDrafts.error);
+  }
+
+  // Test 4: junk, sent, trash should also use schema names
+  console.log('mail.junk.specifier().uri:', mail.junk.specifier().uri);
+  console.log('mail.sent.specifier().uri:', mail.sent.specifier().uri);
+  console.log('mail.trash.specifier().uri:', mail.trash.specifier().uri);
+
+  console.log('\n--- URI Resolution Test (computedNav) ---');
+
+  // Test 5: resolveURI('mail://accounts[0]/inbox') should resolve via computedNav
+  const resolvedAccountInbox = resolveURI('mail://accounts[0]/inbox');
+  if (resolvedAccountInbox.ok) {
+    console.log('resolveURI("mail://accounts[0]/inbox"):');
+    console.log('  Resolved:', 'PASS');
+    console.log('  name.resolve():', resolvedAccountInbox.value.name.resolve());
+    console.log('  unreadCount.resolve():', resolvedAccountInbox.value.unreadCount.resolve());
+    // Verify it matches direct access via computedNav
+    const directInboxName = account.inbox.name.resolve();
+    console.log('  Matches account.inbox:', resolvedAccountInbox.value.name.resolve() === directInboxName ? 'PASS' : 'FAIL');
+  } else {
+    console.log('resolveURI("mail://accounts[0]/inbox"): FAIL -', resolvedAccountInbox.error);
+  }
+
+  // Test 6: resolveURI('mail://accounts[0]/mailboxes/INBOX') should resolve via normal path
+  const resolvedJxaPath = resolveURI('mail://accounts[0]/mailboxes/INBOX');
+  if (resolvedJxaPath.ok) {
+    console.log('resolveURI("mail://accounts[0]/mailboxes/INBOX"):');
+    console.log('  Resolved:', 'PASS');
+    console.log('  name.resolve():', resolvedJxaPath.value.name.resolve());
+    console.log('  unreadCount.resolve():', resolvedJxaPath.value.unreadCount.resolve());
+  } else {
+    console.log('resolveURI("mail://accounts[0]/mailboxes/INBOX"): FAIL -', resolvedJxaPath.error);
+  }
+
+  // Test 7: Both paths should yield equivalent data
+  if (resolvedAccountInbox.ok && resolvedJxaPath.ok) {
+    const inboxName1 = resolvedAccountInbox.value.name.resolve();
+    const inboxName2 = resolvedJxaPath.value.name.resolve();
+    console.log('Both paths yield same mailbox name:', inboxName1 === inboxName2 ? 'PASS' : 'FAIL');
+  }
+
+  // Test 8: Attachments URI should use schema name
+  const attachmentsUri = message1.attachments.specifier().uri;
+  console.log('\nmessage.attachments.specifier().uri:', attachmentsUri);
+  const attachmentsUriExpected = attachmentsUri.includes('/attachments') && !attachmentsUri.includes('/mailAttachments');
+  console.log('  Uses schema name (attachments, not mailAttachments):', attachmentsUriExpected ? 'PASS' : 'FAIL');
+
+  // Test 9: resolveURI for attachments
+  const resolvedAttachments = resolveURI(attachmentsUri);
+  if (resolvedAttachments.ok) {
+    console.log('resolveURI(attachmentsUri):');
+    console.log('  Resolved:', 'PASS');
+    const attachmentList2 = resolvedAttachments.value.resolve();
+    console.log('  Attachment count:', attachmentList2.length);
+  } else {
+    console.log('resolveURI(attachmentsUri): FAIL -', resolvedAttachments.error);
+  }
 
   console.log('\n=== All Tests Complete ===');
 }

@@ -36,6 +36,12 @@ class JXADelegate implements Delegate {
     return new JXADelegate(this._jxaRef[key], newPath, this._jxaRef, key);
   }
 
+  propWithAlias(jxaName: string, uriName: string): JXADelegate {
+    // Navigate JXA using jxaName, but track uriName in path
+    const newPath = [...this._path, { kind: 'prop' as const, name: uriName }];
+    return new JXADelegate(this._jxaRef[jxaName], newPath, this._jxaRef, jxaName);
+  }
+
   byIndex(n: number): JXADelegate {
     const newPath = [...this._path, { kind: 'index' as const, value: n }];
     return new JXADelegate(this._jxaRef[n], newPath);

@@ -31,6 +31,13 @@ class MockDelegate implements Delegate {
     return new MockDelegate(newData, newPath);
   }
 
+  propWithAlias(jxaName: string, uriName: string): MockDelegate {
+    // Navigate data using JXA name, but track URI name in path
+    const newPath = [...this._path, { kind: 'prop' as const, name: uriName }];
+    const newData = this._data ? this._data[jxaName] : undefined;
+    return new MockDelegate(newData, newPath);
+  }
+
   byIndex(n: number): MockDelegate {
     const newPath = [...this._path, { kind: 'index' as const, value: n }];
     const newData = Array.isArray(this._data) ? this._data[n] : undefined;

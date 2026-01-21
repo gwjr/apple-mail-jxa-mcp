@@ -127,6 +127,7 @@ type QueryState = {
 interface Delegate {
   _jxa(): any;
   prop(key: string): Delegate;
+  propWithAlias(jxaName: string, uriName: string): Delegate;
   byIndex(n: number): Delegate;
   byName(name: string): Delegate;
   byId(id: string | number): Delegate;
@@ -164,8 +165,14 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
             return createRes(targetDelegate, navInfo.targetProto);
           }
           // Normal property navigation - use jxaName if defined, otherwise use the property name
-          const jxaName = getJxaName(value) || (prop as string);
-          return createRes(t._delegate.prop(jxaName), value);
+          const jxaName = getJxaName(value);
+          const schemaName = prop as string;
+          if (jxaName) {
+            // Navigate with JXA name but track schema name for URI
+            return createRes(t._delegate.propWithAlias(jxaName, schemaName), value);
+          } else {
+            return createRes(t._delegate.prop(schemaName), value);
+          }
         }
         return value;
       }
@@ -909,8 +916,39 @@ function resolveURI(uri: string): Result<Res<any>> {
 
     const childProto = proto[head];
 
-    if (childProto !== undefined && isChildProto(childProto)) {
-      delegate = delegate.prop(head);
+    // Check for computedNav first
+    const navInfo = childProto ? getComputedNav(childProto) : undefined;
+    if (navInfo) {
+      // Apply the computed navigation
+      delegate = navInfo.navigate(delegate);
+      proto = navInfo.targetProto;
+
+      // Handle qualifiers on the target if any
+      if (qualifier) {
+        const itemProto = getItemProto(proto);
+
+        if (qualifier.kind === 'index') {
+          if (!hasByIndex(proto)) {
+            return { ok: false, error: `computedNav target '${head}' does not support index addressing` };
+          }
+          delegate = delegate.byIndex(qualifier.value);
+          proto = itemProto || baseScalar;
+        } else if (qualifier.kind === 'id') {
+          if (!hasById(proto)) {
+            return { ok: false, error: `computedNav target '${head}' does not support id addressing` };
+          }
+          delegate = delegate.byId(qualifier.value);
+          proto = itemProto || baseScalar;
+        } else if (qualifier.kind === 'query') {
+          const applied = applyQueryQualifier(delegate, proto, qualifier);
+          delegate = applied.delegate;
+          proto = applied.proto;
+        }
+      }
+    } else if (childProto !== undefined && isChildProto(childProto)) {
+      // Normal property navigation - use jxaName if available
+      const jxaName = getJxaName(childProto) || head;
+      delegate = delegate.prop(jxaName);
       proto = childProto;
 
       if (qualifier) {
