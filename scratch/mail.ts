@@ -3,10 +3,19 @@
 // Uses framework.ts building blocks. No framework code here.
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Email Address Parsing (app-specific utility)
+// App-specific utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
 type ParsedEmailAddress = { name: string; address: string };
+
+// Extract mailbox name from JXA mailbox object (used for rule actions)
+function extractMailboxName(mailbox: any): string | null {
+  try {
+    return mailbox ? mailbox.name() : null;
+  } catch {
+    return null;
+  }
+}
 
 function parseEmailAddress(raw: string): ParsedEmailAddress {
   if (!raw) return { name: '', address: '' };
@@ -32,14 +41,7 @@ function parseEmailAddress(raw: string): ParsedEmailAddress {
 // RuleCondition proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface RuleConditionProtoType extends BaseProtoType {
-  header: typeof eagerScalar;
-  qualifier: typeof eagerScalar;
-  ruleType: typeof eagerScalar;
-  expression: typeof eagerScalar;
-}
-
-const RuleConditionProto: RuleConditionProtoType = {
+const RuleConditionProto = {
   ...baseScalar,
   header: eagerScalar,
   qualifier: eagerScalar,
@@ -51,25 +53,7 @@ const RuleConditionProto: RuleConditionProtoType = {
 // Rule proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface RuleProtoType extends BaseProtoType {
-  name: typeof eagerScalar;
-  enabled: ReturnType<typeof withSet<typeof baseScalar>>;
-  allConditionsMustBeMet: ReturnType<typeof withSet<typeof baseScalar>>;
-  deleteMessage: ReturnType<typeof withSet<typeof baseScalar>>;
-  markRead: ReturnType<typeof withSet<typeof baseScalar>>;
-  markFlagged: ReturnType<typeof withSet<typeof baseScalar>>;
-  markFlagIndex: ReturnType<typeof withSet<typeof baseScalar>>;
-  stopEvaluatingRules: ReturnType<typeof withSet<typeof baseScalar>>;
-  forwardMessage: ReturnType<typeof withSet<typeof baseScalar>>;
-  redirectMessage: ReturnType<typeof withSet<typeof baseScalar>>;
-  replyText: ReturnType<typeof withSet<typeof baseScalar>>;
-  playSound: ReturnType<typeof withSet<typeof baseScalar>>;
-  highlightTextUsingColor: ReturnType<typeof withSet<typeof baseScalar>>;
-  // copyMessage and moveMessage are computed properties in production - see note below
-  ruleConditions: BaseProtoType & ByIndexProto<typeof RuleConditionProto>;
-}
-
-const RuleProto: RuleProtoType = {
+const RuleProto = {
   ...baseScalar,
   name: eagerScalar,
   enabled: withSet(baseScalar),
@@ -84,6 +68,9 @@ const RuleProto: RuleProtoType = {
   replyText: withSet(baseScalar),
   playSound: withSet(baseScalar),
   highlightTextUsingColor: withSet(baseScalar),
+  // copyMessage/moveMessage return the destination mailbox name (or null)
+  copyMessage: computed<string | null>(extractMailboxName),
+  moveMessage: computed<string | null>(extractMailboxName),
   ruleConditions: pipe(baseCollection, withByIndex(RuleConditionProto)),
 };
 
@@ -91,12 +78,7 @@ const RuleProto: RuleProtoType = {
 // Signature proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface SignatureProtoType extends BaseProtoType {
-  name: typeof eagerScalar;
-  content: ReturnType<typeof makeLazy<typeof baseScalar>>;
-}
-
-const SignatureProto: SignatureProtoType = {
+const SignatureProto = {
   ...baseScalar,
   name: eagerScalar,
   content: makeLazy(baseScalar),
@@ -106,12 +88,7 @@ const SignatureProto: SignatureProtoType = {
 // Recipient proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface RecipientProtoType extends BaseProtoType {
-  name: typeof eagerScalar;
-  address: typeof eagerScalar;
-}
-
-const RecipientProto: RecipientProtoType = {
+const RecipientProto = {
   ...baseScalar,
   name: eagerScalar,
   address: eagerScalar,
@@ -121,13 +98,7 @@ const RecipientProto: RecipientProtoType = {
 // Attachment proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface AttachmentProtoType extends BaseProtoType {
-  id: typeof eagerScalar;
-  name: typeof eagerScalar;
-  fileSize: typeof eagerScalar;
-}
-
-const AttachmentProto: AttachmentProtoType = {
+const AttachmentProto = {
   ...baseScalar,
   id: eagerScalar,
   name: eagerScalar,
@@ -138,26 +109,7 @@ const AttachmentProto: AttachmentProtoType = {
 // Message proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface MessageProtoType extends BaseProtoType {
-  id: typeof eagerScalar;
-  messageId: typeof eagerScalar;
-  subject: ReturnType<typeof withSet<typeof baseScalar>>;
-  sender: BaseProtoType;                    // Computed: parses raw email string
-  replyTo: BaseProtoType;                   // Computed: parses raw email string
-  dateSent: typeof eagerScalar;
-  dateReceived: typeof eagerScalar;
-  content: ReturnType<typeof makeLazy<typeof baseScalar>>;
-  readStatus: ReturnType<typeof withSet<typeof baseScalar>>;
-  flaggedStatus: ReturnType<typeof withSet<typeof baseScalar>>;
-  junkMailStatus: ReturnType<typeof withSet<typeof baseScalar>>;
-  messageSize: typeof eagerScalar;
-  toRecipients: BaseProtoType & ByIndexProto<typeof RecipientProto> & ByNameProto<typeof RecipientProto>;
-  ccRecipients: BaseProtoType & ByIndexProto<typeof RecipientProto> & ByNameProto<typeof RecipientProto>;
-  bccRecipients: BaseProtoType & ByIndexProto<typeof RecipientProto> & ByNameProto<typeof RecipientProto>;
-  attachments: JxaNamedProto<BaseProtoType & ByIndexProto<typeof AttachmentProto> & ByNameProto<typeof AttachmentProto> & ByIdProto<typeof AttachmentProto>>;
-}
-
-const MessageProto: MessageProtoType = {
+const MessageProto = {
   ...baseScalar,
   id: eagerScalar,
   messageId: eagerScalar,
@@ -183,7 +135,7 @@ const MessageProto: MessageProtoType = {
 const LazyMessageProto = makeLazy(MessageProto);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Mailbox proto (recursive)
+// Mailbox proto (recursive - interface required for self-reference)
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface MailboxProtoType extends BaseProtoType {
@@ -207,47 +159,65 @@ MailboxProto.mailboxes = pipe2(baseCollection, withByIndex(MailboxProto), withBy
 // Account proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface MailAccountProtoType extends BaseProtoType {
-  id: typeof eagerScalar;
-  name: typeof eagerScalar;
-  fullName: typeof eagerScalar;
-  // emailAddresses requires computed() to call jxa.emailAddresses()
-  mailboxes: BaseProtoType & ByIndexProto<typeof MailboxProto> & ByNameProto<typeof MailboxProto>;
-  // Account-level inbox - complex navigation via computedNav
-  inbox: ComputedNavProto<typeof MailboxProto>;
-}
-
-const MailAccountProto: MailAccountProtoType = {
+const MailAccountProto = {
   ...baseScalar,
   id: eagerScalar,
   name: eagerScalar,
   fullName: eagerScalar,
+  emailAddresses: eagerScalar,  // Returns string[] of account's email addresses
   mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
   // Account inbox navigates to mailboxes.byName('INBOX')
   inbox: computedNav((d) => d.prop('mailboxes').byName('INBOX'), MailboxProto),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Settings proto (namespace for app-level preferences)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MailSettingsProto = {
+  ...baseScalar,
+  // App info (read-only)
+  name: eagerScalar,
+  version: eagerScalar,
+  frontmost: eagerScalar,
+  // Behavior
+  alwaysBccMyself: withSet(baseScalar),
+  alwaysCcMyself: withSet(baseScalar),
+  downloadHtmlAttachments: withSet(baseScalar),
+  fetchInterval: withSet(baseScalar),
+  expandGroupAddresses: withSet(baseScalar),
+  // Composing
+  defaultMessageFormat: withSet(baseScalar),
+  chooseSignatureWhenComposing: withSet(baseScalar),
+  quoteOriginalMessage: withSet(baseScalar),
+  sameReplyFormat: withSet(baseScalar),
+  includeAllOriginalMessageText: withSet(baseScalar),
+  // Display
+  highlightSelectedConversation: withSet(baseScalar),
+  colorQuotedText: withSet(baseScalar),
+  levelOneQuotingColor: withSet(baseScalar),
+  levelTwoQuotingColor: withSet(baseScalar),
+  levelThreeQuotingColor: withSet(baseScalar),
+  // Fonts
+  messageFont: withSet(baseScalar),
+  messageFontSize: withSet(baseScalar),
+  messageListFont: withSet(baseScalar),
+  messageListFontSize: withSet(baseScalar),
+  useFixedWidthFont: withSet(baseScalar),
+  fixedWidthFont: withSet(baseScalar),
+  fixedWidthFontSize: withSet(baseScalar),
+  // Sounds
+  newMailSound: withSet(baseScalar),
+  shouldPlayOtherMailSounds: withSet(baseScalar),
+  // Spelling
+  checkSpellingWhileTyping: withSet(baseScalar),
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Application proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface MailApplicationProtoType extends BaseProtoType {
-  name: typeof eagerScalar;
-  version: typeof eagerScalar;
-  accounts: BaseProtoType & ByIndexProto<typeof MailAccountProto> & ByNameProto<typeof MailAccountProto> & ByIdProto<typeof MailAccountProto>;
-  rules: BaseProtoType & ByIndexProto<typeof RuleProto> & ByNameProto<typeof RuleProto>;
-  signatures: BaseProtoType & ByIndexProto<typeof SignatureProto> & ByNameProto<typeof SignatureProto>;
-  // Standard mailboxes - simple property access (jxaName mapping)
-  inbox: typeof MailboxProto;
-  drafts: JxaNamedProto<typeof MailboxProto>;
-  junk: JxaNamedProto<typeof MailboxProto>;
-  outbox: typeof MailboxProto;
-  sent: JxaNamedProto<typeof MailboxProto>;
-  trash: JxaNamedProto<typeof MailboxProto>;
-  // Settings namespace requires computed()
-}
-
-const MailApplicationProto: MailApplicationProtoType = {
+const MailApplicationProto = {
   ...baseScalar,
   name: eagerScalar,
   version: eagerScalar,
@@ -255,12 +225,14 @@ const MailApplicationProto: MailApplicationProtoType = {
   rules: pipe2(baseCollection, withByIndex(RuleProto), withByName(RuleProto)),
   signatures: pipe2(baseCollection, withByIndex(SignatureProto), withByName(SignatureProto)),
   // Standard mailboxes - simple property access with jxaName mapping
-  inbox: MailboxProto,                              // jxaName matches schema name
+  inbox: MailboxProto,
   drafts: withJxaName(MailboxProto, 'draftsMailbox'),
   junk: withJxaName(MailboxProto, 'junkMailbox'),
-  outbox: MailboxProto,                             // jxaName matches schema name
+  outbox: MailboxProto,
   sent: withJxaName(MailboxProto, 'sentMailbox'),
   trash: withJxaName(MailboxProto, 'trashMailbox'),
+  // Settings namespace - virtual grouping of app-level preferences
+  settings: namespaceNav(MailSettingsProto),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -271,13 +243,14 @@ function getMailApp(delegate: Delegate): Res<typeof MailApplicationProto> {
   return createRes(delegate, MailApplicationProto);
 }
 
-// Type aliases
+// Type aliases - use typeof to derive types from proto objects
 type MailApplication = Res<typeof MailApplicationProto>;
 type MailAccount = Res<typeof MailAccountProto>;
-type MailMailbox = Res<typeof MailboxProto>;
+type MailMailbox = Res<MailboxProtoType>;  // Uses interface (recursive)
 type MailMessage = Res<typeof MessageProto>;
 type MailAttachment = Res<typeof AttachmentProto>;
 type MailRecipient = Res<typeof RecipientProto>;
 type MailRule = Res<typeof RuleProto>;
 type MailRuleCondition = Res<typeof RuleConditionProto>;
 type MailSignature = Res<typeof SignatureProto>;
+type MailSettings = Res<typeof MailSettingsProto>;

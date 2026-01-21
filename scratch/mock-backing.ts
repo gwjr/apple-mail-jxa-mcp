@@ -38,6 +38,12 @@ class MockDelegate implements Delegate {
     return new MockDelegate(newData, newPath);
   }
 
+  namespace(name: string): MockDelegate {
+    // A namespace adds a URI segment but keeps the same data (no JXA navigation)
+    const newPath = [...this._path, { kind: 'prop' as const, name }];
+    return new MockDelegate(this._data, newPath);  // Same data!
+  }
+
   byIndex(n: number): MockDelegate {
     const newPath = [...this._path, { kind: 'index' as const, value: n }];
     const newData = Array.isArray(this._data) ? this._data[n] : undefined;

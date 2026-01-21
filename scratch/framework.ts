@@ -133,6 +133,7 @@ interface Delegate {
   byId(id: string | number): Delegate;
   uri(): string;
   set(value: any): void;
+  namespace(name: string): Delegate;
 
   withFilter(filter: WhoseFilter): Delegate;
   withSort(sort: SortSpec<any>): Delegate;
@@ -158,7 +159,12 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
           return value.bind(receiver);
         }
         if (typeof value === 'object' && value !== null) {
-          // Check for computed navigation first
+          // Check for namespace navigation first
+          const namespaceProto = getNamespaceNav(value);
+          if (namespaceProto) {
+            return createRes(t._delegate.namespace(prop as string), namespaceProto);
+          }
+          // Check for computed navigation
           const navInfo = getComputedNav(value);
           if (navInfo) {
             const targetDelegate = navInfo.navigate(t._delegate);
@@ -421,6 +427,32 @@ function computedNav<P extends object>(
 
 function getComputedNav(proto: object): { navigate: NavigationFn; targetProto: object } | undefined {
   return computedNavMap.get(proto);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Namespace Navigation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A namespace is a virtual grouping that:
+// 1. Shares its parent's delegate (no JXA navigation)
+// 2. Adds a segment to the URI path for schema clarity
+// 3. Has its own proto with the grouped properties
+
+declare const NamespaceBrand: unique symbol;
+const namespaceNavMap = new WeakMap<object, object>();
+
+type NamespaceProto<P> = P & { readonly [NamespaceBrand]: true };
+
+function namespaceNav<P extends object>(targetProto: P): NamespaceProto<P> {
+  const navProto = {
+    ...baseScalar,
+  } as unknown as NamespaceProto<P>;
+  namespaceNavMap.set(navProto, targetProto);
+  return navProto;
+}
+
+function getNamespaceNav(proto: object): object | undefined {
+  return namespaceNavMap.get(proto);
 }
 
 interface QueryableProto<T> extends BaseProtoType {
@@ -916,7 +948,19 @@ function resolveURI(uri: string): Result<Res<any>> {
 
     const childProto = proto[head];
 
-    // Check for computedNav first
+    // Check for namespaceNav first (virtual grouping, no JXA navigation)
+    const namespaceProto = childProto ? getNamespaceNav(childProto) : undefined;
+    if (namespaceProto) {
+      delegate = delegate.namespace(head);
+      proto = namespaceProto;
+      // Namespaces don't have qualifiers - if there's a qualifier, it's an error
+      if (qualifier) {
+        return { ok: false, error: `Namespace '${head}' does not support qualifiers` };
+      }
+      continue;
+    }
+
+    // Check for computedNav
     const navInfo = childProto ? getComputedNav(childProto) : undefined;
     if (navInfo) {
       // Apply the computed navigation

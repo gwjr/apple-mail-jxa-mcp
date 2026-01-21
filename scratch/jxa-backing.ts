@@ -42,6 +42,12 @@ class JXADelegate implements Delegate {
     return new JXADelegate(this._jxaRef[jxaName], newPath, this._jxaRef, jxaName);
   }
 
+  namespace(name: string): JXADelegate {
+    // A namespace adds a URI segment but keeps the same JXA ref (no navigation)
+    const newPath = [...this._path, { kind: 'prop' as const, name }];
+    return new JXADelegate(this._jxaRef, newPath, this._parent, this._key);  // Same ref!
+  }
+
   byIndex(n: number): JXADelegate {
     const newPath = [...this._path, { kind: 'index' as const, value: n }];
     return new JXADelegate(this._jxaRef[n], newPath);

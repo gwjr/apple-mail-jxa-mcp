@@ -29,6 +29,41 @@ notes.ts        Notes.app schema (uses framework building blocks)
 5. **Composition via spread** - `makeLazy(proto)` spreads and overrides
 6. **Closures, not properties** - `itemProto` closed over, not stored as `_itemProto`
 7. **Clean side vs dirty side** - Typed domain code; `any` (preferably, `unknown`) only at JXA/mock boundary
+8. **Schema IS the prototype (DRY)** - Define proto objects directly; derive types with `typeof`. Never duplicate a proto as both interface and const.
+
+### Proto Definition Pattern
+
+**WRONG** - duplicates structure in interface and const:
+```typescript
+interface FooProtoType extends BaseProtoType {
+  name: typeof eagerScalar;
+  count: typeof eagerScalar;
+}
+const FooProto: FooProtoType = {
+  ...baseScalar,
+  name: eagerScalar,
+  count: eagerScalar,
+};
+```
+
+**RIGHT** - define once, derive type:
+```typescript
+const FooProto = {
+  ...baseScalar,
+  name: eagerScalar,
+  count: eagerScalar,
+};
+type Foo = Res<typeof FooProto>;
+```
+
+**EXCEPTION** - recursive types need an interface for self-reference:
+```typescript
+interface MailboxProtoType extends BaseProtoType {
+  name: typeof eagerScalar;
+  mailboxes: BaseProtoType & ByIndexProto<MailboxProtoType>;  // Self-reference
+}
+const MailboxProto: MailboxProtoType = { ... };
+```
 
 ## Key Abstractions
 
@@ -38,14 +73,17 @@ notes.ts        Notes.app schema (uses framework building blocks)
 interface Delegate {
   _jxa(): any;                    // Returns data (name is historical)
   prop(key: string): Delegate;
+  propWithAlias(jxaName: string, uriName: string): Delegate;
   byIndex(n: number): Delegate;
   byName(name: string): Delegate;
   byId(id: string | number): Delegate;
   uri(): string;
   set(value: any): void;
+  namespace(name: string): Delegate;  // Virtual grouping (no JXA navigation)
   withFilter(filter: WhoseFilter): Delegate;
   withSort(sort: SortSpec<any>): Delegate;
   withPagination(pagination: PaginationSpec): Delegate;
+  withExpand(fields: string[]): Delegate;
   queryState(): QueryState;
 }
 ```
@@ -74,6 +112,10 @@ withByIndex(itemProto)    // adds byIndex() accessor
 withByName(itemProto)     // adds byName() accessor
 withById(itemProto)       // adds byId() accessor
 withQuery(proto)          // adds whose(), sortBy(), paginate()
+withJxaName(proto, name)  // maps schema name to different JXA name
+computedNav(fn, proto)    // complex navigation (e.g., account.inbox → mailboxes.byName('INBOX'))
+namespaceNav(proto)       // virtual grouping (no JXA navigation, adds URI segment)
+computed(transform)       // transforms raw value (e.g., parse email string)
 
 // Composition via pipe
 const messages = pipe2(baseCollection, withByIndex(MessageProto), withById(MessageProto))

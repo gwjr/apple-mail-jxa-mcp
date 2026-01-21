@@ -10,6 +10,13 @@ declare var console: { log(...args: any[]): void };
 const mockMailData = {
   name: 'Mail',
   version: '16.0',
+  // App-level settings (accessed via namespace)
+  downloadHtmlAttachments: true,
+  newMailSound: 'Glass',
+  fetchInterval: 5,
+  alwaysBccMyself: false,
+  alwaysCcMyself: false,
+  highlightSelectedConversation: true,
   // App-level standard mailboxes (JXA property names)
   inbox: { name: 'Inbox', unreadCount: 5, messages: [], mailboxes: [] },
   draftsMailbox: { name: 'Drafts', unreadCount: 0, messages: [], mailboxes: [] },
@@ -265,6 +272,53 @@ function runTest() {
   } else {
     console.log('resolveURI(attachmentsUri): FAIL -', resolvedAttachments.error);
   }
+
+  console.log('\n--- Settings Namespace Test ---');
+
+  // Test 1: mail.settings.fetchInterval should have correct URI
+  const fetchIntervalUri = mail.settings.fetchInterval.specifier().uri;
+  console.log('mail.settings.fetchInterval.specifier().uri:', fetchIntervalUri);
+  const fetchIntervalUriExpected = fetchIntervalUri === 'mail://settings/fetchInterval';
+  console.log('  Uses settings namespace in URI:', fetchIntervalUriExpected ? 'PASS' : 'FAIL');
+
+  // Test 2: mail.settings.fetchInterval should resolve to app-level property
+  const fetchInterval = mail.settings.fetchInterval.resolve();
+  console.log('mail.settings.fetchInterval.resolve():', fetchInterval);
+  const fetchIntervalExpected = fetchInterval === 5;
+  console.log('  Resolves to correct value:', fetchIntervalExpected ? 'PASS' : 'FAIL');
+
+  // Test 3: Other settings properties
+  console.log('mail.settings.downloadHtmlAttachments.resolve():', mail.settings.downloadHtmlAttachments.resolve());
+  console.log('mail.settings.newMailSound.resolve():', mail.settings.newMailSound.resolve());
+  console.log('mail.settings.fetchInterval.resolve():', mail.settings.fetchInterval.resolve());
+
+  // Test 4: resolveURI('mail://settings/fetchInterval') should work
+  const resolvedSettings = resolveURI('mail://settings/fetchInterval');
+  if (resolvedSettings.ok) {
+    console.log('resolveURI("mail://settings/fetchInterval"):');
+    console.log('  Resolved:', 'PASS');
+    const resolvedValue = resolvedSettings.value.resolve();
+    console.log('  resolve():', resolvedValue);
+    console.log('  Matches direct access:', resolvedValue === fetchInterval ? 'PASS' : 'FAIL');
+  } else {
+    console.log('resolveURI("mail://settings/fetchInterval"): FAIL -', resolvedSettings.error);
+  }
+
+  // Test 5: Round-trip
+  const roundTripSettings = resolveURI(mail.settings.fetchInterval.specifier().uri);
+  if (roundTripSettings.ok) {
+    console.log('Round-trip resolveURI(mail.settings.fetchInterval.specifier().uri):');
+    console.log('  Resolved:', 'PASS');
+    console.log('  resolve():', roundTripSettings.value.resolve());
+  } else {
+    console.log('Round-trip: FAIL -', roundTripSettings.error);
+  }
+
+  // Test 6: Settings namespace URI itself
+  const settingsUri = mail.settings.specifier().uri;
+  console.log('mail.settings.specifier().uri:', settingsUri);
+  const settingsUriExpected = settingsUri === 'mail://settings';
+  console.log('  Settings namespace URI:', settingsUriExpected ? 'PASS' : 'FAIL');
 
   console.log('\n=== All Tests Complete ===');
 }
