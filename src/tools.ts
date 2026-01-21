@@ -108,42 +108,42 @@ function toolMove(itemUri: string, destinationCollectionUri: string): ToolResult
     return { ok: false, error: `Destination ${destinationCollectionUri} does not support receiving items` };
   }
 
-  // For messages, use JXA move verb
+  // For messages, set the mailbox property
   if (itemUri.includes('/messages')) {
     try {
       // Get destination mailbox JXA reference
-      // The destination should be a mailbox, get its JXA ref
       let destMailbox: any;
-      if (destSpec._jxa) {
-        // Destination is a collection, need parent mailbox
-        destMailbox = destSpec._jxa;
-      } else {
-        // Parse destination to get mailbox
-        const destMailboxUri = destinationCollectionUri.replace(/\/messages$/, '');
-        const mailboxResult = specifierFromURI(destMailboxUri);
-        if (!mailboxResult.ok) {
-          return { ok: false, error: `Cannot find mailbox for ${destinationCollectionUri}` };
-        }
-        destMailbox = (mailboxResult.value as any)._jxa;
+      let destMailboxUri = destinationCollectionUri;
+
+      // If destination is a messages collection, get the parent mailbox
+      if (destinationCollectionUri.endsWith('/messages')) {
+        destMailboxUri = destinationCollectionUri.replace(/\/messages$/, '');
       }
 
-      // Get messageId before move (stable identifier, unlike id which changes)
-      const messageId = itemSpec._jxa.messageId();
+      const mailboxResult = specifierFromURI(destMailboxUri);
+      if (!mailboxResult.ok) {
+        return { ok: false, error: `Cannot find mailbox for ${destinationCollectionUri}` };
+      }
+      destMailbox = (mailboxResult.value as any)._jxa;
 
-      // Use JXA move
-      itemSpec._jxa.move({ to: destMailbox });
+      if (!destMailbox) {
+        return { ok: false, error: `Destination ${destMailboxUri} is not a valid mailbox` };
+      }
 
-      // Find the moved message in destination by messageId
-      // The destination messages collection
-      const destMailboxUri = destinationCollectionUri.replace(/\/messages$/, '');
-      const destMessagesUri = `${destMailboxUri}/messages`;
+      // Get RFC messageId before move (stable identifier, unlike id which changes)
+      const rfcId = itemSpec._jxa.messageId();
+
+      // Move by setting the mailbox property
+      itemSpec._jxa.mailbox = destMailbox;
+
+      // Re-find in new location by messageId
       try {
-        const movedMessage = destMailbox.messages.whose({ messageId: { _equals: messageId } }).at(0);
-        const newId = movedMessage.id();
-        return { ok: true, value: { uri: `${destMessagesUri}/${newId}` } };
+        const moved = destMailbox.messages.whose({ messageId: rfcId })[0];
+        const newId = moved.id();
+        return { ok: true, value: { uri: `${destMailboxUri}/messages/${newId}` } };
       } catch {
-        // Fallback: return destination collection URI if we can't find the specific message
-        return { ok: true, value: { uri: destMessagesUri } };
+        // Fallback: return destination mailbox URI if we can't find the specific message
+        return { ok: true, value: { uri: `${destMailboxUri}/messages` } };
       }
     } catch (e: any) {
       return { ok: false, error: `Move failed: ${e.message}` };
