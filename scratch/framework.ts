@@ -15,6 +15,7 @@ declare const SettableBrand: unique symbol;
 declare const ByIndexBrand: unique symbol;
 declare const ByNameBrand: unique symbol;
 declare const ByIdBrand: unique symbol;
+declare const JxaNameBrand: unique symbol;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Type-level utilities
@@ -156,7 +157,9 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
           return value.bind(receiver);
         }
         if (typeof value === 'object' && value !== null) {
-          return createRes(t._delegate.prop(prop as string), value);
+          // Use jxaName if defined, otherwise use the property name
+          const jxaName = getJxaName(value) || (prop as string);
+          return createRes(t._delegate.prop(jxaName), value);
         }
         return value;
       }
@@ -299,6 +302,64 @@ function withById<Item extends object>(itemProto: Item) {
     collectionItemProtos.set(result, itemProto);
     return result;
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JXA Name Mapping
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Store jxaName mapping (proto -> jxaName)
+const jxaNameMap = new WeakMap<object, string>();
+
+type JxaNamedProto<P> = P & { readonly [JxaNameBrand]: string };
+
+function withJxaName<P extends object>(proto: P, jxaName: string): JxaNamedProto<P> {
+  // Create a new object that inherits from proto
+  const named = Object.assign(Object.create(null), proto) as JxaNamedProto<P>;
+  jxaNameMap.set(named, jxaName);
+  // Also copy over the item proto if this is a collection
+  const itemProto = collectionItemProtos.get(proto);
+  if (itemProto) {
+    collectionItemProtos.set(named, itemProto);
+  }
+  return named;
+}
+
+function getJxaName(proto: object): string | undefined {
+  return jxaNameMap.get(proto);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Computed Properties
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A computed property transforms the raw value from the delegate
+function computed<T>(transform: (raw: any) => T): BaseProtoType {
+  return {
+    resolve(this: { _delegate: Delegate }) {
+      const raw = this._delegate._jxa();
+      return transform(raw);
+    },
+    resolve_eager(this: { resolve(): T }) {
+      return this.resolve();
+    },
+    exists(this: { _delegate: Delegate }) {
+      try {
+        this._delegate._jxa();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    specifier(this: { _delegate: Delegate }) {
+      return { uri: this._delegate.uri() };
+    },
+  };
+}
+
+// Lazy computed - resolve_eager returns specifier instead of value
+function lazyComputed<T>(transform: (raw: any) => T): BaseProtoType & { readonly [LazyBrand]: true } {
+  return makeLazy(computed(transform));
 }
 
 interface QueryableProto<T> extends BaseProtoType {
