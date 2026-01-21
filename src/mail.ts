@@ -1,10 +1,9 @@
 /// <reference path="./types/jxa.d.ts" />
-/// <reference path="./types/mail-app.d.ts" />
 /// <reference path="./framework/schema.ts" />
 /// <reference path="./framework/specifier.ts" />
+/// <reference path="./framework/lex.ts" />
 /// <reference path="./framework/runtime.ts" />
 /// <reference path="./framework/uri.ts" />
-/// <reference path="./framework-extras/completions.ts" />
 
 // ============================================================================
 // Email Address Parsing
@@ -26,7 +25,7 @@ function parseEmailAddress(raw: string): ParsedEmailAddress {
 }
 
 // ============================================================================
-// Schema Definitions - Using New Simplified Syntax
+// Schema Definitions
 // ============================================================================
 
 const SettingsSchema = {
@@ -35,36 +34,36 @@ const SettingsSchema = {
   version: t.string,
   frontmost: t.boolean,
   // Behavior
-  alwaysBccMyself: t.boolean,
-  alwaysCcMyself: t.boolean,
-  downloadHtmlAttachments: t.boolean,
-  fetchInterval: t.number,
-  expandGroupAddresses: t.boolean,
+  alwaysBccMyself: rw(t.boolean),
+  alwaysCcMyself: rw(t.boolean),
+  downloadHtmlAttachments: rw(t.boolean),
+  fetchInterval: rw(t.number),
+  expandGroupAddresses: rw(t.boolean),
   // Composing
-  defaultMessageFormat: t.string,
-  chooseSignatureWhenComposing: t.boolean,
-  quoteOriginalMessage: t.boolean,
-  sameReplyFormat: t.boolean,
-  includeAllOriginalMessageText: t.boolean,
+  defaultMessageFormat: rw(t.string),
+  chooseSignatureWhenComposing: rw(t.boolean),
+  quoteOriginalMessage: rw(t.boolean),
+  sameReplyFormat: rw(t.boolean),
+  includeAllOriginalMessageText: rw(t.boolean),
   // Display
-  highlightSelectedConversation: t.boolean,
-  colorQuotedText: t.boolean,
-  levelOneQuotingColor: t.string,
-  levelTwoQuotingColor: t.string,
-  levelThreeQuotingColor: t.string,
+  highlightSelectedConversation: rw(t.boolean),
+  colorQuotedText: rw(t.boolean),
+  levelOneQuotingColor: rw(t.string),
+  levelTwoQuotingColor: rw(t.string),
+  levelThreeQuotingColor: rw(t.string),
   // Fonts
-  messageFont: t.string,
-  messageFontSize: t.number,
-  messageListFont: t.string,
-  messageListFontSize: t.number,
-  useFixedWidthFont: t.boolean,
-  fixedWidthFont: t.string,
-  fixedWidthFontSize: t.number,
+  messageFont: rw(t.string),
+  messageFontSize: rw(t.number),
+  messageListFont: rw(t.string),
+  messageListFontSize: rw(t.number),
+  useFixedWidthFont: rw(t.boolean),
+  fixedWidthFont: rw(t.string),
+  fixedWidthFontSize: rw(t.number),
   // Sounds
-  newMailSound: t.string,
-  shouldPlayOtherMailSounds: t.boolean,
+  newMailSound: rw(t.string),
+  shouldPlayOtherMailSounds: rw(t.boolean),
   // Spelling
-  checkSpellingWhileTyping: t.boolean,
+  checkSpellingWhileTyping: rw(t.boolean),
 } as const;
 
 const RuleConditionSchema = {
@@ -76,18 +75,18 @@ const RuleConditionSchema = {
 
 const RuleSchema = {
   name: t.string,
-  enabled: t.boolean,
-  allConditionsMustBeMet: t.boolean,
-  deleteMessage: t.boolean,
-  markRead: t.boolean,
-  markFlagged: t.boolean,
-  markFlagIndex: t.number,
-  stopEvaluatingRules: t.boolean,
-  forwardMessage: t.string,
-  redirectMessage: t.string,
-  replyText: t.string,
-  playSound: t.string,
-  highlightTextUsingColor: t.string,
+  enabled: rw(t.boolean),
+  allConditionsMustBeMet: rw(t.boolean),
+  deleteMessage: rw(t.boolean),
+  markRead: rw(t.boolean),
+  markFlagged: rw(t.boolean),
+  markFlagIndex: rw(t.number),
+  stopEvaluatingRules: rw(t.boolean),
+  forwardMessage: rw(t.string),
+  redirectMessage: rw(t.string),
+  replyText: rw(t.string),
+  playSound: rw(t.string),
+  highlightTextUsingColor: rw(t.string),
   copyMessage: computed<string | null>((jxa) => {
     try {
       const mailbox = jxa.copyMessage();
@@ -104,7 +103,7 @@ const RuleSchema = {
       return null;
     }
   }),
-  ruleConditions: collection(RuleConditionSchema, [by.index]),
+  ruleConditions: collection(RuleConditionSchema, [by.index], { make: 'unavailable', take: 'unavailable' }),
 } as const;
 
 const SignatureSchema = {
@@ -126,23 +125,23 @@ const AttachmentSchema = {
 const MessageSchema = {
   id: t.number,
   messageId: t.string,
-  subject: t.string,
+  subject: rw(t.string),
   sender: computed<ParsedEmailAddress>((jxa) => parseEmailAddress(str(jxa.sender()))),
   replyTo: computed<ParsedEmailAddress>((jxa) => parseEmailAddress(str(jxa.replyTo()))),
   dateSent: t.date,
   dateReceived: t.date,
   content: lazy(t.string),
-  readStatus: t.boolean,
-  flaggedStatus: t.boolean,
-  junkMailStatus: t.boolean,
+  readStatus: rw(t.boolean),
+  flaggedStatus: rw(t.boolean),
+  junkMailStatus: rw(t.boolean),
   messageSize: t.number,
-  toRecipients: collection(RecipientSchema, [by.name, by.index]),
-  ccRecipients: collection(RecipientSchema, [by.name, by.index]),
-  bccRecipients: collection(RecipientSchema, [by.name, by.index]),
-  attachments: jxa(collection(AttachmentSchema, [by.name, by.index, by.id]), 'mailAttachments'),
+  toRecipients: collection(RecipientSchema, [by.name, by.index], { make: 'unavailable', take: 'unavailable' }),
+  ccRecipients: collection(RecipientSchema, [by.name, by.index], { make: 'unavailable', take: 'unavailable' }),
+  bccRecipients: collection(RecipientSchema, [by.name, by.index], { make: 'unavailable', take: 'unavailable' }),
+  attachments: jxa(collection(AttachmentSchema, [by.name, by.index, by.id], { make: 'unavailable', take: 'unavailable' }), 'mailAttachments'),
 } as const;
 
-const MailboxSchema: any = {
+const MailboxSchema: Schema = {
   name: t.string,
   unreadCount: t.number,
   messages: collection(MessageSchema, [by.index, by.id]),
@@ -153,14 +152,40 @@ const AccountSchema = {
   id: t.string,
   name: t.string,
   fullName: t.string,
-  emailAddresses: t.array(t.string),
+  emailAddresses: computed<string[]>((jxa) => {
+    try {
+      return jxa.emailAddresses() || [];
+    } catch {
+      return [];
+    }
+  }),
   mailboxes: collection(MailboxSchema, [by.name, by.index]),
-  // Virtual mailboxes - declarative instead of hooks
-  inbox: accountScopedMailbox('inbox'),
-  sent: accountScopedMailbox('sentMailbox'),
-  drafts: accountScopedMailbox('draftsMailbox'),
-  junk: accountScopedMailbox('junkMailbox'),
-  trash: accountScopedMailbox('trashMailbox'),
+  // Account-scoped standard mailboxes via computed properties
+  inbox: computed((jxa) => jxa.mailbox({ name: 'INBOX' })),
+  sent: computed((jxa) => {
+    const app = Application('Mail');
+    return (app as any).sentMailbox().mailboxes().find((mb: any) => {
+      try { return mb.account().id() === jxa.id(); } catch { return false; }
+    });
+  }),
+  drafts: computed((jxa) => {
+    const app = Application('Mail');
+    return (app as any).draftsMailbox().mailboxes().find((mb: any) => {
+      try { return mb.account().id() === jxa.id(); } catch { return false; }
+    });
+  }),
+  junk: computed((jxa) => {
+    const app = Application('Mail');
+    return (app as any).junkMailbox().mailboxes().find((mb: any) => {
+      try { return mb.account().id() === jxa.id(); } catch { return false; }
+    });
+  }),
+  trash: computed((jxa) => {
+    const app = Application('Mail');
+    return (app as any).trashMailbox().mailboxes().find((mb: any) => {
+      try { return mb.account().id() === jxa.id(); } catch { return false; }
+    });
+  }),
 } as const;
 
 const StandardMailboxSchema = {
@@ -173,59 +198,16 @@ const MailAppSchema = {
   accounts: collection(AccountSchema, [by.name, by.index, by.id]),
   rules: collection(RuleSchema, [by.name, by.index]),
   signatures: collection(SignatureSchema, [by.name, by.index]),
-  inbox: standardMailbox('inbox'),
-  drafts: standardMailbox('draftsMailbox'),
-  junk: standardMailbox('junkMailbox'),
-  outbox: standardMailbox('outbox'),
-  sent: standardMailbox('sentMailbox'),
-  trash: standardMailbox('trashMailbox'),
-  settings: namespace(SettingsSchema),
+  // Standard mailboxes as computed properties pointing to JXA accessors
+  inbox: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.inbox } as ScalarDescriptor,
+  drafts: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.draftsMailbox, jxaName: 'draftsMailbox' } as ScalarDescriptor,
+  junk: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.junkMailbox, jxaName: 'junkMailbox' } as ScalarDescriptor,
+  outbox: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.outbox } as ScalarDescriptor,
+  sent: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.sentMailbox, jxaName: 'sentMailbox' } as ScalarDescriptor,
+  trash: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.trashMailbox, jxaName: 'trashMailbox' } as ScalarDescriptor,
+  // Settings namespace
+  settings: { dimension: 'scalar', type: SettingsSchema, set: 'unavailable', lazy: false } as ScalarDescriptor,
 } as const;
-
-// ============================================================================
-// Derived Classes
-// ============================================================================
-
-const Settings = createDerived(SettingsSchema, 'Settings');
-const RuleCondition = createDerived(RuleConditionSchema, 'RuleCondition');
-const Rule = createDerived(RuleSchema, 'Rule');
-const Signature = createDerived(SignatureSchema, 'Signature');
-const Recipient = createDerived(RecipientSchema, 'Recipient');
-const Attachment = createDerived(AttachmentSchema, 'Attachment');
-const Message = createDerived(MessageSchema, 'Message');
-const Mailbox = createDerived(MailboxSchema, 'Mailbox');
-const Account = createDerived(AccountSchema, 'Account');
-const MailApp = createDerived(MailAppSchema, 'Mail');
-const StandardMailbox = createDerived(StandardMailboxSchema, 'StandardMailbox');
-
-// ============================================================================
-// Specifier Helpers
-// ============================================================================
-
-function createSchemaSpecifier(uri: string, jxa: any, schema: any, typeName: string): any {
-  const DerivedClass = createDerived(schema, typeName);
-  const spec: any = {
-    _isSpecifier: true, uri,
-    resolve: () => tryResolve(() => DerivedClass.fromJXA(jxa, uri), uri),
-    fix: () => ({ ok: true, value: spec }),
-  };
-  for (const [key, descriptor] of Object.entries(schema)) {
-    const jxaName = getJxaName(descriptor, key);
-    if (descriptor && '_t' in (descriptor as any)) {
-      Object.defineProperty(spec, key, {
-        get() { return scalarSpec(`${uri}/${key}`, () => jxa[jxaName]() ?? ''); },
-        enumerable: true
-      });
-    } else if (descriptor && '_coll' in (descriptor as any)) {
-      const desc = descriptor as any;
-      Object.defineProperty(spec, key, {
-        get() { return createCollSpec(`${uri}/${key}`, jxa[jxaName], desc._schema, getAddressingModes(desc._addressing), `${typeName}_${key}`, desc._opts); },
-        enumerable: true
-      });
-    }
-  }
-  return spec;
-}
 
 // ============================================================================
 // Entry Point
@@ -234,55 +216,14 @@ function createSchemaSpecifier(uri: string, jxa: any, schema: any, typeName: str
 let _mailApp: any = null;
 function getMailApp() {
   if (_mailApp) return _mailApp;
-
-  const jxa = Application('Mail');
-  const app = MailApp.fromJXA(jxa, 'mail://');
-  (app as any).uri = 'mail://';
-  (app as any)._isSpecifier = true;
-  (app as any).resolve = () => ({ ok: true, value: app });
-
-  // Standard mailboxes
-  const standardMailboxes = [
-    { name: 'inbox', jxaName: 'inbox' },
-    { name: 'drafts', jxaName: 'draftsMailbox' },
-    { name: 'junk', jxaName: 'junkMailbox' },
-    { name: 'outbox', jxaName: 'outbox' },
-    { name: 'sent', jxaName: 'sentMailbox' },
-    { name: 'trash', jxaName: 'trashMailbox' },
-  ];
-  for (const { name, jxaName } of standardMailboxes) {
-    Object.defineProperty(app, name, {
-      get() { return createSchemaSpecifier(`mail://${name}`, jxa[jxaName], StandardMailboxSchema, 'StandardMailbox'); },
-      enumerable: true
-    });
-  }
-
-  // Settings
-  Object.defineProperty(app, 'settings', {
-    get() { return createSchemaSpecifier('mail://settings', jxa, SettingsSchema, 'Settings'); },
-    enumerable: true
-  });
-
-  _mailApp = app;
+  _mailApp = Application('Mail');
   return _mailApp;
 }
 
-registerScheme('mail', getMailApp, MailAppSchema, {
-  StandardMailbox: StandardMailboxSchema,
-  Mailbox: MailboxSchema,
-  Settings: SettingsSchema,
-  Account: AccountSchema,
-  Message: MessageSchema,
-  Recipient: RecipientSchema,
-  Attachment: AttachmentSchema,
-  Rule: RuleSchema,
-  RuleCondition: RuleConditionSchema,
-  Signature: SignatureSchema,
-});
+registerScheme('mail', getMailApp, MailAppSchema);
 
 // ============================================================================
 // Exports
 // ============================================================================
 
 (globalThis as any).specifierFromURI = specifierFromURI;
-(globalThis as any).getCompletions = getCompletions;

@@ -1,5 +1,4 @@
 /// <reference path="../types/jxa.d.ts" />
-/// <reference path="../types/mail-app.d.ts" />
 /// <reference path="../types/mcp.d.ts" />
 
 // ============================================================================

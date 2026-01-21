@@ -11,7 +11,7 @@ type Filter = {
   value: string;
 };
 
-type SortDirection = 'asc' | 'desc';
+// SortDirection defined in specifier.ts
 
 // Qualifiers attach to segment heads
 type IndexQualifier = { kind: 'index'; value: number };

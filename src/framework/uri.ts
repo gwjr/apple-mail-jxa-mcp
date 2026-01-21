@@ -18,21 +18,7 @@ function registerScheme(scheme: string, root: () => any, schema: Schema): void {
   schemeRegistry[scheme] = { root, schema };
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-function isPrimitive(type: any): type is PrimitiveType {
-  return type === String || type === Number || type === Boolean || type === Date;
-}
-
-function isScalar(desc: Descriptor): desc is ScalarDescriptor {
-  return desc.dimension === 'scalar';
-}
-
-function isCollection(desc: Descriptor): desc is CollectionDescriptor {
-  return Array.isArray(desc.dimension);
-}
+// Helpers isPrimitive, isScalar, isCollection defined in runtime.ts
 
 // ============================================================================
 // URI Resolution - Route through schema
