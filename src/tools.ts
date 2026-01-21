@@ -1,15 +1,11 @@
-/// <reference path="framework/specifier.ts" />
-/// <reference path="framework/uri.ts" />
-/// <reference path="framework/runtime.ts" />
+/// <reference path="framework.ts" />
 
 // ============================================================================
 // MCP Tools for Mail.app
 // ============================================================================
 //
-// TODO: This file contains mail-specific code (message move, delete→trash,
-// mailbox deletion guard) that should be moved to mail.ts via custom
-// operation handlers. The tools here should be generic, with app-specific
-// behavior defined via the schema's make/take operations.
+// Generic tools that work with the framework. Domain-specific behavior
+// (e.g., message move, delete→trash) is handled by custom handlers in mail.ts.
 //
 
 type ToolResult = { ok: true; value: any } | { ok: false; error: string };
@@ -26,8 +22,6 @@ function toolSet(uri: string, value: any): ToolResult {
 
   // Check if parent uses name addressing and we're setting 'name'
   if (lastSegment === 'name') {
-    const parentUri = segments.slice(0, -1).join('/');
-    // Check if parent is addressed by name (not by index like [0])
     const parentLastSegment = segments[segments.length - 2];
     if (parentLastSegment && !parentLastSegment.match(/\[\d+\]$/) && !parentLastSegment.includes('://')) {
       return {
@@ -37,22 +31,24 @@ function toolSet(uri: string, value: any): ToolResult {
     }
   }
 
-  const specResult = specifierFromURI(uri);
-  if (!specResult.ok) {
-    return { ok: false, error: specResult.error };
+  const resResult = resolveURI(uri);
+  if (!resResult.ok) {
+    return { ok: false, error: resResult.error };
   }
 
-  const spec = specResult.value as any;
-  if (typeof spec.set !== 'function') {
+  const res = resResult.value as any;
+
+  // Check if the proto has a set method (added by withSet)
+  if (typeof res.set !== 'function') {
     return { ok: false, error: `Property at ${uri} is not mutable` };
   }
 
-  const result = spec.set(value);
-  if (!result.ok) {
-    return { ok: false, error: result.error };
+  try {
+    res.set(value);
+    return { ok: true, value: { uri, updated: true } };
+  } catch (e: any) {
+    return { ok: false, error: `Set failed: ${e.message || e}` };
   }
-
-  return { ok: true, value: { uri, updated: true } };
 }
 
 // ============================================================================
@@ -60,22 +56,29 @@ function toolSet(uri: string, value: any): ToolResult {
 // ============================================================================
 
 function toolMake(collectionUri: string, properties: Record<string, any>): ToolResult {
-  const specResult = specifierFromURI(collectionUri);
-  if (!specResult.ok) {
-    return { ok: false, error: specResult.error };
+  const resResult = resolveURI(collectionUri);
+  if (!resResult.ok) {
+    return { ok: false, error: resResult.error };
   }
 
-  const spec = specResult.value as any;
-  if (typeof spec.create !== 'function') {
-    return { ok: false, error: `Collection at ${collectionUri} does not support creating items` };
+  const res = resResult.value as any;
+
+  // Check if proto has create method (from withCreate) or use delegate
+  if (typeof res.create === 'function') {
+    const result = res.create(properties);
+    if (!result.ok) {
+      return { ok: false, error: result.error };
+    }
+    return { ok: true, value: { uri: result.value._delegate.uri().href } };
   }
 
-  const result = spec.create(properties);
-  if (!result.ok) {
-    return { ok: false, error: result.error };
+  // Fall back to delegate create
+  const createResult = res._delegate.create(properties);
+  if (!createResult.ok) {
+    return { ok: false, error: createResult.error };
   }
 
-  return { ok: true, value: result.value };
+  return { ok: true, value: { uri: createResult.value.href } };
 }
 
 // ============================================================================
@@ -83,147 +86,81 @@ function toolMake(collectionUri: string, properties: Record<string, any>): ToolR
 // ============================================================================
 
 function toolMove(itemUri: string, destinationCollectionUri: string): ToolResult {
+  // Guard: Cannot move mailboxes
+  if (itemUri.match(/\/mailboxes\/[^/]+$/) || itemUri.match(/\/mailboxes\[\d+\]$/)) {
+    if (!itemUri.includes('/messages')) {
+      return { ok: false, error: `Cannot move mailboxes. Use Mail.app directly to manage mailboxes.` };
+    }
+  }
+
   // Get source item
-  const itemResult = specifierFromURI(itemUri);
+  const itemResult = resolveURI(itemUri);
   if (!itemResult.ok) {
     return { ok: false, error: itemResult.error };
   }
 
   // Get destination collection
-  const destResult = specifierFromURI(destinationCollectionUri);
+  const destResult = resolveURI(destinationCollectionUri);
   if (!destResult.ok) {
     return { ok: false, error: destResult.error };
   }
 
-  const itemSpec = itemResult.value as any;
-  const destSpec = destResult.value as any;
+  const item = itemResult.value as any;
+  const dest = destResult.value as any;
 
-  // Check source has _jxa for move operation
-  if (!itemSpec._jxa) {
-    return { ok: false, error: `Cannot move item at ${itemUri}: no JXA reference` };
-  }
-
-  // Check destination supports creation
-  if (typeof destSpec.create !== 'function' && !destSpec._jxa) {
-    return { ok: false, error: `Destination ${destinationCollectionUri} does not support receiving items` };
-  }
-
-  // For messages, set the mailbox property
-  if (itemUri.includes('/messages')) {
-    try {
-      // Get destination mailbox JXA reference
-      let destMailbox: any;
-      let destMailboxUri = destinationCollectionUri;
-
-      // If destination is a messages collection, get the parent mailbox
-      if (destinationCollectionUri.endsWith('/messages')) {
-        destMailboxUri = destinationCollectionUri.replace(/\/messages$/, '');
-      }
-
-      const mailboxResult = specifierFromURI(destMailboxUri);
-      if (!mailboxResult.ok) {
-        return { ok: false, error: `Cannot find mailbox for ${destinationCollectionUri}` };
-      }
-      destMailbox = (mailboxResult.value as any)._jxa;
-
-      if (!destMailbox) {
-        return { ok: false, error: `Destination ${destMailboxUri} is not a valid mailbox` };
-      }
-
-      // Get RFC messageId before move (stable identifier, unlike id which changes)
-      const rfcId = itemSpec._jxa.messageId();
-
-      // Move by setting the mailbox property
-      itemSpec._jxa.mailbox = destMailbox;
-
-      // Re-find in new location by messageId
-      try {
-        const moved = destMailbox.messages.whose({ messageId: rfcId })[0];
-        const newId = moved.id();
-        return { ok: true, value: { uri: `${destMailboxUri}/messages/${newId}` } };
-      } catch {
-        // Fallback: return destination mailbox URI if we can't find the specific message
-        return { ok: true, value: { uri: `${destMailboxUri}/messages` } };
-      }
-    } catch (e: any) {
-      return { ok: false, error: `Move failed: ${e.message}` };
+  // Check if item has move method (from withMove)
+  if (typeof item.move === 'function') {
+    const moveResult = item.move(dest);
+    if (!moveResult.ok) {
+      return { ok: false, error: moveResult.error };
     }
+    return { ok: true, value: { uri: moveResult.value._delegate.uri().href } };
   }
 
-  // For other objects, would need take + make semantics
-  return { ok: false, error: `Move not implemented for this object type` };
+  // Fall back to delegate moveTo
+  const moveResult = item._delegate.moveTo(dest._delegate);
+  if (!moveResult.ok) {
+    return { ok: false, error: moveResult.error };
+  }
+
+  return { ok: true, value: { uri: moveResult.value.href } };
 }
 
 // ============================================================================
-// Delete Tool - Delete objects with mailbox guard and message→trash override
+// Delete Tool - Delete objects with mailbox guard
 // ============================================================================
 
 function toolDelete(itemUri: string): ToolResult {
   // Guard: Cannot delete mailboxes
   if (itemUri.match(/\/mailboxes\/[^/]+$/) || itemUri.match(/\/mailboxes\[\d+\]$/)) {
-    // But allow if it's a message in a mailbox
     if (!itemUri.includes('/messages')) {
       return { ok: false, error: `Cannot delete mailboxes. Use Mail.app directly to manage mailboxes.` };
     }
   }
 
-  const itemResult = specifierFromURI(itemUri);
+  const itemResult = resolveURI(itemUri);
   if (!itemResult.ok) {
     return { ok: false, error: itemResult.error };
   }
 
-  const itemSpec = itemResult.value as any;
-  if (!itemSpec._jxa) {
-    return { ok: false, error: `Cannot delete item at ${itemUri}: no JXA reference` };
-  }
+  const item = itemResult.value as any;
 
-  // For messages, move to trash instead of deleting
-  if (itemUri.includes('/messages')) {
-    try {
-      // Find the account's trash mailbox
-      // Parse URI to find account
-      const accountMatch = itemUri.match(/mail:\/\/accounts\[(\d+)\]/);
-      let trashMailbox: any;
-
-      if (accountMatch) {
-        const accountUri = `mail://accounts[${accountMatch[1]}]`;
-        const accountResult = specifierFromURI(accountUri);
-        if (accountResult.ok) {
-          const accountSpec = accountResult.value as any;
-          if (accountSpec._jxa) {
-            trashMailbox = accountSpec._jxa.trashMailbox;
-          }
-        }
-      }
-
-      // Fallback to app-level trash
-      if (!trashMailbox) {
-        const trashResult = specifierFromURI('mail://trash');
-        if (trashResult.ok) {
-          trashMailbox = (trashResult.value as any)._jxa;
-        }
-      }
-
-      if (!trashMailbox) {
-        return { ok: false, error: `Cannot find trash mailbox` };
-      }
-
-      // Move to trash
-      itemSpec._jxa.move({ to: trashMailbox });
-
-      return { ok: true, value: { deleted: true, movedToTrash: true, uri: itemUri } };
-    } catch (e: any) {
-      return { ok: false, error: `Delete (move to trash) failed: ${e.message}` };
+  // Check if item has delete method (from withDelete)
+  if (typeof item.delete === 'function') {
+    const deleteResult = item.delete();
+    if (!deleteResult.ok) {
+      return { ok: false, error: deleteResult.error };
     }
+    return { ok: true, value: { deleted: true, uri: itemUri } };
   }
 
-  // For other objects, actually delete
-  try {
-    itemSpec._jxa.delete();
-    return { ok: true, value: { deleted: true, uri: itemUri } };
-  } catch (e: any) {
-    return { ok: false, error: `Delete failed: ${e.message}` };
+  // Fall back to delegate delete
+  const deleteResult = item._delegate.delete();
+  if (!deleteResult.ok) {
+    return { ok: false, error: deleteResult.error };
   }
+
+  return { ok: true, value: { deleted: true, uri: itemUri } };
 }
 
 // ============================================================================

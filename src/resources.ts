@@ -5,30 +5,31 @@
 // ============================================================================
 
 function readResource(uri: string): { mimeType: string; text: string | object; fixedUri?: string } | null {
-  const spec = specifierFromURI(uri);
-  if (!spec.ok) {
+  const resResult = resolveURI(uri);
+  if (!resResult.ok) {
     // Return null to trigger JSON-RPC error response
     return null;
   }
 
-  const result = spec.value.resolve();
-  if (!result.ok) {
-    // Return null to trigger JSON-RPC error response
-    return null;
-  }
+  const res = resResult.value;
 
-  // Try to get a stable reference URI via fix()
-  let fixedUri: string | undefined;
-  const fixed = spec.value.fix();
-  if (fixed.ok && fixed.value.uri !== uri) {
-    fixedUri = fixed.value.uri;
-    // Update _uri in result if it's an object
-    if (result.value && typeof result.value === 'object' && '_uri' in result.value) {
-      (result.value as any)._uri = fixedUri;
+  try {
+    const data = res.resolve();
+
+    // Get the canonical URI from the delegate
+    const canonicalUri = res._delegate.uri().href;
+    const fixedUri = canonicalUri !== uri ? canonicalUri : undefined;
+
+    // Add _uri to the result if it's an object
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      (data as any)._uri = fixedUri || uri;
     }
-  }
 
-  return { mimeType: 'application/json', text: result.value, fixedUri };
+    return { mimeType: 'application/json', text: data, fixedUri };
+  } catch (e: any) {
+    // Return null to trigger JSON-RPC error response
+    return null;
+  }
 }
 
 function listResources(): McpResource[] {
@@ -48,18 +49,20 @@ function listResources(): McpResource[] {
     { uri: 'mail://settings', name: 'Settings', description: 'Mail.app preferences' }
   ];
 
-  const spec = specifierFromURI('mail://accounts');
-  if (spec.ok) {
-    const result = spec.value.resolve();
-    if (result.ok) {
-      for (let i = 0; i < result.value.length; i++) {
-        const acc = result.value[i];
+  const resResult = resolveURI('mail://accounts');
+  if (resResult.ok) {
+    try {
+      const accounts = resResult.value.resolve() as any[];
+      for (let i = 0; i < accounts.length; i++) {
+        const acc = accounts[i];
         resources.push({
           uri: `mail://accounts[${i}]`,
           name: acc.name,
           description: `Account: ${acc.fullName}`
         });
       }
+    } catch {
+      // Silently ignore if we can't resolve accounts
     }
   }
 
