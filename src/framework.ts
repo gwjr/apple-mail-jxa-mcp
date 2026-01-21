@@ -24,8 +24,8 @@ declare const CreateableBrand: unique symbol;
 // Root Marker (for parent navigation)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Use a runtime symbol for the RootMarker
-const RootBrand: unique symbol = Symbol('RootBrand') as any;
+// Explicit unique symbol type - used directly in type literal (no typeof needed)
+const RootBrand: unique symbol = Symbol('RootBrand');
 type RootMarker = { readonly [RootBrand]: true };
 const ROOT: RootMarker = { [RootBrand]: true } as RootMarker;
 
@@ -373,9 +373,9 @@ type MoveHandler = (item: Delegate, destCollection: Delegate) => Result<URL>;
 type DeleteHandler = (item: Delegate) => Result<URL>;
 type CreateHandler = (collection: Delegate, properties: Record<string, any>) => Result<URL>;
 
-// Moveable proto interface - takes Res<CollectionProto<Item>> (which has _delegate)
+// Moveable proto interface - generic constraint makes error messages clearer
 interface MoveableProto<Item> {
-  move(to: Res<CollectionProto<Item>>): Result<Res<Item>>;
+  move<C extends CollectionProto<Item>>(to: Res<C>): Result<Res<Item>>;
 }
 
 // Composer: adds move() with optional custom handler
@@ -384,7 +384,7 @@ function withMove<Item extends object>(itemProto: Item, handler?: MoveHandler) {
   return function<P extends BaseProtoType>(proto: P): P & MoveableProto<Item> & { readonly [MoveableBrand]: true } {
     const result = {
       ...proto,
-      move(this: { _delegate: Delegate }, to: Res<CollectionProto<Item>>): Result<Res<Item>> {
+      move<C extends CollectionProto<Item>>(this: { _delegate: Delegate }, to: Res<C>): Result<Res<Item>> {
         const urlResult = handler
           ? handler(this._delegate, to._delegate)
           : this._delegate.moveTo(to._delegate);

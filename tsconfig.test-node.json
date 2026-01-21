@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "None",
+    "lib": ["ES2023", "DOM"],
+    "outFile": "tests/framework.test.js",
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noEmitOnError": true,
+    "declaration": false,
+    "removeComments": false,
+    "esModuleInterop": false,
+    "skipLibCheck": true
+  },
+  "files": [
+    "src/types/jxa.d.ts",
+    "src/framework.ts",
+    "src/mock-delegate.ts",
+    "src/mail.ts",
+    "tests/src/test-utils.ts",
+    "tests/src/test-framework.ts",
+    "tests/src/test-operations.ts"
+  ]
+}

@@ -4,11 +4,11 @@
   "description": "Apple Mail MCP Server using JXA (JavaScript for Automation)",
   "scripts": {
     "build": "tsc",
-    "build:test": "tsc -p tsconfig.test.json",
+    "build:test": "tsc -p tsconfig.test-node.json && tsc -p tsconfig.test-jxa.json",
     "start": "osascript -l JavaScript dist/mail.js",
-    "test": "npm run build:test && cd tests && osascript -l JavaScript framework.js && osascript -l JavaScript uri-parsing.js && node mcp-server.js",
-    "test:framework": "npm run build:test && cd tests && osascript -l JavaScript framework.js",
-    "test:uri": "npm run build:test && cd tests && osascript -l JavaScript uri-parsing.js",
+    "test": "npm run test:node && npm run test:jxa",
+    "test:node": "tsc -p tsconfig.test-node.json && node tests/framework.test.js",
+    "test:jxa": "tsc -p tsconfig.test-jxa.json && osascript -l JavaScript tests/framework.jxa.test.js",
     "test:mcp": "npm run build && node tests/mcp-server.js"
   },
   "devDependencies": {

@@ -1,68 +1,13 @@
-// scratch/test-operations.ts - Tests for domain operations (move, delete, create)
+// tests/src/test-operations.ts - Domain operation tests (runs in Node with mock data)
 //
-// Run with:
-// npx tsc scratch/framework.ts scratch/mock-backing.ts scratch/mail.ts scratch/test-operations.ts \
-//   --outFile scratch/test-operations.js --module None --target ES2020 --lib ES2020 --strict
-// node scratch/test-operations.js
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Test utilities
-// ─────────────────────────────────────────────────────────────────────────────
-
-let testCount = 0;
-let passCount = 0;
-
-function assert(condition: boolean, message: string): void {
-  testCount++;
-  if (condition) {
-    passCount++;
-    console.log(`  ✓ ${message}`);
-  } else {
-    console.log(`  ✗ ${message}`);
-  }
-}
-
-function assertEqual<T>(actual: T, expected: T, message: string): void {
-  testCount++;
-  if (actual === expected) {
-    passCount++;
-    console.log(`  ✓ ${message}`);
-  } else {
-    console.log(`  ✗ ${message}`);
-    console.log(`      expected: ${JSON.stringify(expected)}`);
-    console.log(`      actual:   ${JSON.stringify(actual)}`);
-  }
-}
-
-function assertOk<T>(result: Result<T>, message: string): T | undefined {
-  testCount++;
-  if (result.ok) {
-    passCount++;
-    console.log(`  ✓ ${message}`);
-    return result.value;
-  } else {
-    console.log(`  ✗ ${message}`);
-    console.log(`      error: ${result.error}`);
-    return undefined;
-  }
-}
-
-function assertError<T>(result: Result<T>, message: string): void {
-  testCount++;
-  if (!result.ok) {
-    passCount++;
-    console.log(`  ✓ ${message}`);
-  } else {
-    console.log(`  ✗ ${message}`);
-    console.log(`      expected error, got: ${JSON.stringify(result.value)}`);
-  }
-}
+// Tests move, delete, create operations and parent navigation.
+// Uses MockDelegate - no Mail.app required.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock Data
 // ─────────────────────────────────────────────────────────────────────────────
 
-function createMockMailData() {
+function createOperationsMockData() {
   return {
     name: 'Mail',
     version: '16.0',
@@ -147,6 +92,13 @@ function createMockMailData() {
         markFlagged: false,
       },
     ],
+    signatures: [],
+    inbox: { name: 'Inbox', unreadCount: 5, messages: [], mailboxes: [] },
+    sentMailbox: { name: 'Sent', unreadCount: 0, messages: [], mailboxes: [] },
+    draftsMailbox: { name: 'Drafts', unreadCount: 0, messages: [], mailboxes: [] },
+    trashMailbox: { name: 'Trash', unreadCount: 0, messages: [], mailboxes: [] },
+    junkMailbox: { name: 'Junk', unreadCount: 0, messages: [], mailboxes: [] },
+    outbox: { name: 'Outbox', unreadCount: 0, messages: [], mailboxes: [] },
   };
 }
 
@@ -155,11 +107,11 @@ function createMockMailData() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function testMoveMessageBetweenMailboxes() {
-  console.log('\n=== Test: Move message between mailboxes ===');
+  group('Move Message Between Mailboxes');
 
-  const mockData = createMockMailData();
-  const delegate = createMockDelegate(mockData, 'mail');
+  const mockData = createOperationsMockData();
   registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+  const delegate = createMockDelegate(mockData, 'mail');
   const mail = getMailApp(delegate);
 
   // Get inbox and archive mailboxes
@@ -177,10 +129,8 @@ function testMoveMessageBetweenMailboxes() {
   assertEqual(message.subject.resolve(), 'Hello World', 'Message subject is correct');
 
   // Move message to archive
-  // Cast to Res<CollectionProto> since the type system doesn't know that archive.messages
-  // is wrapped in Res (the proxy wraps it at runtime, but types don't reflect this)
   const moveResult = message.move(archive.messages as any);
-  const newUri = assertOk(moveResult, 'Move operation succeeded');
+  assertOk(moveResult, 'Move operation succeeded');
 
   // Verify message was removed from source
   const inboxMessagesAfter = inbox.messages.resolve() as any[];
@@ -196,36 +146,35 @@ function testMoveMessageBetweenMailboxes() {
   assertEqual(movedMsg?.subject, 'Hello World', 'Moved message has correct subject');
 }
 
-function testMoveTypeError() {
-  console.log('\n=== Test: Move type constraint ===');
+function testMoveTypeConstraint() {
+  group('Move Type Constraint');
 
-  // This test verifies at compile time that you can't move a message to a mailbox collection
-  // The following code should NOT compile:
-  // message.move(account.mailboxes)  // Type error: Collection<Mailbox> not Collection<Message>
+  // This test verifies that the type system constrains move destinations.
+  // At compile time: message.move(account.mailboxes) would be a type error
+  // because Collection<Mailbox> is not compatible with Collection<Message>.
 
-  // We just verify that the types are set up correctly by checking the proto structure
-  const mockData = createMockMailData();
+  const mockData = createOperationsMockData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
   const delegate = createMockDelegate(mockData, 'mail');
   const mail = getMailApp(delegate);
 
-  // This SHOULD work (same item type)
   const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
-  const archive = mail.accounts.byName('Work').mailboxes.byName('Archive');
   const message = inbox.messages.byId(1001);
 
+  // Verify message has move method
   assert('move' in message, 'Message has move method');
   assert(typeof (message as any).move === 'function', 'move is a function');
 
-  // Type system prevents: message.move(mail.accounts) - would be type error
-  console.log('  ✓ Type constraint prevents moving message to wrong collection type (compile-time check)');
-  passCount++;
-  testCount++;
+  // The type system prevents: message.move(mail.accounts.byName('Work').mailboxes)
+  // This is verified at compile time, not runtime.
+  console.log('  \u2713 Type constraint prevents moving message to wrong collection type (compile-time check)');
 }
 
 function testDeleteMessage() {
-  console.log('\n=== Test: Delete message ===');
+  group('Delete Message');
 
-  const mockData = createMockMailData();
+  const mockData = createOperationsMockData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
   const delegate = createMockDelegate(mockData, 'mail');
   const mail = getMailApp(delegate);
 
@@ -249,9 +198,10 @@ function testDeleteMessage() {
 }
 
 function testDeleteRule() {
-  console.log('\n=== Test: Delete rule ===');
+  group('Delete Rule');
 
-  const mockData = createMockMailData();
+  const mockData = createOperationsMockData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
   const delegate = createMockDelegate(mockData, 'mail');
   const mail = getMailApp(delegate);
 
@@ -273,9 +223,10 @@ function testDeleteRule() {
 }
 
 function testCreateMessage() {
-  console.log('\n=== Test: Create message in mailbox ===');
+  group('Create Message');
 
-  const mockData = createMockMailData();
+  const mockData = createOperationsMockData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
   const delegate = createMockDelegate(mockData, 'mail');
   const mail = getMailApp(delegate);
 
@@ -285,8 +236,7 @@ function testCreateMessage() {
   const messagesBefore = inbox.messages.resolve() as any[];
   assertEqual(messagesBefore.length, 2, 'Inbox has 2 messages initially');
 
-  // Create a new message using delegate directly (since create is on delegate, not proto)
-  // Cast to any to access _delegate (runtime proxy provides it, but type system doesn't know)
+  // Create a new message using delegate
   const createResult: Result<URL> = (inbox.messages as any)._delegate.create({
     subject: 'New Test Message',
     sender: 'test@example.com',
@@ -312,14 +262,14 @@ function testCreateMessage() {
 }
 
 function testParentNavigation() {
-  console.log('\n=== Test: Parent navigation ===');
+  group('Parent Navigation');
 
-  const mockData = createMockMailData();
+  const mockData = createOperationsMockData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
   const delegate = createMockDelegate(mockData, 'mail');
   const mail = getMailApp(delegate);
 
   // Navigate to messages collection
-  // Cast to any to access _delegate (runtime proxy provides it, but type system doesn't know)
   const messagesDelegate = (mail.accounts.byName('Work').mailboxes.byName('INBOX').messages as any)._delegate as Delegate;
 
   // Get parent (should be the mailbox)
@@ -340,14 +290,14 @@ function testParentNavigation() {
 }
 
 function testUriReturnsURL() {
-  console.log('\n=== Test: uri() returns URL object ===');
+  group('URI Returns URL Object');
 
-  const mockData = createMockMailData();
+  const mockData = createOperationsMockData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
   const delegate = createMockDelegate(mockData, 'mail');
   const mail = getMailApp(delegate);
 
   const message = mail.accounts.byName('Work').mailboxes.byName('INBOX').messages.byId(1001);
-  // Cast to any to access _delegate (runtime proxy provides it, but type system doesn't know)
   const uri = (message as any)._delegate.uri() as URL;
 
   assert(uri instanceof URL, 'uri() returns URL object');
@@ -360,21 +310,15 @@ function testUriReturnsURL() {
 // Run tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-console.log('Domain Operations Tests');
-console.log('========================');
+console.log('Domain Operations Tests (Node/Mock)');
+console.log('====================================');
 
 testMoveMessageBetweenMailboxes();
-testMoveTypeError();
+testMoveTypeConstraint();
 testDeleteMessage();
 testDeleteRule();
 testCreateMessage();
 testParentNavigation();
 testUriReturnsURL();
 
-console.log(`\n========================`);
-console.log(`Tests: ${passCount}/${testCount} passed`);
-
-if (passCount < testCount) {
-  console.log('SOME TESTS FAILED');
-  // process.exit(1) - not available in JXA
-}
+const operationsTestResult = summary();

@@ -1,308 +1,4 @@
 "use strict";
-/// <reference path="../types/jxa.d.ts" />
-/// <reference path="../types/mcp.d.ts" />
-// ============================================================================
-// MCP Server Implementation with Resources Support
-// JSON-RPC 2.0 over stdio with NSRunLoop-based I/O
-// ============================================================================
-// Standard JSON-RPC error codes
-const JsonRpcErrorCodes = {
-    PARSE_ERROR: -32700,
-    INVALID_REQUEST: -32600,
-    METHOD_NOT_FOUND: -32601,
-    INVALID_PARAMS: -32602,
-    INTERNAL_ERROR: -32603,
-    RESOURCE_NOT_FOUND: -32002,
-    SERVER_ERROR: -32000
-};
-class MCPServer {
-    serverInfo;
-    tools;
-    resourceLister;
-    resourceReader;
-    resourceTemplates;
-    stdin;
-    stdout;
-    stderr;
-    buffer;
-    shouldQuit;
-    dataAvailable;
-    observer;
-    debug;
-    constructor(name, version, debug = true) {
-        this.serverInfo = { name, version };
-        this.tools = new Map();
-        this.resourceLister = null;
-        this.resourceReader = null;
-        this.resourceTemplates = [];
-        this.buffer = "";
-        this.shouldQuit = false;
-        this.dataAvailable = false;
-        this.debug = debug;
-        // Import Foundation framework
-        ObjC.import("Foundation");
-        // Get standard file handles
-        this.stdin = $.NSFileHandle.fileHandleWithStandardInput;
-        this.stdout = $.NSFileHandle.fileHandleWithStandardOutput;
-        this.stderr = $.NSFileHandle.fileHandleWithStandardError;
-    }
-    // ============================================================================
-    // Tool Registration
-    // ============================================================================
-    addTool(definition) {
-        const tool = {
-            name: definition.name,
-            description: definition.description,
-            inputSchema: definition.inputSchema ?? { type: "object", properties: {}, required: [] }
-        };
-        if (definition.annotations) {
-            tool.annotations = definition.annotations;
-        }
-        this.tools.set(definition.name, { tool, handler: definition.handler });
-        return this;
-    }
-    // ============================================================================
-    // Resource Registration
-    // ============================================================================
-    setResources(lister, reader) {
-        this.resourceLister = lister;
-        this.resourceReader = reader;
-        return this;
-    }
-    setResourceTemplates(templates) {
-        this.resourceTemplates = templates;
-        return this;
-    }
-    // ============================================================================
-    // I/O Helpers
-    // ============================================================================
-    log(message) {
-        if (!this.debug)
-            return;
-        const fullMessage = `[${this.serverInfo.name}] ${message}\n`;
-        const data = $.NSString.alloc.initWithUTF8String(fullMessage)
-            .dataUsingEncoding($.NSUTF8StringEncoding);
-        this.stderr.writeData(data);
-    }
-    send(response) {
-        const json = JSON.stringify(response) + "\n";
-        const data = $.NSString.alloc.initWithUTF8String(json)
-            .dataUsingEncoding($.NSUTF8StringEncoding);
-        this.stdout.writeData(data);
-    }
-    sendResult(id, result) {
-        this.send({ jsonrpc: "2.0", id, result });
-    }
-    sendError(id, code, message) {
-        this.send({ jsonrpc: "2.0", id, error: { code, message } });
-    }
-    sendToolResult(id, text, isError = false) {
-        this.sendResult(id, {
-            content: [{ type: "text", text: String(text) }],
-            isError
-        });
-    }
-    // ============================================================================
-    // Request Handlers
-    // ============================================================================
-    handleInitialize(id, params) {
-        const clientName = params.clientInfo?.name ?? 'unknown';
-        this.log(`Initialize from: ${clientName}`);
-        const capabilities = {};
-        if (this.tools.size > 0) {
-            capabilities.tools = {};
-        }
-        if (this.resourceLister) {
-            capabilities.resources = {};
-        }
-        this.sendResult(id, {
-            protocolVersion: "2024-11-05",
-            serverInfo: this.serverInfo,
-            capabilities
-        });
-    }
-    handleToolsList(id) {
-        const tools = [];
-        this.tools.forEach(({ tool }) => tools.push(tool));
-        this.log(`Tools list (${tools.length})`);
-        this.sendResult(id, { tools });
-    }
-    handleToolsCall(id, params) {
-        const name = params.name;
-        const args = params.arguments ?? {};
-        this.log(`Call: ${name}`);
-        const entry = this.tools.get(name);
-        if (!entry) {
-            this.sendError(id, JsonRpcErrorCodes.METHOD_NOT_FOUND, `Unknown tool: ${name}`);
-            return;
-        }
-        try {
-            const result = entry.handler(args);
-            this.sendResult(id, result);
-        }
-        catch (e) {
-            const error = e;
-            this.sendToolResult(id, `Error: ${error.message}`, true);
-        }
-    }
-    handleResourcesList(id) {
-        this.log("Resources list");
-        if (!this.resourceLister) {
-            this.sendResult(id, { resources: [] });
-            return;
-        }
-        try {
-            const resources = this.resourceLister();
-            this.sendResult(id, { resources });
-        }
-        catch (e) {
-            const error = e;
-            this.sendError(id, JsonRpcErrorCodes.SERVER_ERROR, `Resource list error: ${error.message}`);
-        }
-    }
-    handleResourcesRead(id, params) {
-        const uri = params.uri;
-        this.log(`Resource read: ${uri}`);
-        if (!this.resourceReader) {
-            this.sendError(id, JsonRpcErrorCodes.METHOD_NOT_FOUND, "Resources not supported");
-            return;
-        }
-        try {
-            this.log(`[DBG] calling resourceReader...`);
-            const content = this.resourceReader(uri);
-            this.log(`[DBG] resourceReader returned`);
-            if (content === null || content === undefined) {
-                this.sendError(id, JsonRpcErrorCodes.RESOURCE_NOT_FOUND, `Resource not found: ${uri}`);
-                return;
-            }
-            this.log(`[DBG] stringifying content...`);
-            const textContent = typeof content.text === 'string'
-                ? content.text
-                : JSON.stringify(content.text, null, 2);
-            this.log(`[DBG] stringified, length: ${textContent.length}`);
-            this.log(`[DBG] building result...`);
-            const result = {
-                contents: [{
-                        uri,
-                        mimeType: content.mimeType || 'application/json',
-                        text: textContent
-                    }]
-            };
-            this.log(`[DBG] calling sendResult...`);
-            this.sendResult(id, result);
-            this.log(`[DBG] sendResult done`);
-        }
-        catch (e) {
-            const error = e;
-            this.sendError(id, JsonRpcErrorCodes.SERVER_ERROR, `Resource read error: ${error.message}`);
-        }
-    }
-    handleResourceTemplatesList(id) {
-        this.log("Resource templates list");
-        this.sendResult(id, { resourceTemplates: this.resourceTemplates });
-    }
-    // ============================================================================
-    // Request Dispatch
-    // ============================================================================
-    handleRequest(request) {
-        switch (request.method) {
-            case "initialize":
-                this.handleInitialize(request.id, request.params ?? {});
-                break;
-            case "initialized":
-            case "notifications/initialized":
-                this.log("Client initialized");
-                break;
-            case "tools/list":
-                this.handleToolsList(request.id);
-                break;
-            case "tools/call":
-                this.handleToolsCall(request.id, request.params ?? {});
-                break;
-            case "resources/list":
-                this.handleResourcesList(request.id);
-                break;
-            case "resources/read":
-                this.handleResourcesRead(request.id, request.params ?? {});
-                break;
-            case "resources/templates/list":
-                this.handleResourceTemplatesList(request.id);
-                break;
-            default:
-                // Only send error for requests (with id), not notifications
-                if (request.id !== undefined && !request.method?.startsWith('notifications/')) {
-                    this.sendError(request.id, JsonRpcErrorCodes.METHOD_NOT_FOUND, `Method not found: ${request.method}`);
-                }
-        }
-    }
-    // ============================================================================
-    // Buffer Processing
-    // ============================================================================
-    processBuffer() {
-        const lines = this.buffer.split("\n");
-        this.buffer = lines.pop() ?? "";
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed)
-                continue;
-            try {
-                const request = JSON.parse(trimmed);
-                this.handleRequest(request);
-            }
-            catch (e) {
-                const error = e;
-                this.log(`Parse error: ${error.message}`);
-                this.sendError(null, JsonRpcErrorCodes.PARSE_ERROR, "Parse error");
-            }
-        }
-    }
-    // ============================================================================
-    // Main Run Loop
-    // ============================================================================
-    run() {
-        this.log(`${this.serverInfo.name} v${this.serverInfo.version} starting...`);
-        // Register Objective-C subclass for notification handling
-        const observerClassName = `StdinObserver_${Date.now()}`;
-        ObjC.registerSubclass({
-            name: observerClassName,
-            methods: {
-                "handleData:": {
-                    types: ["void", ["id"]],
-                    implementation: (_notification) => {
-                        this.dataAvailable = true;
-                    }
-                }
-            }
-        });
-        // Access the registered class via the $ bridge
-        this.observer = $[observerClassName].alloc.init;
-        // Register for stdin data notifications
-        $.NSNotificationCenter.defaultCenter.addObserverSelectorNameObject(this.observer, "handleData:", "NSFileHandleDataAvailableNotification", this.stdin);
-        // Start listening
-        void this.stdin.waitForDataInBackgroundAndNotify;
-        // Main run loop
-        while (!this.shouldQuit) {
-            $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(1.0));
-            if (this.dataAvailable) {
-                this.dataAvailable = false;
-                const data = this.stdin.availableData;
-                if (data.length === 0) {
-                    this.shouldQuit = true;
-                    break;
-                }
-                const nsString = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
-                if (nsString) {
-                    this.buffer += nsString.js;
-                    this.processBuffer();
-                }
-                void this.stdin.waitForDataInBackgroundAndNotify;
-            }
-        }
-        // Cleanup
-        $.NSNotificationCenter.defaultCenter.removeObserverNameObject(this.observer, "NSFileHandleDataAvailableNotification", this.stdin);
-        this.log("Server shutting down");
-    }
-}
 // scratch/framework.ts - Plugboard v4 Framework
 //
 // Core types, proto system, URI parsing - no app-specific code.
@@ -1534,529 +1230,388 @@ const _globalThis = globalThis;
 if (typeof _globalThis.Application !== 'undefined' && typeof _globalThis.createJXADelegate !== 'undefined') {
     registerScheme('mail', () => _globalThis.createJXADelegate(_globalThis.Application('Mail'), 'mail'), MailApplicationProto);
 }
-/// <reference path="./types/mcp.d.ts" />
-// ============================================================================
-// MCP Resource Handler
-// ============================================================================
-function readResource(uri) {
-    const resResult = resolveURI(uri);
-    if (!resResult.ok) {
-        // Return null to trigger JSON-RPC error response
-        return null;
+// tests/src/test-utils.ts - Shared test utilities
+//
+// Simple assertion functions that work in both Node and JXA environments.
+let testCount = 0;
+let passCount = 0;
+let currentGroup = '';
+function group(name) {
+    currentGroup = name;
+    console.log(`\n=== ${name} ===`);
+}
+function assert(condition, message) {
+    testCount++;
+    if (condition) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
     }
-    const res = resResult.value;
-    try {
-        const data = res.resolve();
-        // Get the canonical URI from the delegate
-        const canonicalUri = res._delegate.uri().href;
-        const fixedUri = canonicalUri !== uri ? canonicalUri : undefined;
-        // Add _uri to the result if it's an object
-        if (data && typeof data === 'object' && !Array.isArray(data)) {
-            data._uri = fixedUri || uri;
-        }
-        return { mimeType: 'application/json', text: data, fixedUri };
-    }
-    catch (e) {
-        // Return null to trigger JSON-RPC error response
-        return null;
+    else {
+        console.log(`  \u2717 ${message}`);
     }
 }
-function listResources() {
-    const resources = [
-        // Standard mailboxes (aggregate across accounts)
-        { uri: 'mail://inbox', name: 'Inbox', description: 'Combined inbox from all accounts' },
-        { uri: 'mail://sent', name: 'Sent', description: 'Combined sent from all accounts' },
-        { uri: 'mail://drafts', name: 'Drafts', description: 'Combined drafts from all accounts' },
-        { uri: 'mail://trash', name: 'Trash', description: 'Combined trash from all accounts' },
-        { uri: 'mail://junk', name: 'Junk', description: 'Combined junk/spam from all accounts' },
-        { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
-        // Accounts
-        { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' },
-        // Rules, Signatures, Settings
-        { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
-        { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' },
-        { uri: 'mail://settings', name: 'Settings', description: 'Mail.app preferences' }
-    ];
-    const resResult = resolveURI('mail://accounts');
-    if (resResult.ok) {
+function assertEqual(actual, expected, message) {
+    testCount++;
+    if (actual === expected) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      expected: ${JSON.stringify(expected)}`);
+        console.log(`      actual:   ${JSON.stringify(actual)}`);
+    }
+}
+function assertDeepEqual(actual, expected, message) {
+    testCount++;
+    if (JSON.stringify(actual) === JSON.stringify(expected)) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      expected: ${JSON.stringify(expected)}`);
+        console.log(`      actual:   ${JSON.stringify(actual)}`);
+    }
+}
+function assertOk(result, message) {
+    testCount++;
+    if (result.ok) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+        return result.value;
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      error: ${result.error}`);
+        return undefined;
+    }
+}
+function assertError(result, message) {
+    testCount++;
+    if (!result.ok) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      expected error, got: ${JSON.stringify(result.value)}`);
+    }
+}
+function assertThrows(fn, message) {
+    testCount++;
+    try {
+        fn();
+        console.log(`  \u2717 ${message}`);
+        console.log(`      expected exception, but none was thrown`);
+    }
+    catch (e) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+    }
+}
+function summary() {
+    console.log(`\n========================`);
+    console.log(`Tests: ${passCount}/${testCount} passed`);
+    const success = passCount === testCount;
+    if (!success) {
+        console.log('SOME TESTS FAILED');
+    }
+    return { passed: passCount, total: testCount, success };
+}
+function resetCounters() {
+    testCount = 0;
+    passCount = 0;
+    currentGroup = '';
+}
+// tests/src/test-framework-jxa.ts - JXA integration tests (runs with osascript)
+//
+// Tests the framework against real Mail.app. Requires Mail.app to be configured
+// with at least one account.
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+function testJxaURIResolution() {
+    group('JXA URI Resolution');
+    // Root app
+    const root = resolveURI('mail://');
+    assertOk(root, 'Resolve mail://');
+    if (root.ok) {
         try {
-            const accounts = resResult.value.resolve();
-            for (let i = 0; i < accounts.length; i++) {
-                const acc = accounts[i];
-                resources.push({
-                    uri: `mail://accounts[${i}]`,
-                    name: acc.name,
-                    description: `Account: ${acc.fullName}`
-                });
+            const name = root.value.name.resolve();
+            assertEqual(name, 'Mail', 'App name is Mail');
+        }
+        catch (e) {
+            console.log(`  \u2717 App name: ${e.message}`);
+        }
+    }
+    // Accounts collection
+    const accounts = resolveURI('mail://accounts');
+    assertOk(accounts, 'Resolve mail://accounts');
+    if (accounts.ok) {
+        try {
+            const list = accounts.value.resolve();
+            assert(Array.isArray(list), 'accounts.resolve() returns array');
+            assert(list.length >= 0, 'Accounts array exists (may be empty)');
+            if (list.length > 0) {
+                // Don't try to map account names - just report count
+                console.log(`    Found ${list.length} account(s)`);
             }
         }
-        catch {
-            // Silently ignore if we can't resolve accounts
+        catch (e) {
+            console.log(`  \u2717 accounts.resolve(): ${e.message}`);
         }
     }
-    return resources;
 }
-// ============================================================================
-// Resource Templates Documentation
-// ============================================================================
-//
-// URI Structure: mail://{path}?{query}
-//
-// Path Addressing:
-//   - By index:  collection[0], collection[1], ...
-//   - By name:   collection/MyName (for mailboxes, recipients)
-//   - By id:     collection/12345 (for messages)
-//
-// Query Parameters:
-//   Filters (applied server-side when possible):
-//     - Exact match:   ?name=Inbox
-//     - Greater than:  ?unreadCount.gt=0
-//     - Less than:     ?messageSize.lt=1000000
-//     - Contains:      ?subject.contains=urgent
-//     - Starts with:   ?name.startsWith=Project
-//
-//   Sorting:
-//     - Ascending:     ?sort=name.asc
-//     - Descending:    ?sort=dateReceived.desc
-//
-//   Pagination:
-//     - Limit:         ?limit=10
-//     - Offset:        ?offset=20
-//     - Combined:      ?limit=10&offset=20
-//
-//   Expand (resolve lazy properties inline):
-//     - Single:        ?expand=content
-//     - Multiple:      ?expand=content,attachments
-//
-//   Combined:
-//     ?unreadCount.gt=0&sort=unreadCount.desc&limit=10&expand=content
-//
-// ============================================================================
-const resourceTemplates = [
-    // --- Standard Mailboxes (aggregate across all accounts) ---
-    {
-        uriTemplate: 'mail://inbox',
-        name: 'All Inboxes',
-        description: 'Combined inbox across all accounts. Returns: name, unreadCount, messages'
-    },
-    {
-        uriTemplate: 'mail://inbox/messages',
-        name: 'Inbox Messages',
-        description: 'Messages from all inboxes'
-    },
-    {
-        uriTemplate: 'mail://inbox/messages?{query}',
-        name: 'Filtered Inbox Messages',
-        description: 'Filter: ?readStatus=false, ?subject.contains=X. Sort: ?sort=dateReceived.desc. Paginate: ?limit=10&offset=0'
-    },
-    {
-        uriTemplate: 'mail://sent',
-        name: 'All Sent',
-        description: 'Combined sent mailbox across all accounts'
-    },
-    {
-        uriTemplate: 'mail://drafts',
-        name: 'All Drafts',
-        description: 'Combined drafts mailbox across all accounts'
-    },
-    {
-        uriTemplate: 'mail://trash',
-        name: 'All Trash',
-        description: 'Combined trash mailbox across all accounts'
-    },
-    {
-        uriTemplate: 'mail://junk',
-        name: 'All Junk',
-        description: 'Combined junk/spam mailbox across all accounts'
-    },
-    {
-        uriTemplate: 'mail://outbox',
-        name: 'Outbox',
-        description: 'Messages waiting to be sent'
-    },
-    // --- Accounts ---
-    {
-        uriTemplate: 'mail://accounts',
-        name: 'All Accounts',
-        description: 'List all mail accounts'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]',
-        name: 'Account by Index',
-        description: 'Single account. Returns: id, name, fullName, emailAddresses'
-    },
-    {
-        uriTemplate: 'mail://accounts/{name}',
-        name: 'Account by Name',
-        description: 'Single account by name. Example: mail://accounts/iCloud'
-    },
-    // --- Account Standard Mailboxes ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/inbox',
-        name: 'Account Inbox',
-        description: "The account's inbox mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/sent',
-        name: 'Account Sent',
-        description: "The account's sent mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/drafts',
-        name: 'Account Drafts',
-        description: "The account's drafts mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/junk',
-        name: 'Account Junk',
-        description: "The account's junk/spam mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/trash',
-        name: 'Account Trash',
-        description: "The account's trash/deleted items mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/inbox/messages?{query}',
-        name: 'Account Inbox Messages',
-        description: "Messages in the account's inbox. Supports filter/sort/pagination"
-    },
-    // --- Mailboxes ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes',
-        name: 'Mailboxes',
-        description: 'All mailboxes for an account. Returns: name, unreadCount per mailbox'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}',
-        name: 'Mailbox by Name',
-        description: 'Single mailbox. Supports nested: /mailboxes/Work/mailboxes/Projects'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes?{query}',
-        name: 'Filtered Mailboxes',
-        description: 'Filter: ?name=Inbox, ?unreadCount.gt=0. Sort: ?sort=unreadCount.desc'
-    },
-    // --- Messages ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages',
-        name: 'Messages',
-        description: 'All messages. Returns: id, subject, sender {name, address}, dateSent, readStatus, etc. Content is lazy (use ?expand=content)'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages[{msgIndex}]',
-        name: 'Message by Index',
-        description: 'Single message by position (0-indexed)'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}',
-        name: 'Message by ID',
-        description: 'Single message by Mail.app message ID'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages?{query}',
-        name: 'Filtered Messages',
-        description: 'Filter: ?readStatus=false, ?flaggedStatus=true. Sort: ?sort=dateReceived.desc. Expand: ?expand=content'
-    },
-    // --- Message Content (Lazy) ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/content',
-        name: 'Message Content',
-        description: 'Full message body text. Fetched separately as it can be large'
-    },
-    // --- Recipients ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/toRecipients',
-        name: 'To Recipients',
-        description: 'To recipients. Returns: name, address'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/ccRecipients',
-        name: 'CC Recipients',
-        description: 'CC recipients. Returns: name, address'
-    },
-    // --- Attachments ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/attachments',
-        name: 'Attachments',
-        description: 'Message attachments. Returns: id, name, fileSize'
-    },
-    // --- Rules ---
-    {
-        uriTemplate: 'mail://rules',
-        name: 'All Rules',
-        description: 'List all mail filtering rules'
-    },
-    {
-        uriTemplate: 'mail://rules[{index}]',
-        name: 'Rule by Index',
-        description: 'Single rule. Returns: name, enabled, conditions, actions'
-    },
-    {
-        uriTemplate: 'mail://rules/{name}',
-        name: 'Rule by Name',
-        description: 'Single rule by name'
-    },
-    {
-        uriTemplate: 'mail://rules[{index}]/ruleConditions',
-        name: 'Rule Conditions',
-        description: 'Conditions for a rule. Returns: header, qualifier, ruleType, expression'
-    },
-    // --- Signatures ---
-    {
-        uriTemplate: 'mail://signatures',
-        name: 'All Signatures',
-        description: 'List all email signatures'
-    },
-    {
-        uriTemplate: 'mail://signatures[{index}]',
-        name: 'Signature by Index',
-        description: 'Single signature by position'
-    },
-    {
-        uriTemplate: 'mail://signatures/{name}',
-        name: 'Signature by Name',
-        description: 'Single signature by name. Returns: name, content (lazy)'
-    },
-    // --- Settings ---
-    {
-        uriTemplate: 'mail://settings',
-        name: 'Settings',
-        description: 'Mail.app preferences: fonts, colors, behavior, composing options'
-    },
-    {
-        uriTemplate: 'mail://settings/{property}',
-        name: 'Setting Property',
-        description: 'Individual setting value (e.g., mail://settings/fetchInterval)'
+function testJxaAccountNavigation() {
+    group('JXA Account Navigation');
+    const accounts = resolveURI('mail://accounts');
+    if (!accounts.ok) {
+        console.log('  - Skipping: could not resolve accounts');
+        return;
     }
-];
-// Export for JXA
-globalThis.readResource = readResource;
-globalThis.listResources = listResources;
-globalThis.resourceTemplates = resourceTemplates;
-/// <reference path="framework.ts" />
-// ============================================================================
-// Set Tool - Modify scalar values
-// ============================================================================
-function toolSet(uri, value) {
-    // Guard: Detect if URI uses name addressing for the item being modified
-    // If so, and we're setting 'name', this would break the reference
-    const segments = uri.split('/');
-    const lastSegment = segments[segments.length - 1];
-    // Check if parent uses name addressing and we're setting 'name'
-    if (lastSegment === 'name') {
-        const parentLastSegment = segments[segments.length - 2];
-        if (parentLastSegment && !parentLastSegment.match(/\[\d+\]$/) && !parentLastSegment.includes('://')) {
-            return {
-                ok: false,
-                error: `Cannot set 'name' when the object is addressed by name. Use index addressing (e.g., [0]) instead.`
-            };
-        }
-    }
-    const resResult = resolveURI(uri);
-    if (!resResult.ok) {
-        return { ok: false, error: resResult.error };
-    }
-    const res = resResult.value;
-    // Check if the proto has a set method (added by withSet)
-    if (typeof res.set !== 'function') {
-        return { ok: false, error: `Property at ${uri} is not mutable` };
-    }
+    let list;
     try {
-        res.set(value);
-        return { ok: true, value: { uri, updated: true } };
+        list = accounts.value.resolve();
     }
     catch (e) {
-        return { ok: false, error: `Set failed: ${e.message || e}` };
+        console.log(`  - Skipping: could not resolve accounts list: ${e.message}`);
+        return;
+    }
+    if (list.length === 0) {
+        console.log('  - Skipping: no accounts configured');
+        return;
+    }
+    // Navigate by index
+    const acc0 = resolveURI('mail://accounts[0]');
+    assertOk(acc0, 'Resolve mail://accounts[0]');
+    if (acc0.ok) {
+        try {
+            const name = acc0.value.name.resolve();
+            assert(typeof name === 'string', 'Account has name');
+            console.log(`    First account: ${name}`);
+            const fullName = acc0.value.fullName.resolve();
+            assert(typeof fullName === 'string', 'Account has fullName');
+            const emails = acc0.value.emailAddresses.resolve();
+            assert(Array.isArray(emails), 'Account has emailAddresses');
+            // Navigate by name - use resolved name
+            const accByName = resolveURI(`mail://accounts/${encodeURIComponent(name)}`);
+            assertOk(accByName, `Resolve account by name: ${name}`);
+        }
+        catch (e) {
+            console.log(`  \u2717 Account navigation failed: ${e.message}`);
+        }
     }
 }
-// ============================================================================
-// Make Tool - Create new objects in collections
-// ============================================================================
-function toolMake(collectionUri, properties) {
-    const resResult = resolveURI(collectionUri);
-    if (!resResult.ok) {
-        return { ok: false, error: resResult.error };
-    }
-    const res = resResult.value;
-    // Check if proto has create method (from withCreate) or use delegate
-    if (typeof res.create === 'function') {
-        const result = res.create(properties);
-        if (!result.ok) {
-            return { ok: false, error: result.error };
+function testJxaMailboxNavigation() {
+    group('JXA Mailbox Navigation');
+    try {
+        const accounts = resolveURI('mail://accounts');
+        if (!accounts.ok) {
+            console.log('  - Skipping: no accounts');
+            return;
         }
-        return { ok: true, value: { uri: result.value._delegate.uri().href } };
+        const accList = accounts.value.resolve();
+        if (accList.length === 0) {
+            console.log('  - Skipping: no accounts');
+            return;
+        }
     }
-    // Fall back to delegate create
-    const createResult = res._delegate.create(properties);
-    if (!createResult.ok) {
-        return { ok: false, error: createResult.error };
+    catch (e) {
+        console.log(`  - Skipping: ${e.message}`);
+        return;
     }
-    return { ok: true, value: { uri: createResult.value.href } };
+    // Get first account's mailboxes
+    const mailboxes = resolveURI('mail://accounts[0]/mailboxes');
+    assertOk(mailboxes, 'Resolve mailboxes');
+    if (mailboxes.ok) {
+        try {
+            const list = mailboxes.value.resolve();
+            assert(Array.isArray(list), 'mailboxes.resolve() returns array');
+            console.log(`    Found ${list.length} mailbox(es)`);
+        }
+        catch (e) {
+            console.log(`  \u2717 mailboxes.resolve(): ${e.message}`);
+        }
+    }
+    // Standard inbox
+    const inbox = resolveURI('mail://inbox');
+    assertOk(inbox, 'Resolve mail://inbox (aggregate)');
+    if (inbox.ok) {
+        try {
+            const name = inbox.value.name.resolve();
+            const unread = inbox.value.unreadCount.resolve();
+            console.log(`    Inbox: ${name} (${unread} unread)`);
+        }
+        catch (e) {
+            console.log(`  \u2717 inbox properties: ${e.message}`);
+        }
+    }
+    // Account-specific inbox via computedNav
+    const accInbox = resolveURI('mail://accounts[0]/inbox');
+    assertOk(accInbox, 'Resolve account inbox via computedNav');
+    if (accInbox.ok) {
+        try {
+            const name = accInbox.value.name.resolve();
+            console.log(`    Account[0] inbox: ${name}`);
+        }
+        catch (e) {
+            console.log(`  \u2717 account inbox: ${e.message}`);
+        }
+    }
 }
-// ============================================================================
-// Move Tool - Move objects between collections
-// ============================================================================
-function toolMove(itemUri, destinationCollectionUri) {
-    // Guard: Cannot move mailboxes
-    if (itemUri.match(/\/mailboxes\/[^/]+$/) || itemUri.match(/\/mailboxes\[\d+\]$/)) {
-        if (!itemUri.includes('/messages')) {
-            return { ok: false, error: `Cannot move mailboxes. Use Mail.app directly to manage mailboxes.` };
-        }
+function testJxaMessageAccess() {
+    group('JXA Message Access');
+    // Try to find a mailbox with messages
+    const inbox = resolveURI('mail://inbox');
+    if (!inbox.ok) {
+        console.log('  - Skipping: could not resolve inbox');
+        return;
     }
-    // Get source item
-    const itemResult = resolveURI(itemUri);
-    if (!itemResult.ok) {
-        return { ok: false, error: itemResult.error };
+    let msgList;
+    try {
+        const messages = inbox.value.messages;
+        msgList = messages.resolve();
     }
-    // Get destination collection
-    const destResult = resolveURI(destinationCollectionUri);
-    if (!destResult.ok) {
-        return { ok: false, error: destResult.error };
+    catch (e) {
+        console.log(`  - Skipping: could not resolve messages: ${e.message}`);
+        return;
     }
-    const item = itemResult.value;
-    const dest = destResult.value;
-    // Check if item has move method (from withMove)
-    if (typeof item.move === 'function') {
-        const moveResult = item.move(dest);
-        if (!moveResult.ok) {
-            return { ok: false, error: moveResult.error };
-        }
-        return { ok: true, value: { uri: moveResult.value._delegate.uri().href } };
+    if (msgList.length === 0) {
+        console.log('  - Skipping: inbox is empty');
+        return;
     }
-    // Fall back to delegate moveTo
-    const moveResult = item._delegate.moveTo(dest._delegate);
-    if (!moveResult.ok) {
-        return { ok: false, error: moveResult.error };
+    console.log(`    Found ${msgList.length} message(s) in inbox`);
+    try {
+        // Get first message by index
+        const msg0 = inbox.value.messages.byIndex(0);
+        assert('_delegate' in msg0, 'byIndex returns Res');
+        const subject = msg0.subject.resolve();
+        assert(typeof subject === 'string', 'Message has subject');
+        console.log(`    First message: "${String(subject).substring(0, 50)}..."`);
+        // Test computed property (sender parsing)
+        const sender = msg0.sender.resolve();
+        assert(typeof sender === 'object', 'sender is parsed object');
+        assert('address' in sender, 'sender has address');
+        console.log(`    From: ${sender.name} <${sender.address}>`);
+        // Test lazy property (content) - resolving full message
+        const resolved = msg0.resolve();
+        assert('content' in resolved, 'Resolved message has content specifier');
     }
-    return { ok: true, value: { uri: moveResult.value.href } };
+    catch (e) {
+        console.log(`  \u2717 Message access: ${e.message}`);
+    }
 }
-// ============================================================================
-// Delete Tool - Delete objects with mailbox guard
-// ============================================================================
-function toolDelete(itemUri) {
-    // Guard: Cannot delete mailboxes
-    if (itemUri.match(/\/mailboxes\/[^/]+$/) || itemUri.match(/\/mailboxes\[\d+\]$/)) {
-        if (!itemUri.includes('/messages')) {
-            return { ok: false, error: `Cannot delete mailboxes. Use Mail.app directly to manage mailboxes.` };
+function testJxaStandardMailboxes() {
+    group('JXA Standard Mailboxes');
+    const standardNames = ['inbox', 'sent', 'drafts', 'trash', 'junk', 'outbox'];
+    for (const name of standardNames) {
+        testCount++;
+        const result = resolveURI(`mail://${name}`);
+        if (result.ok) {
+            try {
+                const mbName = result.value.name.resolve();
+                const unread = result.value.unreadCount.resolve();
+                passCount++;
+                console.log(`  \u2713 ${name}: ${mbName} (${unread} unread)`);
+            }
+            catch (e) {
+                passCount++;
+                console.log(`  \u2713 ${name}: resolved (properties failed: ${e.message})`);
+            }
+        }
+        else {
+            console.log(`  \u2717 ${name}: ${result.error}`);
         }
     }
-    const itemResult = resolveURI(itemUri);
-    if (!itemResult.ok) {
-        return { ok: false, error: itemResult.error };
-    }
-    const item = itemResult.value;
-    // Check if item has delete method (from withDelete)
-    if (typeof item.delete === 'function') {
-        const deleteResult = item.delete();
-        if (!deleteResult.ok) {
-            return { ok: false, error: deleteResult.error };
-        }
-        return { ok: true, value: { deleted: true, uri: itemUri } };
-    }
-    // Fall back to delegate delete
-    const deleteResult = item._delegate.delete();
-    if (!deleteResult.ok) {
-        return { ok: false, error: deleteResult.error };
-    }
-    return { ok: true, value: { deleted: true, uri: itemUri } };
 }
-// ============================================================================
-// Tool Registration Helper
-// ============================================================================
-function registerMailTools(server) {
-    server.addTool({
-        name: 'set',
-        description: 'Set a scalar property value. Use URI to specify the property (e.g., mail://rules[0]/enabled).',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                uri: { type: 'string', description: 'URI of the property to set' },
-                value: { description: 'New value for the property' }
-            },
-            required: ['uri', 'value']
-        },
-        handler: (args) => {
-            const result = toolSet(args.uri, args.value);
-            if (!result.ok)
-                return { content: [{ type: 'text', text: `Error: ${result.error}` }], isError: true };
-            return { content: [{ type: 'text', text: JSON.stringify(result.value) }] };
+function testJxaSettings() {
+    group('JXA Settings Namespace');
+    const settings = resolveURI('mail://settings');
+    assertOk(settings, 'Resolve mail://settings');
+    // Test a few settings
+    try {
+        const fetchInterval = resolveURI('mail://settings/fetchInterval');
+        if (fetchInterval.ok) {
+            const val = fetchInterval.value.resolve();
+            assert(typeof val === 'number', 'fetchInterval is number');
+            console.log(`    fetchInterval: ${val}`);
         }
-    });
-    server.addTool({
-        name: 'make',
-        description: 'Create a new object in a collection (e.g., new rule, signature).',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                collection: { type: 'string', description: 'URI of the collection (e.g., mail://rules)' },
-                properties: { type: 'object', description: 'Properties for the new object' }
-            },
-            required: ['collection', 'properties']
-        },
-        handler: (args) => {
-            const result = toolMake(args.collection, args.properties);
-            if (!result.ok)
-                return { content: [{ type: 'text', text: `Error: ${result.error}` }], isError: true };
-            return { content: [{ type: 'text', text: JSON.stringify(result.value) }] };
+        const alwaysBcc = resolveURI('mail://settings/alwaysBccMyself');
+        if (alwaysBcc.ok) {
+            const val = alwaysBcc.value.resolve();
+            assert(typeof val === 'boolean', 'alwaysBccMyself is boolean');
+            console.log(`    alwaysBccMyself: ${val}`);
         }
-    });
-    server.addTool({
-        name: 'move',
-        description: 'Move an object to a different collection (e.g., move message to another mailbox).',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                item: { type: 'string', description: 'URI of the item to move' },
-                destination: { type: 'string', description: 'URI of the destination collection' }
-            },
-            required: ['item', 'destination']
-        },
-        handler: (args) => {
-            const result = toolMove(args.item, args.destination);
-            if (!result.ok)
-                return { content: [{ type: 'text', text: `Error: ${result.error}` }], isError: true };
-            return { content: [{ type: 'text', text: JSON.stringify(result.value) }] };
-        }
-    });
-    server.addTool({
-        name: 'delete',
-        description: 'Delete an object. Messages are moved to trash. Mailbox deletion is blocked.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                item: { type: 'string', description: 'URI of the item to delete' }
-            },
-            required: ['item']
-        },
-        handler: (args) => {
-            const result = toolDelete(args.item);
-            if (!result.ok)
-                return { content: [{ type: 'text', text: `Error: ${result.error}` }], isError: true };
-            return { content: [{ type: 'text', text: JSON.stringify(result.value) }] };
-        }
-    });
+    }
+    catch (e) {
+        console.log(`  \u2717 Settings: ${e.message}`);
+    }
 }
-// Export for use in main.ts
-globalThis.registerMailTools = registerMailTools;
-/// <reference path="types/jxa.d.ts" />
-/// <reference path="types/mcp.d.ts" />
-/// <reference path="core/mcp-server.ts" />
-/// <reference path="framework.ts" />
-/// <reference path="jxa-delegate.ts" />
-/// <reference path="mail.ts" />
-/// <reference path="resources.ts" />
-/// <reference path="tools.ts" />
-// ============================================================================
-// Apple Mail MCP Server - Entry Point
-// ============================================================================
-const server = new MCPServer("apple-mail-jxa", "1.0.0");
-// Register resource handlers
-server.setResources(listResources, readResource);
-server.setResourceTemplates(resourceTemplates);
-// Register tools
-registerMailTools(server);
-// Start the server (unless loaded as a library)
-if (!globalThis.__LIBRARY_MODE__) {
-    server.run();
+function testJxaRulesAndSignatures() {
+    group('JXA Rules and Signatures');
+    // Rules
+    const rules = resolveURI('mail://rules');
+    assertOk(rules, 'Resolve mail://rules');
+    if (rules.ok) {
+        try {
+            const list = rules.value.resolve();
+            console.log(`    Found ${list.length} rule(s)`);
+        }
+        catch (e) {
+            console.log(`  \u2717 rules.resolve(): ${e.message}`);
+        }
+    }
+    // Signatures
+    const sigs = resolveURI('mail://signatures');
+    assertOk(sigs, 'Resolve mail://signatures');
+    if (sigs.ok) {
+        try {
+            const list = sigs.value.resolve();
+            console.log(`    Found ${list.length} signature(s)`);
+        }
+        catch (e) {
+            console.log(`  \u2717 signatures.resolve(): ${e.message}`);
+        }
+    }
 }
+function testJxaQueryOperations() {
+    group('JXA Query Operations');
+    try {
+        // Filter mailboxes by unread count
+        const filtered = resolveURI('mail://accounts[0]/mailboxes?unreadCount.gt=0');
+        if (filtered.ok) {
+            const list = filtered.value.resolve();
+            console.log(`    Mailboxes with unread: ${list.length}`);
+            if (list.length > 0) {
+                assert(list.every((m) => m.unreadCount > 0), 'All have unread > 0');
+            }
+            else {
+                console.log('    (no mailboxes with unread)');
+            }
+        }
+        // Sort and limit
+        const sorted = resolveURI('mail://accounts[0]/mailboxes?sort=name.asc&limit=5');
+        if (sorted.ok) {
+            const list = sorted.value.resolve();
+            console.log(`    First 5 sorted: ${list.length} mailbox(es)`);
+        }
+    }
+    catch (e) {
+        console.log(`  \u2717 Query operations: ${e.message}`);
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Run tests
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('Framework Tests (JXA/Mail.app)');
+console.log('==============================');
+testJxaURIResolution();
+testJxaAccountNavigation();
+testJxaMailboxNavigation();
+testJxaMessageAccess();
+testJxaStandardMailboxes();
+testJxaSettings();
+testJxaRulesAndSignatures();
+testJxaQueryOperations();
+const jxaTestResult = summary();

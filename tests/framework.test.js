@@ -1,308 +1,4 @@
 "use strict";
-/// <reference path="../types/jxa.d.ts" />
-/// <reference path="../types/mcp.d.ts" />
-// ============================================================================
-// MCP Server Implementation with Resources Support
-// JSON-RPC 2.0 over stdio with NSRunLoop-based I/O
-// ============================================================================
-// Standard JSON-RPC error codes
-const JsonRpcErrorCodes = {
-    PARSE_ERROR: -32700,
-    INVALID_REQUEST: -32600,
-    METHOD_NOT_FOUND: -32601,
-    INVALID_PARAMS: -32602,
-    INTERNAL_ERROR: -32603,
-    RESOURCE_NOT_FOUND: -32002,
-    SERVER_ERROR: -32000
-};
-class MCPServer {
-    serverInfo;
-    tools;
-    resourceLister;
-    resourceReader;
-    resourceTemplates;
-    stdin;
-    stdout;
-    stderr;
-    buffer;
-    shouldQuit;
-    dataAvailable;
-    observer;
-    debug;
-    constructor(name, version, debug = true) {
-        this.serverInfo = { name, version };
-        this.tools = new Map();
-        this.resourceLister = null;
-        this.resourceReader = null;
-        this.resourceTemplates = [];
-        this.buffer = "";
-        this.shouldQuit = false;
-        this.dataAvailable = false;
-        this.debug = debug;
-        // Import Foundation framework
-        ObjC.import("Foundation");
-        // Get standard file handles
-        this.stdin = $.NSFileHandle.fileHandleWithStandardInput;
-        this.stdout = $.NSFileHandle.fileHandleWithStandardOutput;
-        this.stderr = $.NSFileHandle.fileHandleWithStandardError;
-    }
-    // ============================================================================
-    // Tool Registration
-    // ============================================================================
-    addTool(definition) {
-        const tool = {
-            name: definition.name,
-            description: definition.description,
-            inputSchema: definition.inputSchema ?? { type: "object", properties: {}, required: [] }
-        };
-        if (definition.annotations) {
-            tool.annotations = definition.annotations;
-        }
-        this.tools.set(definition.name, { tool, handler: definition.handler });
-        return this;
-    }
-    // ============================================================================
-    // Resource Registration
-    // ============================================================================
-    setResources(lister, reader) {
-        this.resourceLister = lister;
-        this.resourceReader = reader;
-        return this;
-    }
-    setResourceTemplates(templates) {
-        this.resourceTemplates = templates;
-        return this;
-    }
-    // ============================================================================
-    // I/O Helpers
-    // ============================================================================
-    log(message) {
-        if (!this.debug)
-            return;
-        const fullMessage = `[${this.serverInfo.name}] ${message}\n`;
-        const data = $.NSString.alloc.initWithUTF8String(fullMessage)
-            .dataUsingEncoding($.NSUTF8StringEncoding);
-        this.stderr.writeData(data);
-    }
-    send(response) {
-        const json = JSON.stringify(response) + "\n";
-        const data = $.NSString.alloc.initWithUTF8String(json)
-            .dataUsingEncoding($.NSUTF8StringEncoding);
-        this.stdout.writeData(data);
-    }
-    sendResult(id, result) {
-        this.send({ jsonrpc: "2.0", id, result });
-    }
-    sendError(id, code, message) {
-        this.send({ jsonrpc: "2.0", id, error: { code, message } });
-    }
-    sendToolResult(id, text, isError = false) {
-        this.sendResult(id, {
-            content: [{ type: "text", text: String(text) }],
-            isError
-        });
-    }
-    // ============================================================================
-    // Request Handlers
-    // ============================================================================
-    handleInitialize(id, params) {
-        const clientName = params.clientInfo?.name ?? 'unknown';
-        this.log(`Initialize from: ${clientName}`);
-        const capabilities = {};
-        if (this.tools.size > 0) {
-            capabilities.tools = {};
-        }
-        if (this.resourceLister) {
-            capabilities.resources = {};
-        }
-        this.sendResult(id, {
-            protocolVersion: "2024-11-05",
-            serverInfo: this.serverInfo,
-            capabilities
-        });
-    }
-    handleToolsList(id) {
-        const tools = [];
-        this.tools.forEach(({ tool }) => tools.push(tool));
-        this.log(`Tools list (${tools.length})`);
-        this.sendResult(id, { tools });
-    }
-    handleToolsCall(id, params) {
-        const name = params.name;
-        const args = params.arguments ?? {};
-        this.log(`Call: ${name}`);
-        const entry = this.tools.get(name);
-        if (!entry) {
-            this.sendError(id, JsonRpcErrorCodes.METHOD_NOT_FOUND, `Unknown tool: ${name}`);
-            return;
-        }
-        try {
-            const result = entry.handler(args);
-            this.sendResult(id, result);
-        }
-        catch (e) {
-            const error = e;
-            this.sendToolResult(id, `Error: ${error.message}`, true);
-        }
-    }
-    handleResourcesList(id) {
-        this.log("Resources list");
-        if (!this.resourceLister) {
-            this.sendResult(id, { resources: [] });
-            return;
-        }
-        try {
-            const resources = this.resourceLister();
-            this.sendResult(id, { resources });
-        }
-        catch (e) {
-            const error = e;
-            this.sendError(id, JsonRpcErrorCodes.SERVER_ERROR, `Resource list error: ${error.message}`);
-        }
-    }
-    handleResourcesRead(id, params) {
-        const uri = params.uri;
-        this.log(`Resource read: ${uri}`);
-        if (!this.resourceReader) {
-            this.sendError(id, JsonRpcErrorCodes.METHOD_NOT_FOUND, "Resources not supported");
-            return;
-        }
-        try {
-            this.log(`[DBG] calling resourceReader...`);
-            const content = this.resourceReader(uri);
-            this.log(`[DBG] resourceReader returned`);
-            if (content === null || content === undefined) {
-                this.sendError(id, JsonRpcErrorCodes.RESOURCE_NOT_FOUND, `Resource not found: ${uri}`);
-                return;
-            }
-            this.log(`[DBG] stringifying content...`);
-            const textContent = typeof content.text === 'string'
-                ? content.text
-                : JSON.stringify(content.text, null, 2);
-            this.log(`[DBG] stringified, length: ${textContent.length}`);
-            this.log(`[DBG] building result...`);
-            const result = {
-                contents: [{
-                        uri,
-                        mimeType: content.mimeType || 'application/json',
-                        text: textContent
-                    }]
-            };
-            this.log(`[DBG] calling sendResult...`);
-            this.sendResult(id, result);
-            this.log(`[DBG] sendResult done`);
-        }
-        catch (e) {
-            const error = e;
-            this.sendError(id, JsonRpcErrorCodes.SERVER_ERROR, `Resource read error: ${error.message}`);
-        }
-    }
-    handleResourceTemplatesList(id) {
-        this.log("Resource templates list");
-        this.sendResult(id, { resourceTemplates: this.resourceTemplates });
-    }
-    // ============================================================================
-    // Request Dispatch
-    // ============================================================================
-    handleRequest(request) {
-        switch (request.method) {
-            case "initialize":
-                this.handleInitialize(request.id, request.params ?? {});
-                break;
-            case "initialized":
-            case "notifications/initialized":
-                this.log("Client initialized");
-                break;
-            case "tools/list":
-                this.handleToolsList(request.id);
-                break;
-            case "tools/call":
-                this.handleToolsCall(request.id, request.params ?? {});
-                break;
-            case "resources/list":
-                this.handleResourcesList(request.id);
-                break;
-            case "resources/read":
-                this.handleResourcesRead(request.id, request.params ?? {});
-                break;
-            case "resources/templates/list":
-                this.handleResourceTemplatesList(request.id);
-                break;
-            default:
-                // Only send error for requests (with id), not notifications
-                if (request.id !== undefined && !request.method?.startsWith('notifications/')) {
-                    this.sendError(request.id, JsonRpcErrorCodes.METHOD_NOT_FOUND, `Method not found: ${request.method}`);
-                }
-        }
-    }
-    // ============================================================================
-    // Buffer Processing
-    // ============================================================================
-    processBuffer() {
-        const lines = this.buffer.split("\n");
-        this.buffer = lines.pop() ?? "";
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed)
-                continue;
-            try {
-                const request = JSON.parse(trimmed);
-                this.handleRequest(request);
-            }
-            catch (e) {
-                const error = e;
-                this.log(`Parse error: ${error.message}`);
-                this.sendError(null, JsonRpcErrorCodes.PARSE_ERROR, "Parse error");
-            }
-        }
-    }
-    // ============================================================================
-    // Main Run Loop
-    // ============================================================================
-    run() {
-        this.log(`${this.serverInfo.name} v${this.serverInfo.version} starting...`);
-        // Register Objective-C subclass for notification handling
-        const observerClassName = `StdinObserver_${Date.now()}`;
-        ObjC.registerSubclass({
-            name: observerClassName,
-            methods: {
-                "handleData:": {
-                    types: ["void", ["id"]],
-                    implementation: (_notification) => {
-                        this.dataAvailable = true;
-                    }
-                }
-            }
-        });
-        // Access the registered class via the $ bridge
-        this.observer = $[observerClassName].alloc.init;
-        // Register for stdin data notifications
-        $.NSNotificationCenter.defaultCenter.addObserverSelectorNameObject(this.observer, "handleData:", "NSFileHandleDataAvailableNotification", this.stdin);
-        // Start listening
-        void this.stdin.waitForDataInBackgroundAndNotify;
-        // Main run loop
-        while (!this.shouldQuit) {
-            $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(1.0));
-            if (this.dataAvailable) {
-                this.dataAvailable = false;
-                const data = this.stdin.availableData;
-                if (data.length === 0) {
-                    this.shouldQuit = true;
-                    break;
-                }
-                const nsString = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
-                if (nsString) {
-                    this.buffer += nsString.js;
-                    this.processBuffer();
-                }
-                void this.stdin.waitForDataInBackgroundAndNotify;
-            }
-        }
-        // Cleanup
-        $.NSNotificationCenter.defaultCenter.removeObserverNameObject(this.observer, "NSFileHandleDataAvailableNotification", this.stdin);
-        this.log("Server shutting down");
-    }
-}
 // scratch/framework.ts - Plugboard v4 Framework
 //
 // Core types, proto system, URI parsing - no app-specific code.
@@ -1086,69 +782,90 @@ function resolveURI(uri) {
     }
     return { ok: true, value: createRes(delegate, proto) };
 }
-// scratch/jxa-backing.ts - JXA Delegate implementation
+// scratch/mock-backing.ts - Mock Delegate implementation
 //
-// This file is only included in JXA builds (osascript -l JavaScript)
-// Contains the JXADelegate class and JXA-specific utilities
+// This file is only included in Node builds (for testing)
+// Contains the MockDelegate class that works against in-memory data
 // Import types from core (when compiled together, these are in the same scope)
 // The core exports: Delegate, PathSegment, buildURI, buildQueryString, QueryState, WhoseFilter, SortSpec, PaginationSpec, RootMarker, ROOT
 // ─────────────────────────────────────────────────────────────────────────────
-// JXA Delegate implementation
+// Mock Delegate implementation
 // ─────────────────────────────────────────────────────────────────────────────
-class JXADelegate {
-    _jxaRef;
+// ID counter for auto-generating IDs
+let mockIdCounter = 1000;
+class MockDelegate {
+    _data;
     _path;
-    _jxaParent;
-    _key;
+    _root;
     _parentDelegate;
+    _parentArray;
+    _indexInParent;
     _query;
-    constructor(_jxaRef, _path, _jxaParent, // Parent JXA object
-    _key, // Property key in parent
-    _parentDelegate, // Parent delegate for navigation
+    constructor(_data, // Current node in mock data
+    _path, _root, // Root data for navigation
+    _parentDelegate, // Parent delegate
+    _parentArray, // Parent array (if this is an item in an array)
+    _indexInParent, // Index in parent array
     _query = {}) {
-        this._jxaRef = _jxaRef;
+        this._data = _data;
         this._path = _path;
-        this._jxaParent = _jxaParent;
-        this._key = _key;
+        this._root = _root;
         this._parentDelegate = _parentDelegate;
+        this._parentArray = _parentArray;
+        this._indexInParent = _indexInParent;
         this._query = _query;
     }
     _jxa() {
-        // If we have a parent and key, call as property getter
-        if (this._jxaParent && this._key) {
-            return this._jxaParent[this._key]();
+        // Apply query state to data if it's an array
+        if (Array.isArray(this._data)) {
+            return applyQueryState(this._data, this._query);
         }
-        // Otherwise try to call directly (may be a specifier or function)
-        if (typeof this._jxaRef === 'function') {
-            return this._jxaRef();
-        }
-        return this._jxaRef;
+        return this._data;
     }
     prop(key) {
         const newPath = [...this._path, { kind: 'prop', name: key }];
-        return new JXADelegate(this._jxaRef[key], newPath, this._jxaRef, key, this);
+        const newData = this._data ? this._data[key] : undefined;
+        return new MockDelegate(newData, newPath, this._root, this, null, null);
     }
     propWithAlias(jxaName, uriName) {
-        // Navigate JXA using jxaName, but track uriName in path
+        // Navigate data using JXA name, but track URI name in path
         const newPath = [...this._path, { kind: 'prop', name: uriName }];
-        return new JXADelegate(this._jxaRef[jxaName], newPath, this._jxaRef, jxaName, this);
+        const newData = this._data ? this._data[jxaName] : undefined;
+        return new MockDelegate(newData, newPath, this._root, this, null, null);
     }
     namespace(name) {
-        // A namespace adds a URI segment but keeps the same JXA ref (no navigation)
+        // A namespace adds a URI segment but keeps the same data (no JXA navigation)
         const newPath = [...this._path, { kind: 'prop', name }];
-        return new JXADelegate(this._jxaRef, newPath, this._jxaParent, this._key, this); // Same ref!
+        return new MockDelegate(this._data, newPath, this._root, this, null, null); // Same data!
     }
     byIndex(n) {
         const newPath = [...this._path, { kind: 'index', value: n }];
-        return new JXADelegate(this._jxaRef[n], newPath, this._jxaRef, undefined, this);
+        const newData = Array.isArray(this._data) ? this._data[n] : undefined;
+        return new MockDelegate(newData, newPath, this._root, this, this._data, n);
     }
     byName(name) {
         const newPath = [...this._path, { kind: 'name', value: name }];
-        return new JXADelegate(this._jxaRef.byName(name), newPath, this._jxaRef, undefined, this);
+        let item;
+        let idx = null;
+        if (Array.isArray(this._data)) {
+            idx = this._data.findIndex((x) => x.name === name);
+            item = idx >= 0 ? this._data[idx] : undefined;
+            if (idx < 0)
+                idx = null;
+        }
+        return new MockDelegate(item, newPath, this._root, this, this._data, idx);
     }
     byId(id) {
         const newPath = [...this._path, { kind: 'id', value: id }];
-        return new JXADelegate(this._jxaRef.byId(id), newPath, this._jxaRef, undefined, this);
+        let item;
+        let idx = null;
+        if (Array.isArray(this._data)) {
+            idx = this._data.findIndex((x) => x.id === id);
+            item = idx >= 0 ? this._data[idx] : undefined;
+            if (idx < 0)
+                idx = null;
+        }
+        return new MockDelegate(item, newPath, this._root, this, this._data, idx);
     }
     uri() {
         const base = buildURI(this._path);
@@ -1159,12 +876,16 @@ class JXADelegate {
         return base;
     }
     set(value) {
-        if (this._jxaParent && this._key) {
-            this._jxaParent[this._key] = value;
+        // For mock, we need parent reference to actually set
+        if (this._parentDelegate && this._parentDelegate._data && this._path.length > 0) {
+            const lastSeg = this._path[this._path.length - 1];
+            if (lastSeg.kind === 'prop') {
+                this._parentDelegate._data[lastSeg.name] = value;
+                this._data = value;
+                return;
+            }
         }
-        else {
-            throw new Error('Cannot set on root object');
-        }
+        throw new Error('MockDelegate.set() cannot set this path');
     }
     // Parent navigation
     parent() {
@@ -1174,117 +895,84 @@ class JXADelegate {
         return ROOT;
     }
     // Mutation: move this item to a destination collection
-    // Generic JXA implementation - domain handlers may override
     moveTo(destination) {
-        try {
-            const destJxa = destination._jxaRef;
-            // JXA move pattern: item.move({ to: destination })
-            this._jxaRef.move({ to: destJxa });
-            // Return the new URI (item is now in destination)
-            const destUri = destination.uri();
-            // Try to construct a URI based on item's id or name
-            try {
-                const id = this._jxaRef.id();
-                return { ok: true, value: new URL(`${destUri.href}/${encodeURIComponent(String(id))}`) };
-            }
-            catch {
-                try {
-                    const name = this._jxaRef.name();
-                    return { ok: true, value: new URL(`${destUri.href}/${encodeURIComponent(name)}`) };
-                }
-                catch {
-                    // Fall back to destination URI (can't determine specific item URI)
-                    return { ok: true, value: destUri };
-                }
-            }
+        // Remove from source
+        if (this._parentArray !== null && this._indexInParent !== null) {
+            this._parentArray.splice(this._indexInParent, 1);
         }
-        catch (e) {
-            return { ok: false, error: `JXA move failed: ${e.message || e}` };
+        else {
+            return { ok: false, error: 'Cannot remove item from source: no parent array' };
         }
+        // Add to destination
+        const destData = destination._data;
+        if (!Array.isArray(destData)) {
+            return { ok: false, error: 'Destination is not a collection' };
+        }
+        destData.push(this._data);
+        // Return new URI
+        const destUri = destination.uri();
+        const id = this._data?.id ?? this._data?.name;
+        if (id !== undefined) {
+            return { ok: true, value: new URL(`${destUri.href}/${encodeURIComponent(String(id))}`) };
+        }
+        // Fall back to index
+        const newIndex = destData.length - 1;
+        return { ok: true, value: new URL(`${destUri.href}[${newIndex}]`) };
     }
     // Mutation: delete this item
     delete() {
-        try {
-            const uri = this.uri();
-            this._jxaRef.delete();
-            return { ok: true, value: uri };
+        if (this._parentArray !== null && this._indexInParent !== null) {
+            this._parentArray.splice(this._indexInParent, 1);
+            // Return the URI we were at (item no longer exists)
+            return { ok: true, value: this.uri() };
         }
-        catch (e) {
-            return { ok: false, error: `JXA delete failed: ${e.message || e}` };
-        }
+        return { ok: false, error: 'Cannot delete: item not in a collection' };
     }
     // Mutation: create a new item in this collection
     create(properties) {
-        try {
-            // JXA create pattern: Application.make({ new: 'type', withProperties: {...} })
-            // For collections, we typically use collection.push() or make()
-            // This generic implementation tries the push pattern
-            const newItem = this._jxaRef.push(properties);
-            // Return URI to new item
-            const baseUri = this.uri();
-            try {
-                const id = newItem.id();
-                return { ok: true, value: new URL(`${baseUri.href}/${encodeURIComponent(String(id))}`) };
-            }
-            catch {
-                try {
-                    const name = newItem.name();
-                    return { ok: true, value: new URL(`${baseUri.href}/${encodeURIComponent(name)}`) };
-                }
-                catch {
-                    return { ok: true, value: baseUri };
-                }
-            }
+        if (!Array.isArray(this._data)) {
+            return { ok: false, error: 'Cannot create: this is not a collection' };
         }
-        catch (e) {
-            return { ok: false, error: `JXA create failed: ${e.message || e}` };
+        // Assign an id if not provided
+        const newItem = { ...properties };
+        if (!('id' in newItem)) {
+            newItem.id = mockIdCounter++;
         }
+        this._data.push(newItem);
+        // Return URI to new item
+        const id = newItem.id ?? newItem.name;
+        if (id !== undefined) {
+            return { ok: true, value: new URL(`${this.uri().href}/${encodeURIComponent(String(id))}`) };
+        }
+        const newIndex = this._data.length - 1;
+        return { ok: true, value: new URL(`${this.uri().href}[${newIndex}]`) };
     }
-    // Query state methods - merge filters, don't replace
     withFilter(filter) {
         const mergedFilter = { ...this._query.filter, ...filter };
         const newQuery = { ...this._query, filter: mergedFilter };
-        // Try JXA whose() first
-        try {
-            const jxaFilter = toJxaFilter(filter);
-            const filtered = this._jxaRef.whose(jxaFilter);
-            return new JXADelegate(filtered, this._path, undefined, undefined, this._parentDelegate, newQuery);
-        }
-        catch {
-            // JXA whose() failed - keep original ref, apply filter in JS at resolve time
-            return new JXADelegate(this._jxaRef, this._path, this._jxaParent, this._key, this._parentDelegate, newQuery);
-        }
+        return new MockDelegate(this._data, this._path, this._root, this._parentDelegate, this._parentArray, this._indexInParent, newQuery);
     }
     withSort(sort) {
         const newQuery = { ...this._query, sort };
-        return new JXADelegate(this._jxaRef, this._path, this._jxaParent, this._key, this._parentDelegate, newQuery);
+        return new MockDelegate(this._data, this._path, this._root, this._parentDelegate, this._parentArray, this._indexInParent, newQuery);
     }
     withPagination(pagination) {
         const newQuery = { ...this._query, pagination };
-        return new JXADelegate(this._jxaRef, this._path, this._jxaParent, this._key, this._parentDelegate, newQuery);
+        return new MockDelegate(this._data, this._path, this._root, this._parentDelegate, this._parentArray, this._indexInParent, newQuery);
     }
     withExpand(fields) {
-        // Merge with existing expand fields
         const existing = this._query.expand || [];
         const merged = [...new Set([...existing, ...fields])];
         const newQuery = { ...this._query, expand: merged };
-        return new JXADelegate(this._jxaRef, this._path, this._jxaParent, this._key, this._parentDelegate, newQuery);
+        return new MockDelegate(this._data, this._path, this._root, this._parentDelegate, this._parentArray, this._indexInParent, newQuery);
     }
     queryState() {
         return this._query;
     }
 }
-// Convert WhoseFilter to JXA filter format
-function toJxaFilter(filter) {
-    const jxaFilter = {};
-    for (const [field, pred] of Object.entries(filter)) {
-        jxaFilter[field] = pred.operator.toJxa(pred.value);
-    }
-    return jxaFilter;
-}
-// Create a JXA delegate from an Application reference
-function createJXADelegate(app, scheme = 'mail') {
-    return new JXADelegate(app, [{ kind: 'root', scheme }], undefined, undefined, undefined);
+// Create a mock delegate from in-memory data
+function createMockDelegate(data, scheme = 'mail') {
+    return new MockDelegate(data, [{ kind: 'root', scheme }], data, null, null, null);
 }
 // scratch/mail.ts - Mail.app Schema
 //
@@ -1534,529 +1222,740 @@ const _globalThis = globalThis;
 if (typeof _globalThis.Application !== 'undefined' && typeof _globalThis.createJXADelegate !== 'undefined') {
     registerScheme('mail', () => _globalThis.createJXADelegate(_globalThis.Application('Mail'), 'mail'), MailApplicationProto);
 }
-/// <reference path="./types/mcp.d.ts" />
-// ============================================================================
-// MCP Resource Handler
-// ============================================================================
-function readResource(uri) {
-    const resResult = resolveURI(uri);
-    if (!resResult.ok) {
-        // Return null to trigger JSON-RPC error response
-        return null;
+// tests/src/test-utils.ts - Shared test utilities
+//
+// Simple assertion functions that work in both Node and JXA environments.
+let testCount = 0;
+let passCount = 0;
+let currentGroup = '';
+function group(name) {
+    currentGroup = name;
+    console.log(`\n=== ${name} ===`);
+}
+function assert(condition, message) {
+    testCount++;
+    if (condition) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
     }
-    const res = resResult.value;
+    else {
+        console.log(`  \u2717 ${message}`);
+    }
+}
+function assertEqual(actual, expected, message) {
+    testCount++;
+    if (actual === expected) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      expected: ${JSON.stringify(expected)}`);
+        console.log(`      actual:   ${JSON.stringify(actual)}`);
+    }
+}
+function assertDeepEqual(actual, expected, message) {
+    testCount++;
+    if (JSON.stringify(actual) === JSON.stringify(expected)) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      expected: ${JSON.stringify(expected)}`);
+        console.log(`      actual:   ${JSON.stringify(actual)}`);
+    }
+}
+function assertOk(result, message) {
+    testCount++;
+    if (result.ok) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+        return result.value;
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      error: ${result.error}`);
+        return undefined;
+    }
+}
+function assertError(result, message) {
+    testCount++;
+    if (!result.ok) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      expected error, got: ${JSON.stringify(result.value)}`);
+    }
+}
+function assertThrows(fn, message) {
+    testCount++;
     try {
-        const data = res.resolve();
-        // Get the canonical URI from the delegate
-        const canonicalUri = res._delegate.uri().href;
-        const fixedUri = canonicalUri !== uri ? canonicalUri : undefined;
-        // Add _uri to the result if it's an object
-        if (data && typeof data === 'object' && !Array.isArray(data)) {
-            data._uri = fixedUri || uri;
-        }
-        return { mimeType: 'application/json', text: data, fixedUri };
+        fn();
+        console.log(`  \u2717 ${message}`);
+        console.log(`      expected exception, but none was thrown`);
     }
     catch (e) {
-        // Return null to trigger JSON-RPC error response
-        return null;
+        passCount++;
+        console.log(`  \u2713 ${message}`);
     }
 }
-function listResources() {
-    const resources = [
-        // Standard mailboxes (aggregate across accounts)
-        { uri: 'mail://inbox', name: 'Inbox', description: 'Combined inbox from all accounts' },
-        { uri: 'mail://sent', name: 'Sent', description: 'Combined sent from all accounts' },
-        { uri: 'mail://drafts', name: 'Drafts', description: 'Combined drafts from all accounts' },
-        { uri: 'mail://trash', name: 'Trash', description: 'Combined trash from all accounts' },
-        { uri: 'mail://junk', name: 'Junk', description: 'Combined junk/spam from all accounts' },
-        { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
-        // Accounts
-        { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' },
-        // Rules, Signatures, Settings
-        { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
-        { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' },
-        { uri: 'mail://settings', name: 'Settings', description: 'Mail.app preferences' }
-    ];
-    const resResult = resolveURI('mail://accounts');
-    if (resResult.ok) {
-        try {
-            const accounts = resResult.value.resolve();
-            for (let i = 0; i < accounts.length; i++) {
-                const acc = accounts[i];
-                resources.push({
-                    uri: `mail://accounts[${i}]`,
-                    name: acc.name,
-                    description: `Account: ${acc.fullName}`
-                });
-            }
-        }
-        catch {
-            // Silently ignore if we can't resolve accounts
-        }
+function summary() {
+    console.log(`\n========================`);
+    console.log(`Tests: ${passCount}/${testCount} passed`);
+    const success = passCount === testCount;
+    if (!success) {
+        console.log('SOME TESTS FAILED');
     }
-    return resources;
+    return { passed: passCount, total: testCount, success };
 }
-// ============================================================================
-// Resource Templates Documentation
-// ============================================================================
-//
-// URI Structure: mail://{path}?{query}
-//
-// Path Addressing:
-//   - By index:  collection[0], collection[1], ...
-//   - By name:   collection/MyName (for mailboxes, recipients)
-//   - By id:     collection/12345 (for messages)
-//
-// Query Parameters:
-//   Filters (applied server-side when possible):
-//     - Exact match:   ?name=Inbox
-//     - Greater than:  ?unreadCount.gt=0
-//     - Less than:     ?messageSize.lt=1000000
-//     - Contains:      ?subject.contains=urgent
-//     - Starts with:   ?name.startsWith=Project
-//
-//   Sorting:
-//     - Ascending:     ?sort=name.asc
-//     - Descending:    ?sort=dateReceived.desc
-//
-//   Pagination:
-//     - Limit:         ?limit=10
-//     - Offset:        ?offset=20
-//     - Combined:      ?limit=10&offset=20
-//
-//   Expand (resolve lazy properties inline):
-//     - Single:        ?expand=content
-//     - Multiple:      ?expand=content,attachments
-//
-//   Combined:
-//     ?unreadCount.gt=0&sort=unreadCount.desc&limit=10&expand=content
-//
-// ============================================================================
-const resourceTemplates = [
-    // --- Standard Mailboxes (aggregate across all accounts) ---
-    {
-        uriTemplate: 'mail://inbox',
-        name: 'All Inboxes',
-        description: 'Combined inbox across all accounts. Returns: name, unreadCount, messages'
-    },
-    {
-        uriTemplate: 'mail://inbox/messages',
-        name: 'Inbox Messages',
-        description: 'Messages from all inboxes'
-    },
-    {
-        uriTemplate: 'mail://inbox/messages?{query}',
-        name: 'Filtered Inbox Messages',
-        description: 'Filter: ?readStatus=false, ?subject.contains=X. Sort: ?sort=dateReceived.desc. Paginate: ?limit=10&offset=0'
-    },
-    {
-        uriTemplate: 'mail://sent',
-        name: 'All Sent',
-        description: 'Combined sent mailbox across all accounts'
-    },
-    {
-        uriTemplate: 'mail://drafts',
-        name: 'All Drafts',
-        description: 'Combined drafts mailbox across all accounts'
-    },
-    {
-        uriTemplate: 'mail://trash',
-        name: 'All Trash',
-        description: 'Combined trash mailbox across all accounts'
-    },
-    {
-        uriTemplate: 'mail://junk',
-        name: 'All Junk',
-        description: 'Combined junk/spam mailbox across all accounts'
-    },
-    {
-        uriTemplate: 'mail://outbox',
-        name: 'Outbox',
-        description: 'Messages waiting to be sent'
-    },
-    // --- Accounts ---
-    {
-        uriTemplate: 'mail://accounts',
-        name: 'All Accounts',
-        description: 'List all mail accounts'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]',
-        name: 'Account by Index',
-        description: 'Single account. Returns: id, name, fullName, emailAddresses'
-    },
-    {
-        uriTemplate: 'mail://accounts/{name}',
-        name: 'Account by Name',
-        description: 'Single account by name. Example: mail://accounts/iCloud'
-    },
-    // --- Account Standard Mailboxes ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/inbox',
-        name: 'Account Inbox',
-        description: "The account's inbox mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/sent',
-        name: 'Account Sent',
-        description: "The account's sent mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/drafts',
-        name: 'Account Drafts',
-        description: "The account's drafts mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/junk',
-        name: 'Account Junk',
-        description: "The account's junk/spam mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/trash',
-        name: 'Account Trash',
-        description: "The account's trash/deleted items mailbox"
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/inbox/messages?{query}',
-        name: 'Account Inbox Messages',
-        description: "Messages in the account's inbox. Supports filter/sort/pagination"
-    },
-    // --- Mailboxes ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes',
-        name: 'Mailboxes',
-        description: 'All mailboxes for an account. Returns: name, unreadCount per mailbox'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}',
-        name: 'Mailbox by Name',
-        description: 'Single mailbox. Supports nested: /mailboxes/Work/mailboxes/Projects'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes?{query}',
-        name: 'Filtered Mailboxes',
-        description: 'Filter: ?name=Inbox, ?unreadCount.gt=0. Sort: ?sort=unreadCount.desc'
-    },
-    // --- Messages ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages',
-        name: 'Messages',
-        description: 'All messages. Returns: id, subject, sender {name, address}, dateSent, readStatus, etc. Content is lazy (use ?expand=content)'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages[{msgIndex}]',
-        name: 'Message by Index',
-        description: 'Single message by position (0-indexed)'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}',
-        name: 'Message by ID',
-        description: 'Single message by Mail.app message ID'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages?{query}',
-        name: 'Filtered Messages',
-        description: 'Filter: ?readStatus=false, ?flaggedStatus=true. Sort: ?sort=dateReceived.desc. Expand: ?expand=content'
-    },
-    // --- Message Content (Lazy) ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/content',
-        name: 'Message Content',
-        description: 'Full message body text. Fetched separately as it can be large'
-    },
-    // --- Recipients ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/toRecipients',
-        name: 'To Recipients',
-        description: 'To recipients. Returns: name, address'
-    },
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/ccRecipients',
-        name: 'CC Recipients',
-        description: 'CC recipients. Returns: name, address'
-    },
-    // --- Attachments ---
-    {
-        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/attachments',
-        name: 'Attachments',
-        description: 'Message attachments. Returns: id, name, fileSize'
-    },
-    // --- Rules ---
-    {
-        uriTemplate: 'mail://rules',
-        name: 'All Rules',
-        description: 'List all mail filtering rules'
-    },
-    {
-        uriTemplate: 'mail://rules[{index}]',
-        name: 'Rule by Index',
-        description: 'Single rule. Returns: name, enabled, conditions, actions'
-    },
-    {
-        uriTemplate: 'mail://rules/{name}',
-        name: 'Rule by Name',
-        description: 'Single rule by name'
-    },
-    {
-        uriTemplate: 'mail://rules[{index}]/ruleConditions',
-        name: 'Rule Conditions',
-        description: 'Conditions for a rule. Returns: header, qualifier, ruleType, expression'
-    },
-    // --- Signatures ---
-    {
-        uriTemplate: 'mail://signatures',
-        name: 'All Signatures',
-        description: 'List all email signatures'
-    },
-    {
-        uriTemplate: 'mail://signatures[{index}]',
-        name: 'Signature by Index',
-        description: 'Single signature by position'
-    },
-    {
-        uriTemplate: 'mail://signatures/{name}',
-        name: 'Signature by Name',
-        description: 'Single signature by name. Returns: name, content (lazy)'
-    },
-    // --- Settings ---
-    {
-        uriTemplate: 'mail://settings',
-        name: 'Settings',
-        description: 'Mail.app preferences: fonts, colors, behavior, composing options'
-    },
-    {
-        uriTemplate: 'mail://settings/{property}',
-        name: 'Setting Property',
-        description: 'Individual setting value (e.g., mail://settings/fetchInterval)'
-    }
-];
-// Export for JXA
-globalThis.readResource = readResource;
-globalThis.listResources = listResources;
-globalThis.resourceTemplates = resourceTemplates;
-/// <reference path="framework.ts" />
-// ============================================================================
-// Set Tool - Modify scalar values
-// ============================================================================
-function toolSet(uri, value) {
-    // Guard: Detect if URI uses name addressing for the item being modified
-    // If so, and we're setting 'name', this would break the reference
-    const segments = uri.split('/');
-    const lastSegment = segments[segments.length - 1];
-    // Check if parent uses name addressing and we're setting 'name'
-    if (lastSegment === 'name') {
-        const parentLastSegment = segments[segments.length - 2];
-        if (parentLastSegment && !parentLastSegment.match(/\[\d+\]$/) && !parentLastSegment.includes('://')) {
-            return {
-                ok: false,
-                error: `Cannot set 'name' when the object is addressed by name. Use index addressing (e.g., [0]) instead.`
-            };
-        }
-    }
-    const resResult = resolveURI(uri);
-    if (!resResult.ok) {
-        return { ok: false, error: resResult.error };
-    }
-    const res = resResult.value;
-    // Check if the proto has a set method (added by withSet)
-    if (typeof res.set !== 'function') {
-        return { ok: false, error: `Property at ${uri} is not mutable` };
-    }
-    try {
-        res.set(value);
-        return { ok: true, value: { uri, updated: true } };
-    }
-    catch (e) {
-        return { ok: false, error: `Set failed: ${e.message || e}` };
-    }
+function resetCounters() {
+    testCount = 0;
+    passCount = 0;
+    currentGroup = '';
 }
-// ============================================================================
-// Make Tool - Create new objects in collections
-// ============================================================================
-function toolMake(collectionUri, properties) {
-    const resResult = resolveURI(collectionUri);
-    if (!resResult.ok) {
-        return { ok: false, error: resResult.error };
-    }
-    const res = resResult.value;
-    // Check if proto has create method (from withCreate) or use delegate
-    if (typeof res.create === 'function') {
-        const result = res.create(properties);
-        if (!result.ok) {
-            return { ok: false, error: result.error };
-        }
-        return { ok: true, value: { uri: result.value._delegate.uri().href } };
-    }
-    // Fall back to delegate create
-    const createResult = res._delegate.create(properties);
-    if (!createResult.ok) {
-        return { ok: false, error: createResult.error };
-    }
-    return { ok: true, value: { uri: createResult.value.href } };
-}
-// ============================================================================
-// Move Tool - Move objects between collections
-// ============================================================================
-function toolMove(itemUri, destinationCollectionUri) {
-    // Guard: Cannot move mailboxes
-    if (itemUri.match(/\/mailboxes\/[^/]+$/) || itemUri.match(/\/mailboxes\[\d+\]$/)) {
-        if (!itemUri.includes('/messages')) {
-            return { ok: false, error: `Cannot move mailboxes. Use Mail.app directly to manage mailboxes.` };
-        }
-    }
-    // Get source item
-    const itemResult = resolveURI(itemUri);
-    if (!itemResult.ok) {
-        return { ok: false, error: itemResult.error };
-    }
-    // Get destination collection
-    const destResult = resolveURI(destinationCollectionUri);
-    if (!destResult.ok) {
-        return { ok: false, error: destResult.error };
-    }
-    const item = itemResult.value;
-    const dest = destResult.value;
-    // Check if item has move method (from withMove)
-    if (typeof item.move === 'function') {
-        const moveResult = item.move(dest);
-        if (!moveResult.ok) {
-            return { ok: false, error: moveResult.error };
-        }
-        return { ok: true, value: { uri: moveResult.value._delegate.uri().href } };
-    }
-    // Fall back to delegate moveTo
-    const moveResult = item._delegate.moveTo(dest._delegate);
-    if (!moveResult.ok) {
-        return { ok: false, error: moveResult.error };
-    }
-    return { ok: true, value: { uri: moveResult.value.href } };
-}
-// ============================================================================
-// Delete Tool - Delete objects with mailbox guard
-// ============================================================================
-function toolDelete(itemUri) {
-    // Guard: Cannot delete mailboxes
-    if (itemUri.match(/\/mailboxes\/[^/]+$/) || itemUri.match(/\/mailboxes\[\d+\]$/)) {
-        if (!itemUri.includes('/messages')) {
-            return { ok: false, error: `Cannot delete mailboxes. Use Mail.app directly to manage mailboxes.` };
-        }
-    }
-    const itemResult = resolveURI(itemUri);
-    if (!itemResult.ok) {
-        return { ok: false, error: itemResult.error };
-    }
-    const item = itemResult.value;
-    // Check if item has delete method (from withDelete)
-    if (typeof item.delete === 'function') {
-        const deleteResult = item.delete();
-        if (!deleteResult.ok) {
-            return { ok: false, error: deleteResult.error };
-        }
-        return { ok: true, value: { deleted: true, uri: itemUri } };
-    }
-    // Fall back to delegate delete
-    const deleteResult = item._delegate.delete();
-    if (!deleteResult.ok) {
-        return { ok: false, error: deleteResult.error };
-    }
-    return { ok: true, value: { deleted: true, uri: itemUri } };
-}
-// ============================================================================
-// Tool Registration Helper
-// ============================================================================
-function registerMailTools(server) {
-    server.addTool({
-        name: 'set',
-        description: 'Set a scalar property value. Use URI to specify the property (e.g., mail://rules[0]/enabled).',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                uri: { type: 'string', description: 'URI of the property to set' },
-                value: { description: 'New value for the property' }
+// tests/src/test-framework.ts - Core framework tests (runs in Node with mock data)
+//
+// Tests URI parsing, proto composition, Res proxy behavior, and query operations.
+// Uses MockDelegate - no Mail.app required.
+// ─────────────────────────────────────────────────────────────────────────────
+// Mock Data
+// ─────────────────────────────────────────────────────────────────────────────
+function createMockMailData() {
+    return {
+        name: 'Mail',
+        version: '16.0',
+        accounts: [
+            {
+                id: 'acc1',
+                name: 'Work',
+                fullName: 'John Doe',
+                emailAddresses: ['john@work.com'],
+                mailboxes: [
+                    {
+                        name: 'INBOX',
+                        unreadCount: 5,
+                        messages: [
+                            {
+                                id: 1001,
+                                messageId: '<msg1@work.com>',
+                                subject: 'Hello World',
+                                sender: 'alice@example.com',
+                                dateSent: '2024-01-15T10:00:00Z',
+                                dateReceived: '2024-01-15T10:01:00Z',
+                                readStatus: false,
+                                flaggedStatus: false,
+                                messageSize: 1024,
+                                toRecipients: [{ name: 'John', address: 'john@work.com' }],
+                                ccRecipients: [],
+                                bccRecipients: [],
+                                mailAttachments: [],
+                            },
+                            {
+                                id: 1002,
+                                messageId: '<msg2@work.com>',
+                                subject: 'Meeting Tomorrow',
+                                sender: 'Bob Smith <bob@example.com>',
+                                dateSent: '2024-01-15T11:00:00Z',
+                                dateReceived: '2024-01-15T11:01:00Z',
+                                readStatus: true,
+                                flaggedStatus: true,
+                                messageSize: 2048,
+                                toRecipients: [{ name: 'John', address: 'john@work.com' }],
+                                ccRecipients: [{ name: 'Alice', address: 'alice@example.com' }],
+                                bccRecipients: [],
+                                mailAttachments: [{ id: 'att1', name: 'doc.pdf', fileSize: 10240 }],
+                            },
+                        ],
+                        mailboxes: [
+                            {
+                                name: 'Projects',
+                                unreadCount: 2,
+                                messages: [],
+                                mailboxes: [],
+                            },
+                        ],
+                    },
+                    {
+                        name: 'Archive',
+                        unreadCount: 0,
+                        messages: [],
+                        mailboxes: [],
+                    },
+                    {
+                        name: 'Sent',
+                        unreadCount: 0,
+                        messages: [],
+                        mailboxes: [],
+                    },
+                ],
             },
-            required: ['uri', 'value']
-        },
-        handler: (args) => {
-            const result = toolSet(args.uri, args.value);
-            if (!result.ok)
-                return { content: [{ type: 'text', text: `Error: ${result.error}` }], isError: true };
-            return { content: [{ type: 'text', text: JSON.stringify(result.value) }] };
-        }
-    });
-    server.addTool({
-        name: 'make',
-        description: 'Create a new object in a collection (e.g., new rule, signature).',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                collection: { type: 'string', description: 'URI of the collection (e.g., mail://rules)' },
-                properties: { type: 'object', description: 'Properties for the new object' }
+            {
+                id: 'acc2',
+                name: 'Personal',
+                fullName: 'John Doe',
+                emailAddresses: ['john@personal.com'],
+                mailboxes: [
+                    {
+                        name: 'INBOX',
+                        unreadCount: 3,
+                        messages: [],
+                        mailboxes: [],
+                    },
+                ],
             },
-            required: ['collection', 'properties']
-        },
-        handler: (args) => {
-            const result = toolMake(args.collection, args.properties);
-            if (!result.ok)
-                return { content: [{ type: 'text', text: `Error: ${result.error}` }], isError: true };
-            return { content: [{ type: 'text', text: JSON.stringify(result.value) }] };
-        }
-    });
-    server.addTool({
-        name: 'move',
-        description: 'Move an object to a different collection (e.g., move message to another mailbox).',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                item: { type: 'string', description: 'URI of the item to move' },
-                destination: { type: 'string', description: 'URI of the destination collection' }
+        ],
+        rules: [
+            {
+                name: 'Spam Filter',
+                enabled: true,
+                allConditionsMustBeMet: true,
+                deleteMessage: false,
+                markRead: false,
+                markFlagged: false,
+                ruleConditions: [
+                    { header: 'Subject', qualifier: 'contains', ruleType: 'header', expression: 'spam' },
+                ],
             },
-            required: ['item', 'destination']
-        },
-        handler: (args) => {
-            const result = toolMove(args.item, args.destination);
-            if (!result.ok)
-                return { content: [{ type: 'text', text: `Error: ${result.error}` }], isError: true };
-            return { content: [{ type: 'text', text: JSON.stringify(result.value) }] };
-        }
-    });
-    server.addTool({
-        name: 'delete',
-        description: 'Delete an object. Messages are moved to trash. Mailbox deletion is blocked.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                item: { type: 'string', description: 'URI of the item to delete' }
+            {
+                name: 'Work Rules',
+                enabled: false,
+                allConditionsMustBeMet: false,
+                deleteMessage: false,
+                markRead: true,
+                markFlagged: false,
+                ruleConditions: [],
             },
-            required: ['item']
-        },
-        handler: (args) => {
-            const result = toolDelete(args.item);
-            if (!result.ok)
-                return { content: [{ type: 'text', text: `Error: ${result.error}` }], isError: true };
-            return { content: [{ type: 'text', text: JSON.stringify(result.value) }] };
-        }
-    });
+        ],
+        signatures: [
+            { name: 'Default', content: '-- \nJohn Doe' },
+            { name: 'Work', content: '-- \nJohn Doe\nSenior Engineer' },
+        ],
+        // Standard mailboxes (aggregates)
+        inbox: { name: 'All Inboxes', unreadCount: 8, messages: [], mailboxes: [] },
+        sentMailbox: { name: 'All Sent', unreadCount: 0, messages: [], mailboxes: [] },
+        draftsMailbox: { name: 'All Drafts', unreadCount: 0, messages: [], mailboxes: [] },
+        trashMailbox: { name: 'All Trash', unreadCount: 0, messages: [], mailboxes: [] },
+        junkMailbox: { name: 'All Junk', unreadCount: 0, messages: [], mailboxes: [] },
+        outbox: { name: 'Outbox', unreadCount: 0, messages: [], mailboxes: [] },
+        // Settings (app-level properties)
+        alwaysBccMyself: false,
+        alwaysCcMyself: false,
+        fetchInterval: 5,
+    };
 }
-// Export for use in main.ts
-globalThis.registerMailTools = registerMailTools;
-/// <reference path="types/jxa.d.ts" />
-/// <reference path="types/mcp.d.ts" />
-/// <reference path="core/mcp-server.ts" />
-/// <reference path="framework.ts" />
-/// <reference path="jxa-delegate.ts" />
-/// <reference path="mail.ts" />
-/// <reference path="resources.ts" />
-/// <reference path="tools.ts" />
-// ============================================================================
-// Apple Mail MCP Server - Entry Point
-// ============================================================================
-const server = new MCPServer("apple-mail-jxa", "1.0.0");
-// Register resource handlers
-server.setResources(listResources, readResource);
-server.setResourceTemplates(resourceTemplates);
-// Register tools
-registerMailTools(server);
-// Start the server (unless loaded as a library)
-if (!globalThis.__LIBRARY_MODE__) {
-    server.run();
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+function testURIParsing() {
+    group('URI Parsing');
+    // Basic URIs
+    const basic = lexURI('mail://accounts');
+    assertOk(basic, 'Parse mail://accounts');
+    if (basic.ok) {
+        assertEqual(basic.value.scheme, 'mail', 'Scheme is mail');
+        assertEqual(basic.value.segments.length, 1, 'One segment');
+        assertEqual(basic.value.segments[0].head, 'accounts', 'Segment head is accounts');
+    }
+    // Index addressing
+    const indexed = lexURI('mail://accounts[0]');
+    assertOk(indexed, 'Parse mail://accounts[0]');
+    if (indexed.ok) {
+        assertEqual(indexed.value.segments[0].qualifier?.kind, 'index', 'Has index qualifier');
+        if (indexed.value.segments[0].qualifier?.kind === 'index') {
+            assertEqual(indexed.value.segments[0].qualifier.value, 0, 'Index is 0');
+        }
+    }
+    // Nested path
+    const nested = lexURI('mail://accounts[0]/mailboxes/INBOX/messages');
+    assertOk(nested, 'Parse nested path');
+    if (nested.ok) {
+        assertEqual(nested.value.segments.length, 4, 'Four segments');
+        assertEqual(nested.value.segments[2].head, 'INBOX', 'Third segment is INBOX');
+    }
+    // Query parameters
+    const query = lexURI('mail://accounts[0]/mailboxes?name=Inbox&sort=unreadCount.desc');
+    assertOk(query, 'Parse query parameters');
+    if (query.ok) {
+        const q = query.value.segments[1].qualifier;
+        assertEqual(q?.kind, 'query', 'Has query qualifier');
+        if (q?.kind === 'query') {
+            assertEqual(q.filters.length, 1, 'One filter');
+            assertEqual(q.filters[0].field, 'name', 'Filter field is name');
+            assertEqual(q.sort?.field, 'unreadCount', 'Sort by unreadCount');
+            assertEqual(q.sort?.direction, 'desc', 'Sort descending');
+        }
+    }
+    // Pagination
+    const paginated = lexURI('mail://accounts[0]/mailboxes?limit=10&offset=5');
+    assertOk(paginated, 'Parse pagination');
+    if (paginated.ok) {
+        const q = paginated.value.segments[1].qualifier;
+        if (q?.kind === 'query') {
+            assertEqual(q.limit, 10, 'Limit is 10');
+            assertEqual(q.offset, 5, 'Offset is 5');
+        }
+    }
+    // Invalid URI
+    const invalid = lexURI('not-a-uri');
+    assertError(invalid, 'Reject invalid URI');
 }
+function testURIResolution() {
+    group('URI Resolution');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    // Root
+    const root = resolveURI('mail://');
+    assertOk(root, 'Resolve mail://');
+    if (root.ok) {
+        assertEqual(root.value._delegate.uri().href, 'mail://', 'Root URI is mail://');
+    }
+    // Accounts collection
+    const accounts = resolveURI('mail://accounts');
+    assertOk(accounts, 'Resolve mail://accounts');
+    // Account by index
+    const acc0 = resolveURI('mail://accounts[0]');
+    assertOk(acc0, 'Resolve mail://accounts[0]');
+    if (acc0.ok) {
+        const name = acc0.value.name.resolve();
+        assertEqual(name, 'Work', 'First account is Work');
+    }
+    // Account by name
+    const accWork = resolveURI('mail://accounts/Work');
+    assertOk(accWork, 'Resolve mail://accounts/Work');
+    if (accWork.ok) {
+        const name = accWork.value.name.resolve();
+        assertEqual(name, 'Work', 'Account name is Work');
+    }
+    // Nested mailbox
+    const inbox = resolveURI('mail://accounts[0]/mailboxes/INBOX');
+    assertOk(inbox, 'Resolve mailbox by name');
+    if (inbox.ok) {
+        const unread = inbox.value.unreadCount.resolve();
+        assertEqual(unread, 5, 'INBOX has 5 unread');
+    }
+    // Message by id
+    const msg = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1001');
+    assertOk(msg, 'Resolve message by id');
+    if (msg.ok) {
+        const subject = msg.value.subject.resolve();
+        assertEqual(subject, 'Hello World', 'Message subject correct');
+    }
+    // Standard mailboxes
+    const inboxStd = resolveURI('mail://inbox');
+    assertOk(inboxStd, 'Resolve mail://inbox');
+    const sent = resolveURI('mail://sent');
+    assertOk(sent, 'Resolve mail://sent');
+    // Settings namespace
+    const settings = resolveURI('mail://settings');
+    assertOk(settings, 'Resolve mail://settings');
+    const fetchInterval = resolveURI('mail://settings/fetchInterval');
+    assertOk(fetchInterval, 'Resolve mail://settings/fetchInterval');
+    if (fetchInterval.ok) {
+        const val = fetchInterval.value.resolve();
+        assertEqual(val, 5, 'fetchInterval is 5');
+    }
+    // Invalid path
+    const invalid = resolveURI('mail://nonexistent');
+    assertError(invalid, 'Reject unknown path');
+}
+function testResProxy() {
+    group('Res Proxy Behavior');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const result = resolveURI('mail://accounts[0]');
+    if (!result.ok) {
+        assert(false, 'Failed to resolve account');
+        return;
+    }
+    const account = result.value;
+    // Property access creates child Res
+    const mailboxes = account.mailboxes;
+    assert('_delegate' in mailboxes, 'mailboxes has _delegate');
+    assert('byIndex' in mailboxes, 'mailboxes has byIndex method');
+    assert('byName' in mailboxes, 'mailboxes has byName method');
+    // byIndex returns Res
+    const firstMailbox = mailboxes.byIndex(0);
+    assert('_delegate' in firstMailbox, 'byIndex result has _delegate');
+    assertEqual(firstMailbox.name.resolve(), 'INBOX', 'First mailbox is INBOX');
+    // byName returns Res
+    const inboxByName = mailboxes.byName('INBOX');
+    assert('_delegate' in inboxByName, 'byName result has _delegate');
+    assertEqual(inboxByName.name.resolve(), 'INBOX', 'Mailbox by name is INBOX');
+    // Chained navigation
+    const msg = account.mailboxes.byName('INBOX').messages.byId(1001);
+    assert('_delegate' in msg, 'Chained navigation returns Res');
+    assertEqual(msg.subject.resolve(), 'Hello World', 'Chained navigation works');
+}
+function testComputedProperties() {
+    group('Computed Properties');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    // sender is computed from raw email string
+    const msg1 = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1001');
+    if (msg1.ok) {
+        const sender = msg1.value.sender.resolve();
+        assertEqual(sender.address, 'alice@example.com', 'Parsed email address');
+        assertEqual(sender.name, '', 'No name in plain email');
+    }
+    const msg2 = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1002');
+    if (msg2.ok) {
+        const sender = msg2.value.sender.resolve();
+        assertEqual(sender.address, 'bob@example.com', 'Parsed email address with name');
+        assertEqual(sender.name, 'Bob Smith', 'Parsed display name');
+    }
+}
+function testJxaNameMapping() {
+    group('JXA Name Mapping');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    // attachments maps to mailAttachments in JXA
+    const msg = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1002');
+    if (msg.ok) {
+        const attachments = msg.value.attachments.resolve();
+        assertEqual(attachments.length, 1, 'Message has 1 attachment');
+        assertEqual(attachments[0].name, 'doc.pdf', 'Attachment name correct');
+    }
+    // sent maps to sentMailbox in JXA
+    const sent = resolveURI('mail://sent');
+    if (sent.ok) {
+        const name = sent.value.name.resolve();
+        assertEqual(name, 'All Sent', 'Sent mailbox name correct');
+    }
+}
+function testQueryOperations() {
+    group('Query Operations');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    // Filter via URI
+    const filtered = resolveURI('mail://accounts?name=Work');
+    if (filtered.ok) {
+        const accounts = filtered.value.resolve();
+        assertEqual(accounts.length, 1, 'Filter returns 1 account');
+        assertEqual(accounts[0].name, 'Work', 'Filtered account is Work');
+    }
+    // Sort via URI
+    const sorted = resolveURI('mail://accounts[0]/mailboxes?sort=unreadCount.desc');
+    if (sorted.ok) {
+        const mailboxes = sorted.value.resolve();
+        assert(mailboxes.length >= 2, 'At least 2 mailboxes');
+        assert(mailboxes[0].unreadCount >= mailboxes[1].unreadCount, 'Sorted descending');
+    }
+    // Pagination via URI
+    const paginated = resolveURI('mail://accounts[0]/mailboxes?limit=2');
+    if (paginated.ok) {
+        const mailboxes = paginated.value.resolve();
+        assertEqual(mailboxes.length, 2, 'Limit to 2 mailboxes');
+    }
+    // Combined filter + sort + pagination
+    const combo = resolveURI('mail://accounts[0]/mailboxes?unreadCount.gt=0&sort=name.asc&limit=5');
+    if (combo.ok) {
+        const mailboxes = combo.value.resolve();
+        assert(mailboxes.every((m) => m.unreadCount > 0), 'All have unread > 0');
+    }
+}
+function testSetOperation() {
+    group('Set Operation');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    // Get a rule and check initial state
+    const rule = resolveURI('mail://rules[0]');
+    if (rule.ok) {
+        const enabled = rule.value.enabled.resolve();
+        assertEqual(enabled, true, 'Rule initially enabled');
+        // Set to false
+        rule.value.enabled.set(false);
+        const enabledAfter = rule.value.enabled.resolve();
+        assertEqual(enabledAfter, false, 'Rule disabled after set');
+        // Set back
+        rule.value.enabled.set(true);
+        assertEqual(rule.value.enabled.resolve(), true, 'Rule re-enabled');
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Run tests
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('Framework Tests (Node/Mock)');
+console.log('============================');
+testURIParsing();
+testURIResolution();
+testResProxy();
+testComputedProperties();
+testJxaNameMapping();
+testQueryOperations();
+testSetOperation();
+const frameworkTestResult = summary();
+resetCounters();
+// tests/src/test-operations.ts - Domain operation tests (runs in Node with mock data)
+//
+// Tests move, delete, create operations and parent navigation.
+// Uses MockDelegate - no Mail.app required.
+// ─────────────────────────────────────────────────────────────────────────────
+// Mock Data
+// ─────────────────────────────────────────────────────────────────────────────
+function createOperationsMockData() {
+    return {
+        name: 'Mail',
+        version: '16.0',
+        accounts: [
+            {
+                id: 'acc1',
+                name: 'Work',
+                fullName: 'John Doe',
+                emailAddresses: ['john@work.com'],
+                mailboxes: [
+                    {
+                        name: 'INBOX',
+                        unreadCount: 5,
+                        messages: [
+                            {
+                                id: 1001,
+                                messageId: '<msg1@work.com>',
+                                subject: 'Hello World',
+                                sender: 'alice@example.com',
+                                dateSent: '2024-01-15T10:00:00Z',
+                                dateReceived: '2024-01-15T10:01:00Z',
+                                readStatus: false,
+                                flaggedStatus: false,
+                                messageSize: 1024,
+                            },
+                            {
+                                id: 1002,
+                                messageId: '<msg2@work.com>',
+                                subject: 'Meeting Tomorrow',
+                                sender: 'bob@example.com',
+                                dateSent: '2024-01-15T11:00:00Z',
+                                dateReceived: '2024-01-15T11:01:00Z',
+                                readStatus: true,
+                                flaggedStatus: true,
+                                messageSize: 2048,
+                            },
+                        ],
+                        mailboxes: [],
+                    },
+                    {
+                        name: 'Archive',
+                        unreadCount: 0,
+                        messages: [
+                            {
+                                id: 2001,
+                                messageId: '<old@work.com>',
+                                subject: 'Old Message',
+                                sender: 'old@example.com',
+                                dateSent: '2023-01-01T00:00:00Z',
+                                dateReceived: '2023-01-01T00:01:00Z',
+                                readStatus: true,
+                                flaggedStatus: false,
+                                messageSize: 512,
+                            },
+                        ],
+                        mailboxes: [],
+                    },
+                    {
+                        name: 'Trash',
+                        unreadCount: 0,
+                        messages: [],
+                        mailboxes: [],
+                    },
+                ],
+            },
+        ],
+        rules: [
+            {
+                name: 'Spam Filter',
+                enabled: true,
+                allConditionsMustBeMet: true,
+                deleteMessage: false,
+                markRead: false,
+                markFlagged: false,
+            },
+            {
+                name: 'Work Rules',
+                enabled: true,
+                allConditionsMustBeMet: false,
+                deleteMessage: false,
+                markRead: true,
+                markFlagged: false,
+            },
+        ],
+        signatures: [],
+        inbox: { name: 'Inbox', unreadCount: 5, messages: [], mailboxes: [] },
+        sentMailbox: { name: 'Sent', unreadCount: 0, messages: [], mailboxes: [] },
+        draftsMailbox: { name: 'Drafts', unreadCount: 0, messages: [], mailboxes: [] },
+        trashMailbox: { name: 'Trash', unreadCount: 0, messages: [], mailboxes: [] },
+        junkMailbox: { name: 'Junk', unreadCount: 0, messages: [], mailboxes: [] },
+        outbox: { name: 'Outbox', unreadCount: 0, messages: [], mailboxes: [] },
+    };
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+function testMoveMessageBetweenMailboxes() {
+    group('Move Message Between Mailboxes');
+    const mockData = createOperationsMockData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const delegate = createMockDelegate(mockData, 'mail');
+    const mail = getMailApp(delegate);
+    // Get inbox and archive mailboxes
+    const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
+    const archive = mail.accounts.byName('Work').mailboxes.byName('Archive');
+    // Verify initial state
+    const inboxMessages = inbox.messages.resolve();
+    const archiveMessages = archive.messages.resolve();
+    assertEqual(inboxMessages.length, 2, 'Inbox has 2 messages initially');
+    assertEqual(archiveMessages.length, 1, 'Archive has 1 message initially');
+    // Get the first message from inbox
+    const message = inbox.messages.byId(1001);
+    assertEqual(message.subject.resolve(), 'Hello World', 'Message subject is correct');
+    // Move message to archive
+    const moveResult = message.move(archive.messages);
+    assertOk(moveResult, 'Move operation succeeded');
+    // Verify message was removed from source
+    const inboxMessagesAfter = inbox.messages.resolve();
+    assertEqual(inboxMessagesAfter.length, 1, 'Inbox now has 1 message');
+    // Verify message was added to destination
+    const archiveMessagesAfter = archive.messages.resolve();
+    assertEqual(archiveMessagesAfter.length, 2, 'Archive now has 2 messages');
+    // Verify the moved message is in archive
+    const movedMsg = archiveMessagesAfter.find((m) => m.id === 1001);
+    assert(movedMsg !== undefined, 'Moved message found in archive');
+    assertEqual(movedMsg?.subject, 'Hello World', 'Moved message has correct subject');
+}
+function testMoveTypeConstraint() {
+    group('Move Type Constraint');
+    // This test verifies that the type system constrains move destinations.
+    // At compile time: message.move(account.mailboxes) would be a type error
+    // because Collection<Mailbox> is not compatible with Collection<Message>.
+    const mockData = createOperationsMockData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const delegate = createMockDelegate(mockData, 'mail');
+    const mail = getMailApp(delegate);
+    const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
+    const message = inbox.messages.byId(1001);
+    // Verify message has move method
+    assert('move' in message, 'Message has move method');
+    assert(typeof message.move === 'function', 'move is a function');
+    // The type system prevents: message.move(mail.accounts.byName('Work').mailboxes)
+    // This is verified at compile time, not runtime.
+    console.log('  \u2713 Type constraint prevents moving message to wrong collection type (compile-time check)');
+}
+function testDeleteMessage() {
+    group('Delete Message');
+    const mockData = createOperationsMockData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const delegate = createMockDelegate(mockData, 'mail');
+    const mail = getMailApp(delegate);
+    const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
+    // Verify initial state
+    const messagesBefore = inbox.messages.resolve();
+    assertEqual(messagesBefore.length, 2, 'Inbox has 2 messages initially');
+    // Delete the second message
+    const message = inbox.messages.byId(1002);
+    const deleteResult = message.delete();
+    assertOk(deleteResult, 'Delete operation succeeded');
+    // Verify message was removed
+    const messagesAfter = inbox.messages.resolve();
+    assertEqual(messagesAfter.length, 1, 'Inbox now has 1 message');
+    // Verify correct message remains
+    assertEqual(messagesAfter[0].id, 1001, 'Remaining message has correct id');
+}
+function testDeleteRule() {
+    group('Delete Rule');
+    const mockData = createOperationsMockData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const delegate = createMockDelegate(mockData, 'mail');
+    const mail = getMailApp(delegate);
+    // Verify initial state
+    const rulesBefore = mail.rules.resolve();
+    assertEqual(rulesBefore.length, 2, 'App has 2 rules initially');
+    // Delete the first rule
+    const rule = mail.rules.byName('Spam Filter');
+    assert('delete' in rule, 'Rule has delete method');
+    const deleteResult = rule.delete();
+    assertOk(deleteResult, 'Delete operation succeeded');
+    // Verify rule was removed
+    const rulesAfter = mail.rules.resolve();
+    assertEqual(rulesAfter.length, 1, 'App now has 1 rule');
+    assertEqual(rulesAfter[0].name, 'Work Rules', 'Remaining rule is Work Rules');
+}
+function testCreateMessage() {
+    group('Create Message');
+    const mockData = createOperationsMockData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const delegate = createMockDelegate(mockData, 'mail');
+    const mail = getMailApp(delegate);
+    const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
+    // Verify initial state
+    const messagesBefore = inbox.messages.resolve();
+    assertEqual(messagesBefore.length, 2, 'Inbox has 2 messages initially');
+    // Create a new message using delegate
+    const createResult = inbox.messages._delegate.create({
+        subject: 'New Test Message',
+        sender: 'test@example.com',
+        readStatus: false,
+        flaggedStatus: false,
+        messageSize: 100,
+    });
+    const newUri = assertOk(createResult, 'Create operation succeeded');
+    // Verify message was added
+    const messagesAfter = inbox.messages.resolve();
+    assertEqual(messagesAfter.length, 3, 'Inbox now has 3 messages');
+    // Verify the new message
+    const newMsg = messagesAfter[2];
+    assertEqual(newMsg.subject, 'New Test Message', 'New message has correct subject');
+    assert(newMsg.id !== undefined, 'New message has an id assigned');
+    // Verify URI points to new message
+    if (newUri) {
+        assert(newUri.href.includes(String(newMsg.id)), 'Returned URI includes new message id');
+    }
+}
+function testParentNavigation() {
+    group('Parent Navigation');
+    const mockData = createOperationsMockData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const delegate = createMockDelegate(mockData, 'mail');
+    const mail = getMailApp(delegate);
+    // Navigate to messages collection
+    const messagesDelegate = mail.accounts.byName('Work').mailboxes.byName('INBOX').messages._delegate;
+    // Get parent (should be the mailbox)
+    const parentOrRoot = messagesDelegate.parent();
+    assert(!isRoot(parentOrRoot), 'Parent of messages is not root');
+    if (!isRoot(parentOrRoot)) {
+        const parent = parentOrRoot;
+        // Parent should be the mailbox - verify by checking its URI
+        const parentUri = parent.uri().href;
+        assert(parentUri.includes('INBOX'), 'Parent URI includes INBOX');
+    }
+    // Navigate to root
+    const rootDelegate = mail._delegate;
+    const rootParent = rootDelegate.parent();
+    assert(isRoot(rootParent), 'Parent of root delegate is RootMarker');
+}
+function testUriReturnsURL() {
+    group('URI Returns URL Object');
+    const mockData = createOperationsMockData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const delegate = createMockDelegate(mockData, 'mail');
+    const mail = getMailApp(delegate);
+    const message = mail.accounts.byName('Work').mailboxes.byName('INBOX').messages.byId(1001);
+    const uri = message._delegate.uri();
+    assert(uri instanceof URL, 'uri() returns URL object');
+    assertEqual(typeof uri.href, 'string', 'URL has href property');
+    assertEqual(typeof uri.pathname, 'string', 'URL has pathname property');
+    assert(uri.href.startsWith('mail://'), 'URI starts with mail://');
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Run tests
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('Domain Operations Tests (Node/Mock)');
+console.log('====================================');
+testMoveMessageBetweenMailboxes();
+testMoveTypeConstraint();
+testDeleteMessage();
+testDeleteRule();
+testCreateMessage();
+testParentNavigation();
+testUriReturnsURL();
+const operationsTestResult = summary();

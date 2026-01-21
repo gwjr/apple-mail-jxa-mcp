@@ -317,8 +317,13 @@ type MailSettings = Res<typeof MailSettingsProto>;
 
 // Register the mail:// scheme with the framework
 // This enables resolveURI('mail://...') to work
-registerScheme(
-  'mail',
-  () => createJXADelegate(Application('Mail'), 'mail'),
-  MailApplicationProto
-);
+// Only register in JXA environment (Application and createJXADelegate are JXA-only)
+// Use globalThis to check without TypeScript complaining
+const _globalThis = globalThis as any;
+if (typeof _globalThis.Application !== 'undefined' && typeof _globalThis.createJXADelegate !== 'undefined') {
+  registerScheme(
+    'mail',
+    () => _globalThis.createJXADelegate(_globalThis.Application('Mail'), 'mail'),
+    MailApplicationProto
+  );
+}
