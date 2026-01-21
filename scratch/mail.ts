@@ -8,6 +8,45 @@
 
 type ParsedEmailAddress = { name: string; address: string };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Domain-specific mutation handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Messages move by setting the mailbox property, not using JXA move command
+const messageMoveHandler: MoveHandler = (msgDelegate, destCollectionDelegate): Result<URL> => {
+  // destCollectionDelegate is the messages collection
+  // parent() gives us the mailbox
+  const destMailboxOrRoot = destCollectionDelegate.parent();
+  if (isRoot(destMailboxOrRoot)) {
+    return { ok: false, error: 'Cannot determine destination mailbox' };
+  }
+  const destMailbox = destMailboxOrRoot;
+
+  // For JXA: message.mailbox = destMailbox._jxa()
+  // For Mock: move data from one array to another
+  const moveResult = msgDelegate.moveTo(destCollectionDelegate);
+  if (!moveResult.ok) return moveResult;
+
+  // Return new URL - construct from destination mailbox URI
+  const destMailboxUri = destMailbox.uri();
+  // Get the message's RFC messageId (stable across moves)
+  try {
+    const rfcMessageId = msgDelegate.prop('messageId')._jxa();
+    const newUrl = new URL(`${destMailboxUri.href}/messages/${encodeURIComponent(rfcMessageId)}`);
+    return { ok: true, value: newUrl };
+  } catch {
+    // Fall back to default move result
+    return moveResult;
+  }
+};
+
+// Messages delete by moving to trash, not actual delete
+const messageDeleteHandler: DeleteHandler = (msgDelegate): Result<URL> => {
+  // For now, use the default delete behavior
+  // A full implementation would navigate to account's trash and move there
+  return msgDelegate.delete();
+};
+
 // Extract mailbox name from JXA mailbox object (used for rule actions)
 function extractMailboxName(mailbox: any): string | null {
   try {
@@ -53,26 +92,29 @@ const RuleConditionProto = {
 // Rule proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-const RuleProto = {
+const _RuleProtoBase = {
   ...baseScalar,
   name: eagerScalar,
-  enabled: withSet(baseScalar),
-  allConditionsMustBeMet: withSet(baseScalar),
-  deleteMessage: withSet(baseScalar),
-  markRead: withSet(baseScalar),
-  markFlagged: withSet(baseScalar),
-  markFlagIndex: withSet(baseScalar),
-  stopEvaluatingRules: withSet(baseScalar),
-  forwardMessage: withSet(baseScalar),
-  redirectMessage: withSet(baseScalar),
-  replyText: withSet(baseScalar),
-  playSound: withSet(baseScalar),
-  highlightTextUsingColor: withSet(baseScalar),
+  enabled: withSet(t.boolean),
+  allConditionsMustBeMet: withSet(t.boolean),
+  deleteMessage: withSet(t.boolean),
+  markRead: withSet(t.boolean),
+  markFlagged: withSet(t.boolean),
+  markFlagIndex: withSet(t.number),
+  stopEvaluatingRules: withSet(t.boolean),
+  forwardMessage: withSet(t.string),
+  redirectMessage: withSet(t.string),
+  replyText: withSet(t.string),
+  playSound: withSet(t.string),
+  highlightTextUsingColor: withSet(t.string),
   // copyMessage/moveMessage return the destination mailbox name (or null)
   copyMessage: computed<string | null>(extractMailboxName),
   moveMessage: computed<string | null>(extractMailboxName),
   ruleConditions: pipe(baseCollection, withByIndex(RuleConditionProto)),
 };
+
+// RuleProto with delete operation (uses default JXA delete)
+const RuleProto = pipe(_RuleProtoBase, withDelete());
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Signature proto
@@ -109,19 +151,22 @@ const AttachmentProto = {
 // Message proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MessageProto = {
+// Forward declaration for MessageProto type (used in collection types)
+type MessageProtoType = typeof _MessageProtoBase & MoveableProto<typeof _MessageProtoBase> & DeleteableProto;
+
+const _MessageProtoBase = {
   ...baseScalar,
   id: eagerScalar,
   messageId: eagerScalar,
-  subject: withSet(baseScalar),
+  subject: withSet(t.string),
   sender: computed<ParsedEmailAddress>(parseEmailAddress),
   replyTo: computed<ParsedEmailAddress>(parseEmailAddress),
   dateSent: eagerScalar,
   dateReceived: eagerScalar,
   content: makeLazy(baseScalar),
-  readStatus: withSet(baseScalar),
-  flaggedStatus: withSet(baseScalar),
-  junkMailStatus: withSet(baseScalar),
+  readStatus: withSet(t.boolean),
+  flaggedStatus: withSet(t.boolean),
+  junkMailStatus: withSet(t.boolean),
   messageSize: eagerScalar,
   toRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
   ccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
@@ -132,28 +177,39 @@ const MessageProto = {
   ),
 };
 
+// MessageProto with move and delete operations
+const MessageProto = pipe2(
+  _MessageProtoBase,
+  withMove(_MessageProtoBase, messageMoveHandler),
+  withDelete(messageDeleteHandler)
+);
+
 const LazyMessageProto = makeLazy(MessageProto);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mailbox proto (recursive - interface required for self-reference)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Collection type with CollectionBrand for type-safe move operations
+type MessageCollectionProto = CollectionProto<typeof LazyMessageProto> & ByIndexProto<typeof LazyMessageProto> & ByIdProto<typeof LazyMessageProto>;
+type MailboxCollectionProto = CollectionProto<MailboxProtoType> & ByIndexProto<MailboxProtoType> & ByNameProto<MailboxProtoType>;
+
 interface MailboxProtoType extends BaseProtoType {
   name: typeof eagerScalar;
   unreadCount: typeof eagerScalar;
-  messages: BaseProtoType & ByIndexProto<typeof LazyMessageProto> & ByIdProto<typeof LazyMessageProto>;
-  mailboxes: BaseProtoType & ByIndexProto<MailboxProtoType> & ByNameProto<MailboxProtoType>;
+  messages: MessageCollectionProto;
+  mailboxes: MailboxCollectionProto;
 }
 
 const MailboxProto: MailboxProtoType = {
   ...baseScalar,
   name: eagerScalar,
   unreadCount: eagerScalar,
-  messages: pipe2(baseCollection, withByIndex(LazyMessageProto), withById(LazyMessageProto)),
+  messages: pipe2(collection<typeof LazyMessageProto>(), withByIndex(LazyMessageProto), withById(LazyMessageProto)) as MessageCollectionProto,
   mailboxes: null as any,
 };
 
-MailboxProto.mailboxes = pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto));
+MailboxProto.mailboxes = pipe2(collection<MailboxProtoType>(), withByIndex(MailboxProto), withByName(MailboxProto)) as MailboxCollectionProto;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto
@@ -181,36 +237,36 @@ const MailSettingsProto = {
   version: eagerScalar,
   frontmost: eagerScalar,
   // Behavior
-  alwaysBccMyself: withSet(baseScalar),
-  alwaysCcMyself: withSet(baseScalar),
-  downloadHtmlAttachments: withSet(baseScalar),
-  fetchInterval: withSet(baseScalar),
-  expandGroupAddresses: withSet(baseScalar),
+  alwaysBccMyself: withSet(t.boolean),
+  alwaysCcMyself: withSet(t.boolean),
+  downloadHtmlAttachments: withSet(t.boolean),
+  fetchInterval: withSet(t.number),
+  expandGroupAddresses: withSet(t.boolean),
   // Composing
-  defaultMessageFormat: withSet(baseScalar),
-  chooseSignatureWhenComposing: withSet(baseScalar),
-  quoteOriginalMessage: withSet(baseScalar),
-  sameReplyFormat: withSet(baseScalar),
-  includeAllOriginalMessageText: withSet(baseScalar),
+  defaultMessageFormat: withSet(t.string),
+  chooseSignatureWhenComposing: withSet(t.boolean),
+  quoteOriginalMessage: withSet(t.boolean),
+  sameReplyFormat: withSet(t.boolean),
+  includeAllOriginalMessageText: withSet(t.boolean),
   // Display
-  highlightSelectedConversation: withSet(baseScalar),
-  colorQuotedText: withSet(baseScalar),
-  levelOneQuotingColor: withSet(baseScalar),
-  levelTwoQuotingColor: withSet(baseScalar),
-  levelThreeQuotingColor: withSet(baseScalar),
+  highlightSelectedConversation: withSet(t.boolean),
+  colorQuotedText: withSet(t.boolean),
+  levelOneQuotingColor: withSet(t.string),
+  levelTwoQuotingColor: withSet(t.string),
+  levelThreeQuotingColor: withSet(t.string),
   // Fonts
-  messageFont: withSet(baseScalar),
-  messageFontSize: withSet(baseScalar),
-  messageListFont: withSet(baseScalar),
-  messageListFontSize: withSet(baseScalar),
-  useFixedWidthFont: withSet(baseScalar),
-  fixedWidthFont: withSet(baseScalar),
-  fixedWidthFontSize: withSet(baseScalar),
+  messageFont: withSet(t.string),
+  messageFontSize: withSet(t.number),
+  messageListFont: withSet(t.string),
+  messageListFontSize: withSet(t.number),
+  useFixedWidthFont: withSet(t.boolean),
+  fixedWidthFont: withSet(t.string),
+  fixedWidthFontSize: withSet(t.number),
   // Sounds
-  newMailSound: withSet(baseScalar),
-  shouldPlayOtherMailSounds: withSet(baseScalar),
+  newMailSound: withSet(t.string),
+  shouldPlayOtherMailSounds: withSet(t.boolean),
   // Spelling
-  checkSpellingWhileTyping: withSet(baseScalar),
+  checkSpellingWhileTyping: withSet(t.boolean),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

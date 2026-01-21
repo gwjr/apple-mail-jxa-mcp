@@ -16,6 +16,22 @@ declare const ByIndexBrand: unique symbol;
 declare const ByNameBrand: unique symbol;
 declare const ByIdBrand: unique symbol;
 declare const JxaNameBrand: unique symbol;
+declare const MoveableBrand: unique symbol;
+declare const DeleteableBrand: unique symbol;
+declare const CreateableBrand: unique symbol;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Root Marker (for parent navigation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Use a runtime symbol for the RootMarker
+const RootBrand: unique symbol = Symbol('RootBrand') as any;
+type RootMarker = { readonly [RootBrand]: true };
+const ROOT: RootMarker = { [RootBrand]: true } as RootMarker;
+
+function isRoot(d: Delegate | RootMarker): d is RootMarker {
+  return RootBrand in d;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Type-level utilities
@@ -131,9 +147,17 @@ interface Delegate {
   byIndex(n: number): Delegate;
   byName(name: string): Delegate;
   byId(id: string | number): Delegate;
-  uri(): string;
+  uri(): URL;
   set(value: any): void;
   namespace(name: string): Delegate;
+
+  // Parent navigation - returns RootMarker at top
+  parent(): Delegate | RootMarker;
+
+  // Mutation operations - return URL
+  moveTo(destination: Delegate): Result<URL>;
+  delete(): Result<URL>;
+  create(properties: Record<string, any>): Result<URL>;
 
   withFilter(filter: WhoseFilter): Delegate;
   withSort(sort: SortSpec<any>): Delegate;
@@ -184,6 +208,10 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
       }
 
       return undefined;
+    },
+    has(t, prop: string | symbol) {
+      if (prop === '_delegate') return true;
+      return prop in proto;
     }
   };
 
@@ -194,34 +222,21 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
 // Base Prototypes
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface BaseProtoType {
-  resolve(): any;
-  resolve_eager(): any;
+interface BaseProtoType<T = any> {
+  resolve(): T;
+  resolve_eager(): T | Specifier;
   exists(): boolean;
   specifier(): Specifier;
 }
 
-const baseScalar = {
-  resolve(this: { _delegate: Delegate }) {
-    return this._delegate._jxa();
-  },
-  resolve_eager(this: { _delegate: Delegate; resolve(): any }) {
-    return this.resolve();
-  },
-  exists(this: { _delegate: Delegate }) {
-    try {
-      this._delegate._jxa();
-      return true;
-    } catch {
-      return false;
-    }
-  },
-  specifier(this: { _delegate: Delegate }) {
-    return { uri: this._delegate.uri() };
-  },
-} as BaseProtoType;
+// Scalar proto: BaseProtoType<T> + ScalarBrand for discrimination
+type ScalarProto<T> = BaseProtoType<T> & { readonly [ScalarBrand]: T };
 
-const baseCollection = {
+// Collection proto: BaseProtoType<Item[]> + CollectionBrand
+type CollectionProto<Item> = BaseProtoType<Item[]> & { readonly [CollectionBrand]: Item };
+
+// Shared implementation for base proto methods
+const _baseProtoImpl = {
   resolve(this: { _delegate: Delegate }) {
     return this._delegate._jxa();
   },
@@ -237,9 +252,32 @@ const baseCollection = {
     }
   },
   specifier(this: { _delegate: Delegate }) {
-    return { uri: this._delegate.uri() };
+    return { uri: this._delegate.uri().href };
   },
-} as BaseProtoType;
+};
+
+// Typed scalar factory
+function scalar<T>(): ScalarProto<T> {
+  return { ..._baseProtoImpl } as ScalarProto<T>;
+}
+
+// Typed collection factory
+function collection<Item = any>(): CollectionProto<Item> {
+  return { ..._baseProtoImpl } as CollectionProto<Item>;
+}
+
+// Primitive type scalars
+const t = {
+  string: scalar<string>(),
+  number: scalar<number>(),
+  boolean: scalar<boolean>(),
+  date: scalar<Date>(),
+  any: scalar<any>(),
+};
+
+// Legacy aliases (untyped, for backwards compatibility)
+const baseScalar = scalar<any>();
+const baseCollection = collection();
 
 // Convenience alias
 const eagerScalar = baseScalar;
@@ -257,17 +295,20 @@ function makeLazy<P extends BaseProtoType>(proto: P): P & { readonly [LazyBrand]
   } as P & { readonly [LazyBrand]: true };
 }
 
-interface SettableProto {
-  set(value: any): void;
+interface SettableProto<T> {
+  set(value: T): void;
 }
 
-function withSet<P extends BaseProtoType>(proto: P): P & SettableProto & { readonly [SettableBrand]: true } {
+// Extract the type from a proto - works with ScalarProto<T> via the brand
+type ExtractProtoType<P> = P extends { readonly [ScalarBrand]: infer T } ? T : any;
+
+function withSet<P extends BaseProtoType<any>>(proto: P): P & SettableProto<ExtractProtoType<P>> & { readonly [SettableBrand]: true } {
   return {
     ...proto,
-    set(this: { _delegate: Delegate }, value: any) {
+    set(this: { _delegate: Delegate }, value: ExtractProtoType<P>) {
       this._delegate.set(value);
     },
-  } as P & SettableProto & { readonly [SettableBrand]: true };
+  } as P & SettableProto<ExtractProtoType<P>> & { readonly [SettableBrand]: true };
 }
 
 const collectionItemProtos = new WeakMap<object, object>();
@@ -324,6 +365,85 @@ function withById<Item extends object>(itemProto: Item) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mutation Composers (move, delete, create)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Operation handler types - return URL, composer wraps in Res
+type MoveHandler = (item: Delegate, destCollection: Delegate) => Result<URL>;
+type DeleteHandler = (item: Delegate) => Result<URL>;
+type CreateHandler = (collection: Delegate, properties: Record<string, any>) => Result<URL>;
+
+// Moveable proto interface - takes Res<CollectionProto<Item>> (which has _delegate)
+interface MoveableProto<Item> {
+  move(to: Res<CollectionProto<Item>>): Result<Res<Item>>;
+}
+
+// Composer: adds move() with optional custom handler
+// Type parameter Item constrains what collections this can move to
+function withMove<Item extends object>(itemProto: Item, handler?: MoveHandler) {
+  return function<P extends BaseProtoType>(proto: P): P & MoveableProto<Item> & { readonly [MoveableBrand]: true } {
+    const result = {
+      ...proto,
+      move(this: { _delegate: Delegate }, to: Res<CollectionProto<Item>>): Result<Res<Item>> {
+        const urlResult = handler
+          ? handler(this._delegate, to._delegate)
+          : this._delegate.moveTo(to._delegate);
+
+        if (!urlResult.ok) return urlResult;
+        // Resolve URL to Res for caller
+        const resolveResult = resolveURI(urlResult.value.href);
+        if (!resolveResult.ok) return resolveResult;
+        return { ok: true, value: resolveResult.value as Res<Item> };
+      },
+    };
+    return result as P & MoveableProto<Item> & { readonly [MoveableBrand]: true };
+  };
+}
+
+// Deleteable proto interface
+interface DeleteableProto {
+  delete(): Result<URL>;
+}
+
+// Composer: adds delete() with optional custom handler
+function withDelete(handler?: DeleteHandler) {
+  return function<P extends BaseProtoType>(proto: P): P & DeleteableProto & { readonly [DeleteableBrand]: true } {
+    return {
+      ...proto,
+      delete(this: { _delegate: Delegate }): Result<URL> {
+        return handler
+          ? handler(this._delegate)
+          : this._delegate.delete();
+      },
+    } as P & DeleteableProto & { readonly [DeleteableBrand]: true };
+  };
+}
+
+// Createable proto interface (for collections)
+interface CreateableProto<Item> {
+  create(properties: Partial<Item>): Result<Res<Item>>;
+}
+
+// Composer: adds create() with optional custom handler
+function withCreate<Item extends object>(itemProto: Item, handler?: CreateHandler) {
+  return function<P extends BaseProtoType>(proto: P): P & CreateableProto<Item> & { readonly [CreateableBrand]: true } {
+    return {
+      ...proto,
+      create(this: { _delegate: Delegate }, properties: Partial<Item>): Result<Res<Item>> {
+        const urlResult = handler
+          ? handler(this._delegate, properties as Record<string, any>)
+          : this._delegate.create(properties as Record<string, any>);
+
+        if (!urlResult.ok) return urlResult;
+        const resolveResult = resolveURI(urlResult.value.href);
+        if (!resolveResult.ok) return resolveResult;
+        return { ok: true, value: resolveResult.value as Res<Item> };
+      },
+    } as P & CreateableProto<Item> & { readonly [CreateableBrand]: true };
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // JXA Name Mapping
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -371,7 +491,7 @@ function computed<T>(transform: (raw: any) => T): BaseProtoType {
       }
     },
     specifier(this: { _delegate: Delegate }) {
-      return { uri: this._delegate.uri() };
+      return { uri: this._delegate.uri().href };
     },
   };
 }
@@ -417,7 +537,7 @@ function computedNav<P extends object>(
       }
     },
     specifier(this: { _delegate: Delegate }) {
-      return { uri: navigate(this._delegate).uri() };
+      return { uri: navigate(this._delegate).uri().href };
     },
   } as unknown as ComputedNavProto<P>;
 
@@ -576,7 +696,7 @@ type PathSegment =
   | { kind: 'name'; value: string }
   | { kind: 'id'; value: string | number };
 
-function buildURI(segments: PathSegment[]): string {
+function buildURIString(segments: PathSegment[]): string {
   let uri = '';
   for (const seg of segments) {
     switch (seg.kind) {
@@ -598,6 +718,10 @@ function buildURI(segments: PathSegment[]): string {
     }
   }
   return uri;
+}
+
+function buildURI(segments: PathSegment[]): URL {
+  return new URL(buildURIString(segments));
 }
 
 function buildQueryString(query: QueryState): string {
