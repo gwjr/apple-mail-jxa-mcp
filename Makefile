@@ -36,7 +36,7 @@ clean:
 	rm -rf dist
 
 reset:
-	@pids=$$(pgrep -f 'osascript.*mail.js|node test-mail' 2>/dev/null); \
+	@pids=$$(pgrep -f 'osascript.*mail.js|node.*mcp-server' 2>/dev/null); \
 	if [ -n "$$pids" ]; then \
 		echo "Killing: $$pids"; \
 		kill $$pids 2>/dev/null; \
@@ -44,8 +44,23 @@ reset:
 		echo "No server running"; \
 	fi
 
-test: $(DIST)
-	node test-mail.js
+# Test bundle (framework only, no MCP server)
+dist/mail-test.js: $(SOURCES) tsconfig.test.json
+	@mkdir -p dist
+	@echo "Building $@ (TypeScript - test)"
+	@npx tsc -p tsconfig.test.json
+	@echo "Built $@ ($$(wc -l < $@ | tr -d ' ') lines)"
+
+# Run all tests
+test: $(DIST) dist/mail-test.js
+	@echo "=== JXA Framework Tests ==="
+	@cd tests && osascript -l JavaScript framework.js
+	@echo ""
+	@echo "=== JXA URI Parsing Tests ==="
+	@cd tests && osascript -l JavaScript uri-parsing.js
+	@echo ""
+	@echo "=== MCP Server Tests ==="
+	@node tests/mcp-server.js
 
 install:
 	npm install

@@ -163,8 +163,14 @@ function parseSegments(path: string): Segment[] {
       const closeIdx = remaining.indexOf(']');
       if (closeIdx !== -1) {
         const indexStr = remaining.slice(1, closeIdx);
-        segment.qualifier = { kind: 'index', value: parseInt(indexStr, 10) };
-        remaining = remaining.slice(closeIdx + 1);
+        if (!isInteger(indexStr)) {
+          // Invalid index - treat as name addressing instead (will fail later if invalid)
+          segment.head = head + remaining.slice(0, closeIdx + 1);
+          remaining = remaining.slice(closeIdx + 1);
+        } else {
+          segment.qualifier = { kind: 'index', value: parseInt(indexStr, 10) };
+          remaining = remaining.slice(closeIdx + 1);
+        }
       }
     }
 

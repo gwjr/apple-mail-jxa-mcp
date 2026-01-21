@@ -7,7 +7,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const readline = require('readline');
 
-const SERVER_PATH = path.join(__dirname, 'dist', 'mail.js');
+const SERVER_PATH = path.join(__dirname, '..', 'dist', 'mail.js');
 const TIMEOUT = 10000;
 
 class MCPTestClient {
@@ -150,6 +150,19 @@ function assertIncludes(array, item, message) {
 }
 
 // ============================================================================
+// PROTOCOL TESTS
+// ============================================================================
+
+// Initialize response validation
+test('initialize returns server info and capabilities', async (client) => {
+    // Re-initialize to check response (client already initialized in start())
+    const result = await client.call('initialize', { clientInfo: { name: 'test-verify' } });
+
+    assert(result.serverInfo?.name === 'apple-mail-jxa', `Expected server name 'apple-mail-jxa', got '${result.serverInfo?.name}'`);
+    assert(result.capabilities?.resources !== undefined, 'Expected resources capability');
+});
+
+// ============================================================================
 // RESOURCE TESTS
 // ============================================================================
 
@@ -197,6 +210,15 @@ test('resources/read mail://rules', async (client) => {
     assert(Array.isArray(content), 'Expected rules to be array');
 });
 
+// Individual rule
+test('resources/read mail://rules[0] returns rule details', async (client) => {
+    const result = await client.call('resources/read', { uri: 'mail://rules[0]' });
+    const content = JSON.parse(result.contents[0].text);
+
+    assert(content.name, 'Expected rule name');
+    assert(typeof content.enabled === 'boolean', 'Expected enabled to be boolean');
+});
+
 // Signatures resource
 test('resources/read mail://signatures', async (client) => {
     const result = await client.call('resources/read', { uri: 'mail://signatures' });
@@ -212,6 +234,19 @@ test('resources/read mail://inbox', async (client) => {
 
     assert(content.name, 'Expected name');
     assert(typeof content.unreadCount === 'number', 'Expected unreadCount');
+});
+
+// Accounts collection
+test('resources/read mail://accounts returns accounts array', async (client) => {
+    const result = await client.call('resources/read', { uri: 'mail://accounts' });
+    const content = JSON.parse(result.contents[0].text);
+
+    assert(Array.isArray(content), 'Expected accounts array');
+    assert(content.length > 0, 'Expected at least one account');
+
+    const acc = content[0];
+    assert(acc.name, 'Expected account name');
+    assert(acc.id, 'Expected account id');
 });
 
 // Account hierarchy
@@ -261,6 +296,15 @@ test('resources/read mail://inbox/messages[0] returns message details', async (c
     assert(content.id !== undefined, 'Expected id');
     assert(content.subject !== undefined, 'Expected subject');
     assert(content.sender, 'Expected sender');
+});
+
+// Pagination
+test('resources/read with pagination (limit)', async (client) => {
+    const result = await client.call('resources/read', { uri: 'mail://accounts[0]/mailboxes?limit=3' });
+    const content = JSON.parse(result.contents[0].text);
+
+    assert(Array.isArray(content), 'Expected array');
+    assert(content.length <= 3, `Expected at most 3 items, got ${content.length}`);
 });
 
 // Filtering

@@ -205,8 +205,8 @@ const MailAppSchema = {
   outbox: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.outbox } as ScalarDescriptor,
   sent: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.sentMailbox, jxaName: 'sentMailbox' } as ScalarDescriptor,
   trash: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa.trashMailbox, jxaName: 'trashMailbox' } as ScalarDescriptor,
-  // Settings namespace
-  settings: { dimension: 'scalar', type: SettingsSchema, set: 'unavailable', lazy: false } as ScalarDescriptor,
+  // Settings namespace - properties are directly on app, not in a sub-object
+  settings: { dimension: 'scalar', type: SettingsSchema, set: 'unavailable', lazy: false, computed: (jxa: any) => jxa } as ScalarDescriptor,
 } as const;
 
 // ============================================================================

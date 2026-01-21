@@ -449,8 +449,15 @@ function parseSegments(path) {
             const closeIdx = remaining.indexOf(']');
             if (closeIdx !== -1) {
                 const indexStr = remaining.slice(1, closeIdx);
-                segment.qualifier = { kind: 'index', value: parseInt(indexStr, 10) };
-                remaining = remaining.slice(closeIdx + 1);
+                if (!isInteger(indexStr)) {
+                    // Invalid index - treat as name addressing instead (will fail later if invalid)
+                    segment.head = head + remaining.slice(0, closeIdx + 1);
+                    remaining = remaining.slice(closeIdx + 1);
+                }
+                else {
+                    segment.qualifier = { kind: 'index', value: parseInt(indexStr, 10) };
+                    remaining = remaining.slice(closeIdx + 1);
+                }
             }
         }
         if (remaining.startsWith('?')) {
@@ -956,6 +963,7 @@ function specifierFromURI(uri) {
     let inCollection = false;
     let collectionSchema = null;
     let collectionAddressing = [];
+    let queryQualifier = null;
     // Walk segments
     for (let i = 0; i < segments.length; i++) {
         const segment = segments[i];
@@ -979,7 +987,10 @@ function specifierFromURI(uri) {
                         return result;
                     currentJxa = result.value.jxa;
                     currentUri = result.value.uri;
-                    if (qualifier.kind !== 'query') {
+                    if (qualifier.kind === 'query') {
+                        queryQualifier = qualifier;
+                    }
+                    else {
                         // Index or ID addressing - now at element level
                         currentSchema = collectionSchema;
                         inCollection = false;
@@ -1037,9 +1048,40 @@ function specifierFromURI(uri) {
     }
     // Build final specifier
     if (inCollection) {
+        // Convert query qualifier to sort/filter/pagination specs
+        let sortSpec;
+        let jsFilter;
+        let pagination;
+        let expand;
+        if (queryQualifier) {
+            if (queryQualifier.sort) {
+                sortSpec = { by: queryQualifier.sort.field, direction: queryQualifier.sort.direction };
+            }
+            if (queryQualifier.filters.length > 0) {
+                jsFilter = {};
+                for (const f of queryQualifier.filters) {
+                    if (f.op === 'equals')
+                        jsFilter[f.field] = { equals: f.value };
+                    else if (f.op === 'contains')
+                        jsFilter[f.field] = { contains: f.value };
+                    else if (f.op === 'startsWith')
+                        jsFilter[f.field] = { startsWith: f.value };
+                    else if (f.op === 'gt')
+                        jsFilter[f.field] = { greaterThan: parseFloat(f.value) };
+                    else if (f.op === 'lt')
+                        jsFilter[f.field] = { lessThan: parseFloat(f.value) };
+                }
+            }
+            if (queryQualifier.limit !== undefined || queryQualifier.offset !== undefined) {
+                pagination = { limit: queryQualifier.limit, offset: queryQualifier.offset };
+            }
+            if (queryQualifier.expand) {
+                expand = queryQualifier.expand;
+            }
+        }
         return {
             ok: true,
-            value: createCollSpec(currentUri, currentJxa, collectionSchema, collectionAddressing, 'Item')
+            value: createCollSpec(currentUri, currentJxa, collectionSchema, collectionAddressing, 'Item', 'default', 'default', sortSpec, jsFilter, pagination, expand)
         };
     }
     return {
@@ -1327,8 +1369,8 @@ const MailAppSchema = {
     outbox: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa) => jxa.outbox },
     sent: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa) => jxa.sentMailbox, jxaName: 'sentMailbox' },
     trash: { dimension: 'scalar', type: StandardMailboxSchema, set: 'unavailable', lazy: false, computed: (jxa) => jxa.trashMailbox, jxaName: 'trashMailbox' },
-    // Settings namespace
-    settings: { dimension: 'scalar', type: SettingsSchema, set: 'unavailable', lazy: false },
+    // Settings namespace - properties are directly on app, not in a sub-object
+    settings: { dimension: 'scalar', type: SettingsSchema, set: 'unavailable', lazy: false, computed: (jxa) => jxa },
 };
 // ============================================================================
 // Entry Point

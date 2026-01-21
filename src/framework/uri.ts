@@ -47,6 +47,7 @@ function specifierFromURI(uri: string): Result<any> {
   let inCollection = false;
   let collectionSchema: Schema | null = null;
   let collectionAddressing: AddressingMode[] = [];
+  let queryQualifier: QueryQualifier | null = null;
 
   // Walk segments
   for (let i = 0; i < segments.length; i++) {
@@ -74,7 +75,9 @@ function specifierFromURI(uri: string): Result<any> {
           if (!result.ok) return result;
           currentJxa = result.value.jxa;
           currentUri = result.value.uri;
-          if (qualifier.kind !== 'query') {
+          if (qualifier.kind === 'query') {
+            queryQualifier = qualifier;
+          } else {
             // Index or ID addressing - now at element level
             currentSchema = collectionSchema;
             inCollection = false;
@@ -129,9 +132,37 @@ function specifierFromURI(uri: string): Result<any> {
 
   // Build final specifier
   if (inCollection) {
+    // Convert query qualifier to sort/filter/pagination specs
+    let sortSpec: SortSpec<any> | undefined;
+    let jsFilter: WhoseFilter<any> | undefined;
+    let pagination: PaginationSpec | undefined;
+    let expand: ExpandSpec | undefined;
+
+    if (queryQualifier) {
+      if (queryQualifier.sort) {
+        sortSpec = { by: queryQualifier.sort.field as any, direction: queryQualifier.sort.direction };
+      }
+      if (queryQualifier.filters.length > 0) {
+        jsFilter = {};
+        for (const f of queryQualifier.filters) {
+          if (f.op === 'equals') (jsFilter as any)[f.field] = { equals: f.value };
+          else if (f.op === 'contains') (jsFilter as any)[f.field] = { contains: f.value };
+          else if (f.op === 'startsWith') (jsFilter as any)[f.field] = { startsWith: f.value };
+          else if (f.op === 'gt') (jsFilter as any)[f.field] = { greaterThan: parseFloat(f.value) };
+          else if (f.op === 'lt') (jsFilter as any)[f.field] = { lessThan: parseFloat(f.value) };
+        }
+      }
+      if (queryQualifier.limit !== undefined || queryQualifier.offset !== undefined) {
+        pagination = { limit: queryQualifier.limit, offset: queryQualifier.offset };
+      }
+      if (queryQualifier.expand) {
+        expand = queryQualifier.expand;
+      }
+    }
+
     return {
       ok: true,
-      value: createCollSpec(currentUri, currentJxa, collectionSchema!, collectionAddressing, 'Item')
+      value: createCollSpec(currentUri, currentJxa, collectionSchema!, collectionAddressing, 'Item', 'default', 'default', sortSpec, jsFilter, pagination, expand)
     };
   }
 
