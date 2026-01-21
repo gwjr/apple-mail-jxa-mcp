@@ -213,7 +213,8 @@ interface MailAccountProtoType extends BaseProtoType {
   fullName: typeof eagerScalar;
   // emailAddresses requires computed() to call jxa.emailAddresses()
   mailboxes: BaseProtoType & ByIndexProto<typeof MailboxProto> & ByNameProto<typeof MailboxProto>;
-  // Account-scoped standard mailboxes (inbox, sent, drafts, junk, trash) require computed()
+  // Account-level inbox - complex navigation via computedNav
+  inbox: ComputedNavProto<typeof MailboxProto>;
 }
 
 const MailAccountProto: MailAccountProtoType = {
@@ -222,6 +223,8 @@ const MailAccountProto: MailAccountProtoType = {
   name: eagerScalar,
   fullName: eagerScalar,
   mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
+  // Account inbox navigates to mailboxes.byName('INBOX')
+  inbox: computedNav((d) => d.prop('mailboxes').byName('INBOX'), MailboxProto),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,7 +237,13 @@ interface MailApplicationProtoType extends BaseProtoType {
   accounts: BaseProtoType & ByIndexProto<typeof MailAccountProto> & ByNameProto<typeof MailAccountProto> & ByIdProto<typeof MailAccountProto>;
   rules: BaseProtoType & ByIndexProto<typeof RuleProto> & ByNameProto<typeof RuleProto>;
   signatures: BaseProtoType & ByIndexProto<typeof SignatureProto> & ByNameProto<typeof SignatureProto>;
-  // Standard mailboxes (inbox, sent, drafts, junk, outbox, trash) require computed()
+  // Standard mailboxes - simple property access (jxaName mapping)
+  inbox: typeof MailboxProto;
+  drafts: JxaNamedProto<typeof MailboxProto>;
+  junk: JxaNamedProto<typeof MailboxProto>;
+  outbox: typeof MailboxProto;
+  sent: JxaNamedProto<typeof MailboxProto>;
+  trash: JxaNamedProto<typeof MailboxProto>;
   // Settings namespace requires computed()
 }
 
@@ -245,6 +254,13 @@ const MailApplicationProto: MailApplicationProtoType = {
   accounts: pipe3(baseCollection, withByIndex(MailAccountProto), withByName(MailAccountProto), withById(MailAccountProto)),
   rules: pipe2(baseCollection, withByIndex(RuleProto), withByName(RuleProto)),
   signatures: pipe2(baseCollection, withByIndex(SignatureProto), withByName(SignatureProto)),
+  // Standard mailboxes - simple property access with jxaName mapping
+  inbox: MailboxProto,                              // jxaName matches schema name
+  drafts: withJxaName(MailboxProto, 'draftsMailbox'),
+  junk: withJxaName(MailboxProto, 'junkMailbox'),
+  outbox: MailboxProto,                             // jxaName matches schema name
+  sent: withJxaName(MailboxProto, 'sentMailbox'),
+  trash: withJxaName(MailboxProto, 'trashMailbox'),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

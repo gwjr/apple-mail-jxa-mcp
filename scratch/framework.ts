@@ -157,7 +157,13 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
           return value.bind(receiver);
         }
         if (typeof value === 'object' && value !== null) {
-          // Use jxaName if defined, otherwise use the property name
+          // Check for computed navigation first
+          const navInfo = getComputedNav(value);
+          if (navInfo) {
+            const targetDelegate = navInfo.navigate(t._delegate);
+            return createRes(targetDelegate, navInfo.targetProto);
+          }
+          // Normal property navigation - use jxaName if defined, otherwise use the property name
           const jxaName = getJxaName(value) || (prop as string);
           return createRes(t._delegate.prop(jxaName), value);
         }
@@ -360,6 +366,54 @@ function computed<T>(transform: (raw: any) => T): BaseProtoType {
 // Lazy computed - resolve_eager returns specifier instead of value
 function lazyComputed<T>(transform: (raw: any) => T): BaseProtoType & { readonly [LazyBrand]: true } {
   return makeLazy(computed(transform));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Computed Navigation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// computedNav is for properties that require multiple delegate operations to navigate.
+// For simple property navigation (including jxaName mapping), use withJxaName instead.
+
+declare const ComputedNavBrand: unique symbol;
+
+type NavigationFn = (d: Delegate) => Delegate;
+
+const computedNavMap = new WeakMap<object, { navigate: NavigationFn; targetProto: object }>();
+
+type ComputedNavProto<P> = P & { readonly [ComputedNavBrand]: true };
+
+function computedNav<P extends object>(
+  navigate: NavigationFn,
+  targetProto: P
+): ComputedNavProto<P> {
+  // Create a proto that has the base methods (resolve, exists, specifier) using the navigated delegate
+  const navProto = {
+    resolve(this: { _delegate: Delegate }) {
+      return navigate(this._delegate)._jxa();
+    },
+    resolve_eager(this: { resolve(): any }) {
+      return this.resolve();
+    },
+    exists(this: { _delegate: Delegate }) {
+      try {
+        navigate(this._delegate)._jxa();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    specifier(this: { _delegate: Delegate }) {
+      return { uri: navigate(this._delegate).uri() };
+    },
+  } as unknown as ComputedNavProto<P>;
+
+  computedNavMap.set(navProto, { navigate, targetProto });
+  return navProto;
+}
+
+function getComputedNav(proto: object): { navigate: NavigationFn; targetProto: object } | undefined {
+  return computedNavMap.get(proto);
 }
 
 interface QueryableProto<T> extends BaseProtoType {

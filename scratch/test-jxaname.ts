@@ -10,6 +10,13 @@ declare var console: { log(...args: any[]): void };
 const mockMailData = {
   name: 'Mail',
   version: '16.0',
+  // App-level standard mailboxes (JXA property names)
+  inbox: { name: 'Inbox', unreadCount: 5, messages: [], mailboxes: [] },
+  draftsMailbox: { name: 'Drafts', unreadCount: 0, messages: [], mailboxes: [] },
+  junkMailbox: { name: 'Junk', unreadCount: 12, messages: [], mailboxes: [] },
+  outbox: { name: 'Outbox', unreadCount: 0, messages: [], mailboxes: [] },
+  sentMailbox: { name: 'Sent', unreadCount: 0, messages: [], mailboxes: [] },
+  trashMailbox: { name: 'Trash', unreadCount: 0, messages: [], mailboxes: [] },
   accounts: [
     {
       id: 'acc-1',
@@ -63,6 +70,12 @@ const mockMailData = {
               mailAttachments: [],
             },
           ],
+          mailboxes: [],
+        },
+        {
+          name: 'Sent',
+          unreadCount: 0,
+          messages: [],
           mailboxes: [],
         },
       ],
@@ -126,6 +139,42 @@ function runTest() {
   console.log('Message 2 replyTo (empty):');
   console.log('  name:', JSON.stringify(replyTo2.name));
   console.log('  address:', JSON.stringify(replyTo2.address));
+
+  console.log('\n--- Standard Mailboxes Test (withJxaName) ---');
+
+  // App-level inbox (jxaName matches schema name)
+  console.log('mail.inbox.specifier().uri:', mail.inbox.specifier().uri);
+  console.log('mail.inbox.name.resolve():', mail.inbox.name.resolve());
+
+  // App-level drafts (jxaName differs from schema name)
+  console.log('mail.drafts.specifier().uri:', mail.drafts.specifier().uri);
+  console.log('mail.drafts.name.resolve():', mail.drafts.name.resolve());
+
+  // App-level junk
+  console.log('mail.junk.specifier().uri:', mail.junk.specifier().uri);
+  console.log('mail.junk.unreadCount.resolve():', mail.junk.unreadCount.resolve());
+
+  // App-level sent
+  console.log('mail.sent.specifier().uri:', mail.sent.specifier().uri);
+
+  // App-level trash
+  console.log('mail.trash.specifier().uri:', mail.trash.specifier().uri);
+
+  console.log('\n--- computedNav Test (Account Inbox) ---');
+
+  // Account-level inbox via computedNav
+  const account = mail.accounts.byIndex(0);
+  console.log('account.inbox.specifier().uri:', account.inbox.specifier().uri);
+  console.log('account.inbox.name.resolve():', account.inbox.name.resolve());
+  console.log('account.inbox.unreadCount.resolve():', account.inbox.unreadCount.resolve());
+
+  // Access messages through account inbox
+  const accountInboxMessages = account.inbox.messages.resolve();
+  console.log('account.inbox.messages count:', accountInboxMessages.length);
+
+  // Access single message through account inbox
+  const firstMsg = account.inbox.messages.byIndex(0);
+  console.log('account.inbox.messages.byIndex(0).subject:', firstMsg.subject.resolve());
 
   console.log('\n=== All Tests Complete ===');
 }
