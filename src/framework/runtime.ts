@@ -187,6 +187,47 @@ function createElemSpec<S extends Schema>(
         }
         return spec;
       }, uri);
+    },
+
+    // Element operations
+    move(toUri: string): Result<{ uri: string }> {
+      const dest = specifierFromURI(toUri);
+      if (!dest.ok) return { ok: false, error: `Invalid destination: ${dest.error}` };
+      return tryResolve(() => {
+        const destJxa = (dest.value as any)._jxa;
+        if (!destJxa) throw new Error(`Destination ${toUri} is not a valid target`);
+        jxa.move({ to: destJxa });
+        const fixed = spec.fix();
+        return { uri: fixed.ok ? fixed.value.uri : `${toUri}/[moved]` };
+      }, `${uri}:move`);
+    },
+
+    copy(toUri: string): Result<{ uri: string }> {
+      const dest = specifierFromURI(toUri);
+      if (!dest.ok) return { ok: false, error: `Invalid destination: ${dest.error}` };
+      return tryResolve(() => {
+        const destJxa = (dest.value as any)._jxa;
+        if (!destJxa) throw new Error(`Destination ${toUri} is not a valid target`);
+        const newItem = jxa.duplicate({ to: destJxa });
+        let newUri = `${toUri}/[copy]`;
+        try {
+          const id = newItem.id?.();
+          if (id != null) newUri = `${toUri}/${id}`;
+        } catch {
+          try {
+            const name = newItem.name?.();
+            if (name) newUri = `${toUri}/${encodeURIComponent(name)}`;
+          } catch {}
+        }
+        return { uri: newUri };
+      }, `${uri}:copy`);
+    },
+
+    delete(): Result<{ deleted: true }> {
+      return tryResolve(() => {
+        jxa.delete();
+        return { deleted: true as const };
+      }, `${uri}:delete`);
     }
   };
 
