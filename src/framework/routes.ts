@@ -19,10 +19,10 @@ const validOperators: Record<ValueType, string[]> = {
   array: ['equals'],
 };
 
-// Route entry types - using unique marker properties for type narrowing (via 'in' checks)
+// Route entry types - discriminated by `kind`
 
 type PropertyEntry = {
-  readonly _property: true;
+  kind: 'property';
   valueType: ValueType;
   jxaName?: string;
   lazy?: boolean;
@@ -30,37 +30,31 @@ type PropertyEntry = {
 };
 
 type ComputedEntry = {
-  readonly _computed: true;
+  kind: 'computed';
   computeFn: (jxa: any) => any;
   jxaName?: string;
 };
 
 type CollectionEntry = {
-  readonly _collection: true;
+  kind: 'collection';
   addressing: AddressingMode[];
   elementSchema: SchemaRef;
   jxaName?: string;
   mutable?: { create?: boolean; delete?: boolean };
 };
 
-type VirtualPropertyEntry = {
-  readonly _virtualProp: true;
-  jxaProperty: string;
+type NestedSchemaEntry = {
+  kind: 'nested';
   targetSchema: SchemaRef;
-  accountScoped?: boolean;
-};
-
-type VirtualContextEntry = {
-  readonly _virtualCtx: true;
-  targetSchema: SchemaRef;
+  jxaName?: string;
+  computed?: boolean;
 };
 
 type RootEntry = {
-  readonly _root: true;
+  kind: 'root';
 };
 
-type VirtualEntry = VirtualPropertyEntry | VirtualContextEntry;
-type RouteEntry = PropertyEntry | ComputedEntry | CollectionEntry | VirtualEntry | RootEntry;
+type RouteEntry = PropertyEntry | ComputedEntry | CollectionEntry | NestedSchemaEntry | RootEntry;
 
 // ============================================================================
 // Factory Functions
@@ -68,67 +62,45 @@ type RouteEntry = PropertyEntry | ComputedEntry | CollectionEntry | VirtualEntry
 
 const route = {
   property(valueType: ValueType, opts?: { jxaName?: string; lazy?: boolean; rw?: boolean }): PropertyEntry {
-    return { _property: true, valueType, ...opts };
+    return { kind: 'property', valueType, ...opts };
   },
 
   computed(fn: (jxa: any) => any, jxaName?: string): ComputedEntry {
-    return { _computed: true, computeFn: fn, jxaName };
+    return { kind: 'computed', computeFn: fn, jxaName };
   },
 
   collection(elementSchema: SchemaRef, addressing: AddressingMode[], opts?: { jxaName?: string; mutable?: { create?: boolean; delete?: boolean } }): CollectionEntry {
-    return { _collection: true, elementSchema, addressing, ...opts };
+    return { kind: 'collection', elementSchema, addressing, ...opts };
   },
 
-  virtualProp(jxaProperty: string, targetSchema: SchemaRef, accountScoped?: boolean): VirtualPropertyEntry {
-    return { _virtualProp: true, jxaProperty, targetSchema, accountScoped };
-  },
-
-  virtualCtx(targetSchema: SchemaRef): VirtualContextEntry {
-    return { _virtualCtx: true, targetSchema };
+  nested(targetSchema: SchemaRef, opts?: { jxaName?: string; computed?: boolean }): NestedSchemaEntry {
+    return { kind: 'nested', targetSchema, ...opts };
   },
 
   root(): RootEntry {
-    return { _root: true };
+    return { kind: 'root' };
   }
 };
 
-// Type guards for discriminating entry types
+// Type guards
 function isPropertyEntry(entry: RouteEntry): entry is PropertyEntry {
-  return '_property' in entry;
+  return entry.kind === 'property';
 }
 
 function isComputedEntry(entry: RouteEntry): entry is ComputedEntry {
-  return '_computed' in entry;
+  return entry.kind === 'computed';
 }
 
 function isCollectionEntry(entry: RouteEntry): entry is CollectionEntry {
-  return '_collection' in entry;
+  return entry.kind === 'collection';
 }
 
-function isVirtualPropEntry(entry: RouteEntry): entry is VirtualPropertyEntry {
-  return '_virtualProp' in entry;
-}
-
-function isVirtualCtxEntry(entry: RouteEntry): entry is VirtualContextEntry {
-  return '_virtualCtx' in entry;
-}
-
-function isVirtualEntry(entry: RouteEntry): entry is VirtualEntry {
-  return '_virtualProp' in entry || '_virtualCtx' in entry;
+function isNestedEntry(entry: RouteEntry): entry is NestedSchemaEntry {
+  return entry.kind === 'nested';
 }
 
 function isRootEntry(entry: RouteEntry): entry is RootEntry {
-  return '_root' in entry;
-}
-
-// Get descriptive type string for external consumers
-function getEntryType(entry: RouteEntry): string {
-  if (isRootEntry(entry)) return 'root';
-  if (isCollectionEntry(entry)) return 'collection';
-  if (isPropertyEntry(entry)) return 'property';
-  if (isComputedEntry(entry)) return 'computed';
-  if (isVirtualEntry(entry)) return 'virtual';
-  return 'unknown';
+  return entry.kind === 'root';
 }
 
 // Route table structure
@@ -198,6 +170,20 @@ function compileRoutes(schema: any, scheme: string, namedSchemas?: Record<string
     }
   }
 
+  // Check if type is a primitive constructor
+  function isPrimitiveType(type: any): boolean {
+    return type === String || type === Number || type === Boolean || type === Date;
+  }
+
+  // Map primitive constructor to ValueType
+  function primitiveToValueType(type: any): ValueType {
+    if (type === String) return 'string';
+    if (type === Number) return 'number';
+    if (type === Boolean) return 'boolean';
+    if (type === Date) return 'date';
+    return 'string'; // fallback
+  }
+
   // Compile a schema into a route node
   function compileSchema(s: any, name: string): RouteNode {
     registerSchema(s, name);
@@ -208,74 +194,66 @@ function compileRoutes(schema: any, scheme: string, namedSchemas?: Record<string
       if (!descriptor) continue;
       const desc = descriptor as any;
 
-      // Collection
-      if ('_coll' in desc) {
-        const elementSchemaName = getSchemaName(desc._schema, key);
-        registerSchema(desc._schema, elementSchemaName);
+      // Collection: dimension is an array of addressing modes
+      if (Array.isArray(desc.dimension)) {
+        const elementSchemaName = getSchemaName(desc.type, key);
+        registerSchema(desc.type, elementSchemaName);
 
         children[key] = {
           entry: route.collection(
             { _ref: elementSchemaName },
-            getAddressingModes(desc._addressing),
-            { jxaName: desc._jxaName, mutable: desc._opts }
+            desc.dimension,
+            {
+              jxaName: desc.jxaName,
+              mutable: {
+                create: desc.make !== 'unavailable',
+                delete: desc.take !== 'unavailable',
+              }
+            }
           ),
           children: {},
         };
         continue;
       }
 
-      // Computed property
-      if ('_computed' in desc) {
-        children[key] = {
-          entry: route.computed(desc._fn, desc._jxaName),
-          children: {},
-        };
-        continue;
-      }
+      // Scalar: dimension === 'scalar'
+      if (desc.dimension === 'scalar') {
+        // Scalar with Schema type = navigable (virtual context)
+        if (!isPrimitiveType(desc.type)) {
+          const nestedSchemaName = getSchemaName(desc.type, key);
+          registerSchema(desc.type, nestedSchemaName);
 
-      // Standard mailbox (app-level virtual)
-      if ('_stdMailbox' in desc) {
-        children[key] = {
-          entry: route.virtualProp(desc._jxaName, { _ref: 'StandardMailbox' }),
-          children: {},
-        };
-        continue;
-      }
-
-      // Account-scoped mailbox (virtual)
-      if ('_accountMailbox' in desc) {
-        children[key] = {
-          entry: route.virtualProp(desc._jxaProperty, { _ref: 'Mailbox' }, true),
-          children: {},
-        };
-        continue;
-      }
-
-      // Namespace marker (object-like navigation with children)
-      if ('_namespace' in desc) {
-        const namespaceSchemaName = getSchemaName(desc._schema, key);
-        registerSchema(desc._schema, namespaceSchemaName);
-        if (desc._jxaProperty) {
-          children[key] = {
-            entry: route.virtualProp(desc._jxaProperty, { _ref: namespaceSchemaName }),
-            children: {},
-          };
-        } else {
-          children[key] = {
-            entry: route.virtualCtx({ _ref: namespaceSchemaName }),
-            children: {},
-          };
+          if (desc.computed) {
+            // Computed navigation - the JXA object is computed
+            children[key] = {
+              entry: route.virtualCtx({ _ref: nestedSchemaName }),
+              children: {},
+            };
+          } else {
+            // Direct JXA property navigation
+            children[key] = {
+              entry: route.virtualProp(desc.jxaName || key, { _ref: nestedSchemaName }),
+              children: {},
+            };
+          }
+          continue;
         }
-        continue;
-      }
 
-      // Type marker (property)
-      if ('_t' in desc) {
+        // Scalar with computed function = computed property
+        if (desc.computed) {
+          children[key] = {
+            entry: route.computed(desc.computed, desc.jxaName),
+            children: {},
+          };
+          continue;
+        }
+
+        // Scalar with primitive type = property
         children[key] = {
-          entry: route.property(mapType(desc._t, desc), {
-            jxaName: desc._jxaName,
-            lazy: desc._lazy,
-            rw: desc._rw,
+          entry: route.property(primitiveToValueType(desc.type), {
+            jxaName: desc.jxaName,
+            lazy: desc.lazy,
+            rw: desc.set !== 'unavailable',
           }),
           children: {},
         };
@@ -287,11 +265,6 @@ function compileRoutes(schema: any, scheme: string, namedSchemas?: Record<string
       entry: route.root(),
       children,
     };
-  }
-
-  function mapType(t: string, desc: any): ValueType {
-    if (t === 'array') return 'array';
-    return t as ValueType;
   }
 
   function getSchemaName(schema: any, fallback: string): string {
@@ -343,75 +316,79 @@ function getRouteChildren(node: RouteNode, table: RouteTable): Record<string, Ro
 function compileSchemaChildren(schema: any, table: RouteTable): Record<string, RouteNode> {
   const children: Record<string, RouteNode> = {};
 
+  // Helper to check if type is primitive
+  function isPrimitiveType(type: any): boolean {
+    return type === String || type === Number || type === Boolean || type === Date;
+  }
+
+  function primitiveToValueType(type: any): ValueType {
+    if (type === String) return 'string';
+    if (type === Number) return 'number';
+    if (type === Boolean) return 'boolean';
+    if (type === Date) return 'date';
+    return 'string';
+  }
+
   for (const [key, descriptor] of Object.entries(schema)) {
     if (!descriptor) continue;
     const desc = descriptor as any;
 
-    // Collection
-    if ('_coll' in desc) {
-      const elementSchemaName = findSchemaName(desc._schema, table) || key;
+    // Collection: dimension is an array
+    if (Array.isArray(desc.dimension)) {
+      const elementSchemaName = findSchemaName(desc.type, table) || key;
       children[key] = {
         entry: route.collection(
           { _ref: elementSchemaName },
-          getAddressingModes(desc._addressing),
-          { jxaName: desc._jxaName, mutable: desc._opts }
+          desc.dimension,
+          {
+            jxaName: desc.jxaName,
+            mutable: {
+              create: desc.make !== 'unavailable',
+              delete: desc.take !== 'unavailable',
+            }
+          }
         ),
         children: {},
       };
       continue;
     }
 
-    // Computed
-    if ('_computed' in desc) {
-      children[key] = {
-        entry: route.computed(desc._fn, desc._jxaName),
-        children: {},
-      };
-      continue;
-    }
+    // Scalar
+    if (desc.dimension === 'scalar') {
+      // Scalar with Schema type = navigable
+      if (!isPrimitiveType(desc.type)) {
+        const nestedSchemaName = findSchemaName(desc.type, table) || key;
 
-    // Standard mailbox
-    if ('_stdMailbox' in desc) {
-      children[key] = {
-        entry: route.virtualProp(desc._jxaName, { _ref: 'StandardMailbox' }),
-        children: {},
-      };
-      continue;
-    }
-
-    // Account-scoped mailbox
-    if ('_accountMailbox' in desc) {
-      children[key] = {
-        entry: route.virtualProp(desc._jxaProperty, { _ref: 'Mailbox' }, true),
-        children: {},
-      };
-      continue;
-    }
-
-    // Namespace marker
-    if ('_namespace' in desc) {
-      const namespaceSchemaName = findSchemaName(desc._schema, table) || key;
-      if (desc._jxaProperty) {
-        children[key] = {
-          entry: route.virtualProp(desc._jxaProperty, { _ref: namespaceSchemaName }),
-          children: {},
-        };
-      } else {
-        children[key] = {
-          entry: route.virtualCtx({ _ref: namespaceSchemaName }),
-          children: {},
-        };
+        if (desc.computed) {
+          children[key] = {
+            entry: route.virtualCtx({ _ref: nestedSchemaName }),
+            children: {},
+          };
+        } else {
+          children[key] = {
+            entry: route.virtualProp(desc.jxaName || key, { _ref: nestedSchemaName }),
+            children: {},
+          };
+        }
+        continue;
       }
-      continue;
-    }
 
-    // Property
-    if ('_t' in desc) {
+      // Computed property
+      if (desc.computed) {
+        children[key] = {
+          entry: route.computed(desc.computed, desc.jxaName),
+          children: {},
+        };
+        continue;
+      }
+
+      // Primitive property
       children[key] = {
-        entry: route.property(
-          desc._t === 'array' ? 'array' : desc._t as ValueType,
-          { jxaName: desc._jxaName, lazy: desc._lazy, rw: desc._rw }
-        ),
+        entry: route.property(primitiveToValueType(desc.type), {
+          jxaName: desc.jxaName,
+          lazy: desc.lazy,
+          rw: desc.set !== 'unavailable',
+        }),
         children: {},
       };
       continue;
@@ -730,12 +707,25 @@ function normalizeOperator(op: string): string {
 function extractFieldTypes(schema: any): Record<string, ValueType> {
   const types: Record<string, ValueType> = {};
 
+  function isPrimitiveType(type: any): boolean {
+    return type === String || type === Number || type === Boolean || type === Date;
+  }
+
+  function primitiveToValueType(type: any): ValueType {
+    if (type === String) return 'string';
+    if (type === Number) return 'number';
+    if (type === Boolean) return 'boolean';
+    if (type === Date) return 'date';
+    return 'string';
+  }
+
   for (const [key, descriptor] of Object.entries(schema)) {
     if (!descriptor) continue;
     const desc = descriptor as any;
 
-    if ('_t' in desc) {
-      types[key] = desc._t === 'array' ? 'array' : desc._t as ValueType;
+    // Only scalar primitives are filterable
+    if (desc.dimension === 'scalar' && isPrimitiveType(desc.type)) {
+      types[key] = primitiveToValueType(desc.type);
     }
   }
 

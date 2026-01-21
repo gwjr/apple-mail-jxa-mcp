@@ -1,74 +1,88 @@
+/// <reference path="specifier.ts" />
+
 // ============================================================================
-// Schema Definition DSL - Simplified Syntax
+// Schema Definition DSL - Discriminated Union Model
 // ============================================================================
 
-// Type markers - property name defaults to JXA name
-const t = {
-  string: { _t: 'string' } as const,
-  number: { _t: 'number' } as const,
-  boolean: { _t: 'boolean' } as const,
-  date: { _t: 'date' } as const,
-  array: <T>(elem: T) => ({ _t: 'array' as const, _elem: elem }),
+type PrimitiveType = typeof String | typeof Number | typeof Boolean | typeof Date;
+
+type Schema = Record<string, Descriptor>;
+
+// Operations: default JXA, unavailable, or custom handler
+type OperationBehaviour =
+  | 'default'
+  | 'unavailable'
+  | ((jxa: any, ...args: any[]) => Result<any>);
+
+// ============================================================================
+// Descriptors - Discriminated by `dimension`
+// ============================================================================
+
+type BaseDescriptor = {
+  jxaName?: string;
+  lazy: boolean;
+  computed?: (jxa: any) => any;
 };
 
-// Addressing markers (compile-time safe)
+type ScalarDescriptor = BaseDescriptor & {
+  dimension: 'scalar';
+  type: PrimitiveType | Schema;
+  set: OperationBehaviour;
+};
+
+type CollectionDescriptor = BaseDescriptor & {
+  dimension: AddressingMode[];
+  type: Schema;
+  make: OperationBehaviour;
+  take: OperationBehaviour;
+};
+
+type Descriptor = ScalarDescriptor | CollectionDescriptor;
+
+// ============================================================================
+// DSL
+// ============================================================================
+
 const by = {
-  name: { _by: 'name' } as const,
-  index: { _by: 'index' } as const,
-  id: { _by: 'id' } as const,
+  name: 'name' as const,
+  index: 'index' as const,
+  id: 'id' as const,
 };
 
-type AddressingMarker = typeof by[keyof typeof by];
-type AddressingMode = 'name' | 'index' | 'id';
+const t = {
+  string: { dimension: 'scalar', type: String, set: 'unavailable', lazy: false } as ScalarDescriptor,
+  number: { dimension: 'scalar', type: Number, set: 'unavailable', lazy: false } as ScalarDescriptor,
+  boolean: { dimension: 'scalar', type: Boolean, set: 'unavailable', lazy: false } as ScalarDescriptor,
+  date: { dimension: 'scalar', type: Date, set: 'unavailable', lazy: false } as ScalarDescriptor,
+};
 
-// Modifiers
-function lazy<T>(type: T): T & { _lazy: true } {
-  return { ...type, _lazy: true as const } as any;
+function rw(desc: ScalarDescriptor): ScalarDescriptor {
+  return { ...desc, set: 'default' };
 }
 
-function rw<T>(type: T): T & { _rw: true } {
-  return { ...type, _rw: true as const } as any;
+function lazy<D extends Descriptor>(desc: D): D {
+  return { ...desc, lazy: true };
 }
 
-function jxa<T, N extends string>(type: T, name: N): T & { _jxaName: N } {
-  return { ...type, _jxaName: name } as any;
+function jxa<D extends Descriptor>(desc: D, name: string): D {
+  return { ...desc, jxaName: name };
 }
 
-// Collection definition
-type CollectionOpts = { create?: boolean; delete?: boolean };
+function computed<T>(fn: (jxa: any) => T): ScalarDescriptor {
+  return { dimension: 'scalar', type: Object as any, set: 'unavailable', lazy: false, computed: fn };
+}
 
-function collection<S, const A extends readonly AddressingMarker[]>(
+function collection<S extends Schema, const A extends readonly AddressingMode[]>(
   schema: S,
   addressing: A,
-  opts?: CollectionOpts
-): { _coll: true; _schema: S; _addressing: A; _opts?: CollectionOpts } {
-  return { _coll: true, _schema: schema, _addressing: addressing, _opts: opts };
+  opts?: { make?: OperationBehaviour; take?: OperationBehaviour }
+): CollectionDescriptor {
+  return {
+    dimension: [...addressing],
+    type: schema,
+    make: opts?.make ?? 'default',
+    take: opts?.take ?? 'default',
+    lazy: false,
+  };
 }
 
-// Computed property
-function computed<T>(fn: (jxa: any) => T): { _computed: true; _fn: (jxa: any) => T } {
-  return { _computed: true, _fn: fn };
-}
-
-// Standard mailbox marker (app-level aggregate)
-function standardMailbox<N extends string>(jxaName: N): { _stdMailbox: true; _jxaName: N } {
-  return { _stdMailbox: true, _jxaName: jxaName };
-}
-
-// Account-scoped mailbox marker (virtual navigation to account's standard mailbox)
-function accountScopedMailbox<N extends string>(jxaProperty: N): { _accountMailbox: true; _jxaProperty: N } {
-  return { _accountMailbox: true, _jxaProperty: jxaProperty };
-}
-
-// Virtual namespace marker (for object-like navigation with children, e.g., settings)
-function namespace<S, N extends string>(
-  schema: S,
-  jxaProperty?: N
-): { _namespace: true; _schema: S; _jxaProperty?: N } {
-  return { _namespace: true, _schema: schema, _jxaProperty: jxaProperty };
-}
-
-// Extract addressing modes from markers
-function getAddressingModes(markers: readonly AddressingMarker[]): AddressingMode[] {
-  return markers.map(m => m._by);
-}
