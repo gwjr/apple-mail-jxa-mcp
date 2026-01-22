@@ -126,7 +126,10 @@ interface McpResourceTemplatesListResult {
 
 // Resource handler types
 type ResourceLister = () => McpResource[];
-type ResourceReader = (uri: string) => { mimeType: string; text: string | object } | null;
+type ReadResourceResult =
+  | { ok: true; mimeType: string; text: string | object; fixedUri?: URL }
+  | { ok: false; error: string };
+type ResourceReader = (uri: URL) => ReadResourceResult;
 
 // ============================================================================
 // Tool definition helper type

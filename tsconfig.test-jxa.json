@@ -15,6 +15,7 @@
   },
   "files": [
     "src/types/jxa.d.ts",
+    "src/jxa-polyfill.ts",
     "src/framework.ts",
     "src/jxa-delegate.ts",
     "src/mail.ts",

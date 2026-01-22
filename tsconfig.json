@@ -16,6 +16,7 @@
   "files": [
     "src/types/jxa.d.ts",
     "src/types/mcp.d.ts",
+    "src/jxa-polyfill.ts",
     "src/core/mcp-server.ts",
     "src/framework.ts",
     "src/jxa-delegate.ts",

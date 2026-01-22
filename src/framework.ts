@@ -167,21 +167,28 @@ interface Delegate {
   withPagination(pagination: PaginationSpec): Delegate;
   withExpand(fields: string[]): Delegate;
   queryState(): QueryState;
+
+  // Create a delegate from arbitrary JXA ref with explicit path
+  // Used for computed navigations that can't be expressed as delegate operations
+  fromJxa?(jxaRef: any, path: PathSegment[]): Delegate;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Res type
 // ─────────────────────────────────────────────────────────────────────────────
 
-type Res<P> = P & { _delegate: Delegate };
+type Res<P> = P & { _delegate: Delegate; _isLazy?: boolean };
 
 function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
   // For namespace protos, get the target proto for property lookup
   const targetProto = getNamespaceNav(proto) || proto;
+  // Check if this proto is marked as lazy (specifierFor)
+  const isLazy = lazyProtos.has(proto);
 
-  const handler: ProxyHandler<{ _delegate: Delegate }> = {
+  const handler: ProxyHandler<{ _delegate: Delegate; _isLazy?: boolean }> = {
     get(t, prop: string | symbol, receiver) {
       if (prop === '_delegate') return t._delegate;
+      if (prop === '_isLazy') return isLazy;
 
       // First check the main proto for methods (resolve, exists, etc.)
       if (prop in proto) {
@@ -225,11 +232,11 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
       return undefined;
     },
     has(t, prop: string | symbol) {
-      if (prop === '_delegate') return true;
+      if (prop === '_delegate' || prop === '_isLazy') return true;
       return prop in proto || prop in targetProto;
     },
     ownKeys(t) {
-      // Combine keys from proto and targetProto, plus _delegate
+      // Combine keys from proto and targetProto, plus _delegate (but not _isLazy - it's internal)
       const keys = new Set<string | symbol>(['_delegate']);
       for (const key of Object.keys(proto)) keys.add(key);
       for (const key of Object.keys(targetProto)) keys.add(key);
@@ -237,7 +244,7 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
     },
     getOwnPropertyDescriptor(t, prop) {
       // Make properties enumerable for Object.keys() to work
-      if (prop === '_delegate' || prop in proto || prop in targetProto) {
+      if (prop === '_delegate' || prop === '_isLazy' || prop in proto || prop in targetProto) {
         return { enumerable: true, configurable: true };
       }
       return undefined;
@@ -294,7 +301,7 @@ const _objectProtoImpl = {
     // First try to get the proto from the Res proxy by getting a known property
     // We iterate over all enumerable properties and resolve them
     const result: Record<string, any> = {};
-    const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
+    const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate', '_isLazy']);
 
     // Get the proto by accessing it through the handler
     // We use Object.keys which will trigger the 'has' trap, giving us the keys
@@ -303,10 +310,14 @@ const _objectProtoImpl = {
       try {
         const propRes = (this as any)[key];
         if (propRes && typeof propRes === 'object' && '_delegate' in propRes) {
-          // It's a Res - resolve it
-          const resolved = propRes.resolve();
-          if (resolved !== undefined) {
-            result[key] = resolved;
+          // It's a Res - check if it's lazy (should return specifier instead of value)
+          if (propRes._isLazy) {
+            result[key] = propRes.specifier();
+          } else {
+            const resolved = propRes.resolve();
+            if (resolved !== undefined) {
+              result[key] = resolved;
+            }
           }
         } else if (propRes !== undefined) {
           result[key] = propRes;
@@ -363,16 +374,19 @@ const eagerScalar = baseScalar;
 // Composers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// specifierFor: marks a property as returning a specifier (URL) rather than a resolved value
-// When the parent object is resolved, this property will be { uri: URL } instead of the actual value
+// Track lazy protos for parent object resolution
+const lazyProtos = new WeakSet<object>();
+
+// specifierFor: marks a property as "lazy" - when resolved as part of a parent object,
+// returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
 function specifierFor<P extends BaseProtoType>(proto: P): P & { readonly [LazyBrand]: true } {
-  return {
-    ...proto,
-    // Override resolve to return specifier instead of value
-    resolve(this: { _delegate: Delegate }): Specifier {
-      return { uri: this._delegate.uri() };
-    },
-  } as P & { readonly [LazyBrand]: true };
+  const lazyProto = { ...proto } as P & { readonly [LazyBrand]: true };
+  lazyProtos.add(lazyProto);
+  return lazyProto;
+}
+
+function isLazyProto(proto: object): boolean {
+  return lazyProtos.has(proto);
 }
 
 interface SettableProto<T> {
@@ -401,23 +415,15 @@ function withByIndex<Item extends object>(itemProto: Item) {
   return function<P extends BaseProtoType>(proto: P): P & ByIndexProto<Item> & { readonly [ByIndexBrand]: true; resolve(): CollectionResolveResult } {
     const result = {
       ...proto,
-      // resolve() returns specifiers for each item - guaranteed to have uri (URL object),
-      // may include additional metadata (id, name) if cheap to obtain
+      // resolve() returns specifiers for each item - just {uri: URL}
+      // We don't extract id/name here because in JXA that would require calling
+      // methods on each item, which is slow for large collections
       resolve(this: { _delegate: Delegate }): CollectionResolveResult {
         const raw = this._delegate._jxa();
         if (!Array.isArray(raw)) return raw;
-        // Map each item to its specifier - uri is guaranteed, other fields optional
-        return raw.map((item: any, i: number) => {
+        return raw.map((_item: any, i: number) => {
           const itemDelegate = this._delegate.byIndex(i);
-          const entry: { uri: URL; [key: string]: any } = {
-            uri: itemDelegate.uri()
-          };
-          // Include id/name if available in raw data (cheap - no extra JXA calls)
-          if (item && typeof item === 'object') {
-            if ('id' in item) entry.id = item.id;
-            if ('name' in item) entry.name = item.name;
-          }
-          return entry;
+          return { uri: itemDelegate.uri() };
         });
       },
       byIndex(this: { _delegate: Delegate }, n: number): Res<Item> {
@@ -695,13 +701,27 @@ interface QueryableProto<T> extends BaseProtoType {
   expand(fields: string[]): Res<QueryableProto<T> & BaseProtoType>;
 }
 
+// Helper to get a property value, handling JXA specifiers (functions)
+function getPropValue(item: any, field: string): any {
+  if (item && typeof item === 'object' && field in item) {
+    const val = item[field];
+    return typeof val === 'function' ? val() : val;
+  }
+  // JXA specifier: property access returns a function to call
+  if (typeof item === 'function' && typeof item[field] === 'function') {
+    return item[field]();
+  }
+  return undefined;
+}
+
 function applyQueryState<T>(items: T[], query: QueryState): T[] {
   let results = items;
 
   if (query.filter && Object.keys(query.filter).length > 0) {
     results = results.filter((item: any) => {
       for (const [field, pred] of Object.entries(query.filter!)) {
-        if (!pred.operator.test(item[field], pred.value)) {
+        const val = getPropValue(item, field);
+        if (!pred.operator.test(val, pred.value)) {
           return false;
         }
       }
@@ -712,8 +732,8 @@ function applyQueryState<T>(items: T[], query: QueryState): T[] {
   if (query.sort) {
     const { by, direction = 'asc' } = query.sort;
     results = [...results].sort((a: any, b: any) => {
-      const aVal = a[by];
-      const bVal = b[by];
+      const aVal = getPropValue(a, by as string);
+      const bVal = getPropValue(b, by as string);
       const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
       return direction === 'desc' ? -cmp : cmp;
     });

@@ -32,6 +32,7 @@ function createMockMailData() {
                 readStatus: false,
                 flaggedStatus: false,
                 messageSize: 1024,
+                content: 'Hello, this is the message body content.',
                 toRecipients: [{ name: 'John', address: 'john@work.com' }],
                 ccRecipients: [],
                 bccRecipients: [],
@@ -47,6 +48,7 @@ function createMockMailData() {
                 readStatus: true,
                 flaggedStatus: true,
                 messageSize: 2048,
+                content: 'Let us meet tomorrow at 10am to discuss the project.',
                 toRecipients: [{ name: 'John', address: 'john@work.com' }],
                 ccRecipients: [{ name: 'Alice', address: 'alice@example.com' }],
                 bccRecipients: [],
@@ -336,7 +338,9 @@ function testJxaNameMapping() {
   if (msg.ok) {
     const attachments = msg.value.attachments.resolve() as any[];
     assertEqual(attachments.length, 1, 'Message has 1 attachment');
-    assertEqual(attachments[0].name, 'doc.pdf', 'Attachment name correct');
+    // Collection returns {uri} specifiers - use byIndex to get actual data
+    const firstAttachment = msg.value.attachments.byIndex(0).resolve() as any;
+    assertEqual(firstAttachment.name, 'doc.pdf', 'Attachment name correct');
   }
 
   // sent maps to sentMailbox in JXA
@@ -469,11 +473,11 @@ function testCollectionResolution() {
     assert(Array.isArray(resolved), 'Messages collection resolves to array');
     assertEqual(resolved.length, 2, 'Messages array has 2 items');
 
-    // Each item should be a specifier with uri property
-    assert(resolved[0] !== null, 'First message is not null');
-    assert('uri' in resolved[0], 'First message is a specifier with uri');
+    // Each item should be a specifier with uri property (just uri, no id/name)
+    assert(resolved[0] !== null, 'First message specifier is not null');
+    assert('uri' in resolved[0], 'First message specifier has uri');
     assert(resolved[0].uri.href.includes('messages%5B0%5D'), 'First message URI has correct index');
-    assert('uri' in resolved[1], 'Second message is a specifier with uri');
+    assert('uri' in resolved[1], 'Second message specifier has uri');
   }
 
   // To get actual data, use byIndex() or byId() then resolve()
@@ -491,9 +495,9 @@ function testCollectionResolution() {
     const resolved = rulesResult.value.resolve() as any[];
     assert(Array.isArray(resolved), 'Rules collection resolves to array');
     assertEqual(resolved.length, 2, 'Rules array has 2 items');
-    assert('uri' in resolved[0], 'First rule is a specifier');
+    assert('uri' in resolved[0], 'First rule specifier has uri');
 
-    // To get data, use byIndex/byName
+    // To get actual data, use byIndex/byName then resolve
     const firstRule = rulesResult.value.byIndex(0).resolve() as any;
     assertEqual(firstRule.name, 'Spam Filter', 'First rule name via byIndex');
   }
@@ -504,11 +508,40 @@ function testCollectionResolution() {
     const resolved = accountsResult.value.resolve() as any[];
     assert(Array.isArray(resolved), 'Accounts collection resolves to array');
     assertEqual(resolved.length, 2, 'Accounts array has 2 items');
-    assert('uri' in resolved[0], 'First account is a specifier');
+    assert('uri' in resolved[0], 'First account specifier has uri');
 
-    // To get data, use byIndex/byName
+    // To get actual data, use byIndex/byName then resolve
     const firstAccount = accountsResult.value.byIndex(0).resolve() as any;
     assertEqual(firstAccount.name, 'Work', 'First account name via byIndex');
+  }
+}
+
+function testLazyContentResolution() {
+  group('Lazy Content Resolution (specifierFor)');
+
+  const mockData = createMockMailData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+
+  // Test 1: When resolving a message, content should be a specifier (lazy)
+  const msgResult = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1001');
+  if (msgResult.ok) {
+    const message = msgResult.value.resolve() as any;
+    assert(typeof message.content === 'object', 'Content in message is an object (specifier)');
+    assert('uri' in message.content, 'Content has uri property (is a specifier)');
+    assert(message.content.uri.href.includes('content'), 'Content specifier URI includes "content"');
+  }
+
+  // Test 2: Direct resolution of content should return actual value
+  const contentResult = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1001/content');
+  if (contentResult.ok) {
+    const content = contentResult.value.resolve();
+    assertEqual(content, 'Hello, this is the message body content.', 'Direct content resolution returns actual text');
+  }
+
+  // Test 3: readResource on content should return actual value
+  const readResult = readResource(new URL('mail://accounts[0]/mailboxes/INBOX/messages/1001/content'));
+  if (assertReadOk(readResult, 'readResource on content succeeds') && readResult.ok) {
+    assertEqual(readResult.text, 'Hello, this is the message body content.', 'readResource returns actual content');
   }
 }
 
@@ -547,6 +580,139 @@ function compileTimeTypeTests() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pagination Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+function createLargeCollectionMockData() {
+  // Generate 150 messages for pagination testing
+  const messages: any[] = [];
+  for (let i = 0; i < 150; i++) {
+    messages.push({
+      id: 2000 + i,
+      messageId: `<msg${i}@test.com>`,
+      subject: `Test Message ${i}`,
+      sender: `sender${i}@example.com`,
+      dateSent: `2024-01-${String(15 + (i % 15)).padStart(2, '0')}T10:00:00Z`,
+      dateReceived: `2024-01-${String(15 + (i % 15)).padStart(2, '0')}T10:01:00Z`,
+      readStatus: i % 2 === 0,
+      flaggedStatus: false,
+      messageSize: 1024 + i,
+      toRecipients: [{ name: 'Test', address: 'test@test.com' }],
+      ccRecipients: [],
+      bccRecipients: [],
+      mailAttachments: [],
+    });
+  }
+
+  return {
+    name: 'Mail',
+    version: '16.0',
+    accounts: [
+      {
+        id: 'acc1',
+        name: 'TestAccount',
+        fullName: 'Test User',
+        emailAddresses: ['test@test.com'],
+        mailboxes: [
+          {
+            name: 'LargeMailbox',
+            unreadCount: 75,
+            messages,
+            mailboxes: [],
+          },
+        ],
+      },
+    ],
+    rules: [],
+    signatures: [],
+    inbox: { name: 'All Inboxes', unreadCount: 0, messages: [], mailboxes: [] },
+    sentMailbox: { name: 'All Sent', unreadCount: 0, messages: [], mailboxes: [] },
+    draftsMailbox: { name: 'All Drafts', unreadCount: 0, messages: [], mailboxes: [] },
+    trashMailbox: { name: 'All Trash', unreadCount: 0, messages: [], mailboxes: [] },
+    junkMailbox: { name: 'All Junk', unreadCount: 0, messages: [], mailboxes: [] },
+    outbox: { name: 'Outbox', unreadCount: 0, messages: [], mailboxes: [] },
+    alwaysBccMyself: false,
+    alwaysCcMyself: false,
+    fetchInterval: 5,
+  };
+}
+
+function assertReadOk(result: ReadResourceResult, message: string): boolean {
+  testCount++;
+  if (result.ok) {
+    passCount++;
+    console.log(`  \u2713 ${message}`);
+    return true;
+  } else {
+    console.log(`  \u2717 ${message}`);
+    console.log(`      error: ${result.error}`);
+    return false;
+  }
+}
+
+function testPagination() {
+  group('Collection Pagination');
+
+  // Use factory function for fresh data each time
+  const freshLargeData = () => createMockDelegate(createLargeCollectionMockData(), 'mail');
+  registerScheme('mail', freshLargeData, MailApplicationProto);
+
+  // Test 1: Default limit (20) applied to large collection
+  const defaultResult = readResource(new URL('mail://accounts[0]/mailboxes/LargeMailbox/messages'));
+  if (assertReadOk(defaultResult, 'Read large collection without limit') && defaultResult.ok) {
+    const data = defaultResult.text as any;
+    assert('_pagination' in data, 'Response has _pagination metadata');
+    assertEqual(data._pagination.total, 150, 'Total count is 150');
+    assertEqual(data._pagination.returned, 20, 'Default returns 20 items');
+    assertEqual(data._pagination.limit, 20, 'Default limit is 20');
+    assertEqual(data._pagination.offset, 0, 'Default offset is 0');
+    assertEqual(data.items.length, 20, 'Items array has 20 elements');
+    assert(data._pagination.next !== null, 'Has next page URL');
+    assert(data._pagination.next.includes('offset=20'), 'Next URL has offset=20');
+  }
+
+  // Test 2: Explicit limit=50 - framework applies it, we see 50 items (no extra truncation)
+  registerScheme('mail', freshLargeData, MailApplicationProto);
+  const limit50Result = readResource(new URL('mail://accounts[0]/mailboxes/LargeMailbox/messages?limit=50'));
+  if (assertReadOk(limit50Result, 'Read with limit=50') && limit50Result.ok) {
+    const data = limit50Result.text as any;
+    // When limit is explicitly requested and honored, no pagination wrapper needed
+    assert(Array.isArray(data), 'With explicit limit=50, returns plain array');
+    assertEqual(data.length, 50, 'Returns exactly 50 items');
+  }
+
+  // Test 3: Limit over max (100) gets capped - framework returns 500 but we cap to 100
+  registerScheme('mail', freshLargeData, MailApplicationProto);
+  const limit500Result = readResource(new URL('mail://accounts[0]/mailboxes/LargeMailbox/messages?limit=500'));
+  if (assertReadOk(limit500Result, 'Read with limit=500 (should cap to 100)') && limit500Result.ok) {
+    const data = limit500Result.text as any;
+    assert('_pagination' in data, 'Over-limit request has pagination wrapper');
+    assertEqual(data._pagination.returned, 100, 'Capped to 100 items');
+    assertEqual(data._pagination.limit, 100, 'Limit capped to 100');
+    assertEqual(data.items.length, 100, 'Items array has 100 elements');
+  }
+
+  // Test 4: Small collection (under default limit) returns all items without pagination
+  registerScheme('mail', () => createMockDelegate(createMockMailData(), 'mail'), MailApplicationProto);
+  const smallResult = readResource(new URL('mail://accounts[0]/mailboxes/INBOX/messages'));
+  if (assertReadOk(smallResult, 'Read small collection') && smallResult.ok) {
+    const data = smallResult.text as any;
+    assert(!('_pagination' in data), 'Small collection has no pagination wrapper');
+    assert(Array.isArray(data), 'Small collection returns plain array');
+  }
+
+  // Test 5: Offset pagination works (with limit under max)
+  registerScheme('mail', freshLargeData, MailApplicationProto);
+  const offsetResult = readResource(new URL('mail://accounts[0]/mailboxes/LargeMailbox/messages?limit=20&offset=140'));
+  if (assertReadOk(offsetResult, 'Read with offset=140, limit=20') && offsetResult.ok) {
+    const data = offsetResult.text as any;
+    // With explicit limit=20 at offset 140, we get 10 items (150-140=10)
+    assert(Array.isArray(data), 'With explicit limit, returns plain array');
+    assertEqual(data.length, 10, 'Returns remaining 10 items');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Run tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -562,6 +728,8 @@ testQueryOperations();
 testSetOperation();
 testObjectResolution();
 testCollectionResolution();
+testPagination();
+testLazyContentResolution();
 
 const frameworkTestResult = summary();
 resetCounters();

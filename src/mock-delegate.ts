@@ -25,10 +25,7 @@ class MockDelegate implements Delegate {
   ) {}
 
   _jxa(): any {
-    // Apply query state to data if it's an array
-    if (Array.isArray(this._data)) {
-      return applyQueryState(this._data, this._query);
-    }
+    // Return raw data - query state is applied by the proto layer (withQuery.resolve())
     return this._data;
   }
 
@@ -196,6 +193,11 @@ class MockDelegate implements Delegate {
 
   queryState(): QueryState {
     return this._query;
+  }
+
+  // Create a delegate from arbitrary data with explicit path
+  fromJxa(data: any, path: PathSegment[]): MockDelegate {
+    return new MockDelegate(data, path, this._root, this, null, null);
   }
 }
 

@@ -4,31 +4,68 @@
 // MCP Resource Handler
 // ============================================================================
 
-function readResource(uri: string): { mimeType: string; text: string | object; fixedUri?: string } | null {
-  const resResult = resolveURI(uri);
+const DEFAULT_COLLECTION_LIMIT = 20;
+const MAX_COLLECTION_LIMIT = 100;
+
+function readResource(uri: URL): ReadResourceResult {
+  const resResult = resolveURI(uri.href);
   if (!resResult.ok) {
-    // Return null to trigger JSON-RPC error response
-    return null;
+    return { ok: false, error: `URI resolution failed: ${resResult.error}` };
   }
 
   const res = resResult.value;
 
   try {
-    const data = res.resolve();
+    let data = res.resolve();
 
     // Get the canonical URI from the delegate
-    const canonicalUri = res._delegate.uri().href;
-    const fixedUri = canonicalUri !== uri ? canonicalUri : undefined;
+    const canonicalUri = res._delegate.uri();
+    const fixedUri = canonicalUri.href !== uri.href ? canonicalUri : undefined;
+
+    // Protect against returning huge collections
+    if (Array.isArray(data)) {
+      const queryState = res._delegate.queryState();
+      const requestedLimit = queryState.pagination?.limit;
+      const requestedOffset = queryState.pagination?.offset ?? 0;
+
+      // Use requested limit (capped at max) or default
+      const effectiveLimit = requestedLimit
+        ? Math.min(requestedLimit, MAX_COLLECTION_LIMIT)
+        : DEFAULT_COLLECTION_LIMIT;
+
+      if (data.length > effectiveLimit) {
+        const totalCount = data.length;
+        const baseUri = (fixedUri || canonicalUri).href.split('?')[0];
+        const nextOffset = requestedOffset + effectiveLimit;
+        const nextUri = `${baseUri}?limit=${effectiveLimit}&offset=${nextOffset}`;
+
+        return {
+          ok: true,
+          mimeType: 'application/json',
+          text: {
+            _pagination: {
+              total: totalCount,
+              returned: effectiveLimit,
+              offset: requestedOffset,
+              limit: effectiveLimit,
+              next: nextOffset < totalCount ? nextUri : null
+            },
+            items: data.slice(0, effectiveLimit)
+          },
+          fixedUri
+        };
+      }
+    }
 
     // Add _uri to the result if it's an object
     if (data && typeof data === 'object' && !Array.isArray(data)) {
-      (data as any)._uri = fixedUri || uri;
+      (data as any)._uri = (fixedUri || uri).href;
     }
 
-    return { mimeType: 'application/json', text: data, fixedUri };
+    return { ok: true, mimeType: 'application/json', text: data, fixedUri };
   } catch (e: any) {
-    // Return null to trigger JSON-RPC error response
-    return null;
+    const errorMessage = e.message || String(e);
+    return { ok: false, error: `JXA error: ${errorMessage}` };
   }
 }
 
@@ -52,13 +89,13 @@ function listResources(): McpResource[] {
   const resResult = resolveURI('mail://accounts');
   if (resResult.ok) {
     try {
-      const accounts = resResult.value.resolve() as any[];
-      for (let i = 0; i < accounts.length; i++) {
-        const acc = accounts[i];
+      const specifiers = resResult.value.resolve() as any[];
+      for (let i = 0; i < specifiers.length; i++) {
+        const acc = resResult.value.byIndex(i).resolve() as any;
         resources.push({
-          uri: `mail://accounts[${i}]`,
-          name: acc.name,
-          description: `Account: ${acc.fullName}`
+          uri: `mail://accounts/${encodeURIComponent(acc.id)}`,
+          name: acc.fullName,
+          description: acc.userName  // email address
         });
       }
     } catch {

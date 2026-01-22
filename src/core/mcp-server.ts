@@ -185,40 +185,44 @@ class MCPServer {
   }
 
   private handleResourcesRead(id: number | string, params: Record<string, unknown>): void {
-    const uri = params.uri as string;
-    this.log(`Resource read: ${uri}`);
+    const uriString = params.uri as string;
+    this.log(`Resource read: ${uriString}`);
 
     if (!this.resourceReader) {
       this.sendError(id, JsonRpcErrorCodes.METHOD_NOT_FOUND, "Resources not supported");
       return;
     }
 
+    // Parse URI string to URL early for type safety
+    let uri: URL;
     try {
-      this.log(`[DBG] calling resourceReader...`);
-      const content = this.resourceReader(uri);
-      this.log(`[DBG] resourceReader returned`);
-      if (content === null || content === undefined) {
-        this.sendError(id, JsonRpcErrorCodes.RESOURCE_NOT_FOUND, `Resource not found: ${uri}`);
+      uri = new URL(uriString);
+    } catch (e) {
+      this.sendError(id, JsonRpcErrorCodes.INVALID_PARAMS, `Invalid URI: ${uriString}`);
+      return;
+    }
+
+    try {
+      const readResult = this.resourceReader(uri);
+
+      // Handle Result<T> type from readResource
+      if (!readResult.ok) {
+        this.sendError(id, JsonRpcErrorCodes.RESOURCE_NOT_FOUND, readResult.error);
         return;
       }
 
-      this.log(`[DBG] stringifying content...`);
-      const textContent = typeof content.text === 'string'
-        ? content.text
-        : JSON.stringify(content.text, null, 2);
-      this.log(`[DBG] stringified, length: ${textContent.length}`);
+      const textContent = typeof readResult.text === 'string'
+        ? readResult.text
+        : JSON.stringify(readResult.text);
 
-      this.log(`[DBG] building result...`);
-      const result = {
+      const response = {
         contents: [{
-          uri,
-          mimeType: content.mimeType || 'application/json',
+          uri: uriString,
+          mimeType: readResult.mimeType || 'application/json',
           text: textContent
         }]
       };
-      this.log(`[DBG] calling sendResult...`);
-      this.sendResult(id, result);
-      this.log(`[DBG] sendResult done`);
+      this.sendResult(id, response);
     } catch (e) {
       const error = e as Error;
       this.sendError(id, JsonRpcErrorCodes.SERVER_ERROR, `Resource read error: ${error.message}`);

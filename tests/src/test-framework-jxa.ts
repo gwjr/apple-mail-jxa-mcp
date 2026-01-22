@@ -274,27 +274,152 @@ function testJxaRulesAndSignatures() {
 function testJxaQueryOperations() {
   group('JXA Query Operations');
 
+  // Filter mailboxes by unread count
   try {
-    // Filter mailboxes by unread count
     const filtered = resolveURI('mail://accounts[0]/mailboxes?unreadCount.gt=0');
     if (filtered.ok) {
       const list = filtered.value.resolve() as any[];
       console.log(`    Mailboxes with unread: ${list.length}`);
-      if (list.length > 0) {
-        assert(list.every((m: any) => m.unreadCount > 0), 'All have unread > 0');
-      } else {
-        console.log('    (no mailboxes with unread)');
-      }
+      // Collection returns specifiers {uri}, verify we got some results
+      assert(list.length > 0, 'Filter returned results');
+      assert('uri' in list[0], 'Filter result is specifier');
+    } else {
+      console.log(`    Filter resolve failed: ${filtered.error}`);
     }
+  } catch (e: any) {
+    console.log(`  \u2717 Filter query failed: ${e.message}`);
+  }
 
-    // Sort and limit
+  // Sort and limit
+  try {
     const sorted = resolveURI('mail://accounts[0]/mailboxes?sort=name.asc&limit=5');
     if (sorted.ok) {
       const list = sorted.value.resolve() as any[];
       console.log(`    First 5 sorted: ${list.length} mailbox(es)`);
+    } else {
+      console.log(`    Sort resolve failed: ${sorted.error}`);
     }
   } catch (e: any) {
-    console.log(`  \u2717 Query operations: ${e.message}`);
+    console.log(`  \u2717 Sort query failed: ${e.message}`);
+  }
+}
+
+function testJxaCollectionResolution() {
+  group('JXA Collection Resolution (specifiers)');
+
+  // Test that collection.resolve() returns array of {uri} specifiers
+  // To get actual item data, use byIndex(n).resolve()
+
+  // Test accounts collection
+  const accounts = resolveURI('mail://accounts');
+  if (!accounts.ok) {
+    console.log('  - Skipping accounts: could not resolve');
+  } else {
+    try {
+      const list = accounts.value.resolve() as any[];
+      assert(Array.isArray(list), 'accounts.resolve() returns array');
+      if (list.length > 0) {
+        const first = list[0];
+        assert(first !== null, 'First account specifier is not null');
+        assert('uri' in first, 'First account specifier has uri');
+        // Get actual data via byIndex
+        const firstData = accounts.value.byIndex(0).resolve() as any;
+        console.log(`    Accounts: ${list.length} specifiers, first name: ${firstData.name}`);
+      } else {
+        console.log('    Accounts: empty');
+      }
+    } catch (e: any) {
+      console.log(`  \u2717 accounts: ${e.message}`);
+    }
+  }
+
+  // Test rules collection
+  const rules = resolveURI('mail://rules');
+  if (!rules.ok) {
+    console.log('  - Skipping rules: could not resolve');
+  } else {
+    try {
+      const list = rules.value.resolve() as any[];
+      assert(Array.isArray(list), 'rules.resolve() returns array');
+      if (list.length > 0) {
+        const first = list[0];
+        assert(first !== null, 'First rule specifier is not null');
+        assert('uri' in first, 'First rule specifier has uri');
+        const firstData = rules.value.byIndex(0).resolve() as any;
+        console.log(`    Rules: ${list.length} specifiers, first name: ${firstData.name}`);
+      } else {
+        console.log('    Rules: empty');
+      }
+    } catch (e: any) {
+      console.log(`  \u2717 rules: ${e.message}`);
+    }
+  }
+
+  // Test signatures collection
+  const sigs = resolveURI('mail://signatures');
+  if (!sigs.ok) {
+    console.log('  - Skipping signatures: could not resolve');
+  } else {
+    try {
+      const list = sigs.value.resolve() as any[];
+      assert(Array.isArray(list), 'signatures.resolve() returns array');
+      if (list.length > 0) {
+        const first = list[0];
+        assert(first !== null, 'First signature specifier is not null');
+        assert('uri' in first, 'First signature specifier has uri');
+        const firstData = sigs.value.byIndex(0).resolve() as any;
+        console.log(`    Signatures: ${list.length} specifiers, first name: ${firstData.name}`);
+      } else {
+        console.log('    Signatures: empty');
+      }
+    } catch (e: any) {
+      console.log(`  \u2717 signatures: ${e.message}`);
+    }
+  }
+
+  // Test mailboxes collection (nested in account)
+  const mailboxes = resolveURI('mail://accounts[0]/mailboxes');
+  if (!mailboxes.ok) {
+    console.log('  - Skipping mailboxes: could not resolve');
+  } else {
+    try {
+      const list = mailboxes.value.resolve() as any[];
+      assert(Array.isArray(list), 'mailboxes.resolve() returns array');
+      if (list.length > 0) {
+        const first = list[0];
+        assert(first !== null, 'First mailbox specifier is not null');
+        assert('uri' in first, 'First mailbox specifier has uri');
+        const firstData = mailboxes.value.byIndex(0).resolve() as any;
+        console.log(`    Mailboxes: ${list.length} specifiers, first name: ${firstData.name}`);
+      } else {
+        console.log('    Mailboxes: empty');
+      }
+    } catch (e: any) {
+      console.log(`  \u2717 mailboxes: ${e.message}`);
+    }
+  }
+
+  // Test messages collection
+  const inbox = resolveURI('mail://inbox');
+  if (!inbox.ok) {
+    console.log('  - Skipping messages: could not resolve inbox');
+  } else {
+    try {
+      const messages = inbox.value.messages;
+      const list = messages.resolve() as any[];
+      assert(Array.isArray(list), 'messages.resolve() returns array');
+      if (list.length > 0) {
+        const first = list[0];
+        assert(first !== null, 'First message specifier is not null');
+        assert('uri' in first, 'First message specifier has uri');
+        const firstData = messages.byIndex(0).resolve() as any;
+        console.log(`    Messages: ${list.length} specifiers, first subject: ${String(firstData.subject).substring(0, 40)}...`);
+      } else {
+        console.log('    Messages: empty');
+      }
+    } catch (e: any) {
+      console.log(`  \u2717 messages: ${e.message}`);
+    }
   }
 }
 
@@ -313,5 +438,6 @@ testJxaStandardMailboxes();
 testJxaSettings();
 testJxaRulesAndSignatures();
 testJxaQueryOperations();
+testJxaCollectionResolution();
 
 const jxaTestResult = summary();

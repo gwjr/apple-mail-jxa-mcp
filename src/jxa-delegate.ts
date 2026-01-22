@@ -155,14 +155,17 @@ class JXADelegate implements Delegate {
   // Query state methods - merge filters, don't replace
   withFilter(filter: WhoseFilter): JXADelegate {
     const mergedFilter = { ...this._query.filter, ...filter };
-    const newQuery = { ...this._query, filter: mergedFilter };
     // Try JXA whose() first
     try {
       const jxaFilter = toJxaFilter(filter);
       const filtered = this._jxaRef.whose(jxaFilter);
+      // JXA whose() succeeded - don't store filter in queryState (already applied)
+      // Keep other query state (sort, pagination, expand) but clear filter
+      const newQuery = { ...this._query, filter: undefined };
       return new JXADelegate(filtered, this._path, undefined, undefined, this._parentDelegate, newQuery);
     } catch {
       // JXA whose() failed - keep original ref, apply filter in JS at resolve time
+      const newQuery = { ...this._query, filter: mergedFilter };
       return new JXADelegate(this._jxaRef, this._path, this._jxaParent, this._key, this._parentDelegate, newQuery);
     }
   }
@@ -188,6 +191,11 @@ class JXADelegate implements Delegate {
   queryState(): QueryState {
     return this._query;
   }
+
+  // Create a delegate from arbitrary JXA ref with explicit path
+  fromJxa(jxaRef: any, path: PathSegment[]): JXADelegate {
+    return new JXADelegate(jxaRef, path, undefined, undefined, this);
+  }
 }
 
 // Convert WhoseFilter to JXA filter format
@@ -203,3 +211,6 @@ function toJxaFilter(filter: WhoseFilter): Record<string, any> {
 function createJXADelegate(app: any, scheme: string = 'mail'): JXADelegate {
   return new JXADelegate(app, [{ kind: 'root', scheme }], undefined, undefined, undefined);
 }
+
+// Export to globalThis for JXA environment detection
+(globalThis as any).createJXADelegate = createJXADelegate;

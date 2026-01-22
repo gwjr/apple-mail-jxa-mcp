@@ -2,6 +2,21 @@
 //
 // Simple assertion functions that work in both Node and JXA environments.
 
+// ─────────────────────────────────────────────────────────────────────────────
+// URL Polyfill for tests
+// ─────────────────────────────────────────────────────────────────────────────
+// Node's URL constructor rejects unencoded brackets, but our mail:// URIs use them.
+// Wrap the native URL to auto-encode brackets before parsing.
+
+const _NativeURL = globalThis.URL;
+(globalThis as any).URL = class URL extends _NativeURL {
+  constructor(url: string, base?: string | URL) {
+    // Encode brackets in the URL before passing to native constructor
+    const encoded = url.replace(/\[/g, '%5B').replace(/\]/g, '%5D');
+    super(encoded, base);
+  }
+};
+
 let testCount = 0;
 let passCount = 0;
 let currentGroup = '';

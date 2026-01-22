@@ -265,7 +265,7 @@ class MCPServer {
             }
             const textContent = typeof readResult.text === 'string'
                 ? readResult.text
-                : JSON.stringify(readResult.text, null, 2);
+                : JSON.stringify(readResult.text);
             const response = {
                 contents: [{
                         uri: uriString,
@@ -446,10 +446,14 @@ const lt = (value) => ({ operator: ltOp, value });
 function createRes(delegate, proto) {
     // For namespace protos, get the target proto for property lookup
     const targetProto = getNamespaceNav(proto) || proto;
+    // Check if this proto is marked as lazy (specifierFor)
+    const isLazy = lazyProtos.has(proto);
     const handler = {
         get(t, prop, receiver) {
             if (prop === '_delegate')
                 return t._delegate;
+            if (prop === '_isLazy')
+                return isLazy;
             // First check the main proto for methods (resolve, exists, etc.)
             if (prop in proto) {
                 const value = proto[prop];
@@ -491,12 +495,12 @@ function createRes(delegate, proto) {
             return undefined;
         },
         has(t, prop) {
-            if (prop === '_delegate')
+            if (prop === '_delegate' || prop === '_isLazy')
                 return true;
             return prop in proto || prop in targetProto;
         },
         ownKeys(t) {
-            // Combine keys from proto and targetProto, plus _delegate
+            // Combine keys from proto and targetProto, plus _delegate (but not _isLazy - it's internal)
             const keys = new Set(['_delegate']);
             for (const key of Object.keys(proto))
                 keys.add(key);
@@ -506,7 +510,7 @@ function createRes(delegate, proto) {
         },
         getOwnPropertyDescriptor(t, prop) {
             // Make properties enumerable for Object.keys() to work
-            if (prop === '_delegate' || prop in proto || prop in targetProto) {
+            if (prop === '_delegate' || prop === '_isLazy' || prop in proto || prop in targetProto) {
                 return { enumerable: true, configurable: true };
             }
             return undefined;
@@ -539,7 +543,7 @@ const _objectProtoImpl = {
         // First try to get the proto from the Res proxy by getting a known property
         // We iterate over all enumerable properties and resolve them
         const result = {};
-        const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
+        const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate', '_isLazy']);
         // Get the proto by accessing it through the handler
         // We use Object.keys which will trigger the 'has' trap, giving us the keys
         for (const key of Object.keys(this)) {
@@ -548,10 +552,15 @@ const _objectProtoImpl = {
             try {
                 const propRes = this[key];
                 if (propRes && typeof propRes === 'object' && '_delegate' in propRes) {
-                    // It's a Res - resolve it
-                    const resolved = propRes.resolve();
-                    if (resolved !== undefined) {
-                        result[key] = resolved;
+                    // It's a Res - check if it's lazy (should return specifier instead of value)
+                    if (propRes._isLazy) {
+                        result[key] = propRes.specifier();
+                    }
+                    else {
+                        const resolved = propRes.resolve();
+                        if (resolved !== undefined) {
+                            result[key] = resolved;
+                        }
                     }
                 }
                 else if (propRes !== undefined) {
@@ -603,16 +612,17 @@ const eagerScalar = baseScalar;
 // ─────────────────────────────────────────────────────────────────────────────
 // Composers
 // ─────────────────────────────────────────────────────────────────────────────
-// specifierFor: marks a property as returning a specifier (URL) rather than a resolved value
-// When the parent object is resolved, this property will be { uri: URL } instead of the actual value
+// Track lazy protos for parent object resolution
+const lazyProtos = new WeakSet();
+// specifierFor: marks a property as "lazy" - when resolved as part of a parent object,
+// returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
 function specifierFor(proto) {
-    return {
-        ...proto,
-        // Override resolve to return specifier instead of value
-        resolve() {
-            return { uri: this._delegate.uri() };
-        },
-    };
+    const lazyProto = { ...proto };
+    lazyProtos.add(lazyProto);
+    return lazyProto;
+}
+function isLazyProto(proto) {
+    return lazyProtos.has(proto);
 }
 function withSet(proto) {
     return {
@@ -627,26 +637,16 @@ function withByIndex(itemProto) {
     return function (proto) {
         const result = {
             ...proto,
-            // resolve() returns specifiers for each item - guaranteed to have uri (URL object),
-            // may include additional metadata (id, name) if cheap to obtain
+            // resolve() returns specifiers for each item - just {uri: URL}
+            // We don't extract id/name here because in JXA that would require calling
+            // methods on each item, which is slow for large collections
             resolve() {
                 const raw = this._delegate._jxa();
                 if (!Array.isArray(raw))
                     return raw;
-                // Map each item to its specifier - uri is guaranteed, other fields optional
-                return raw.map((item, i) => {
+                return raw.map((_item, i) => {
                     const itemDelegate = this._delegate.byIndex(i);
-                    const entry = {
-                        uri: itemDelegate.uri()
-                    };
-                    // Include id/name if available in raw data (cheap - no extra JXA calls)
-                    if (item && typeof item === 'object') {
-                        if ('id' in item)
-                            entry.id = item.id;
-                        if ('name' in item)
-                            entry.name = item.name;
-                    }
-                    return entry;
+                    return { uri: itemDelegate.uri() };
                 });
             },
             byIndex(n) {
@@ -841,12 +841,25 @@ function namespaceNav(targetProto) {
 function getNamespaceNav(proto) {
     return namespaceNavMap.get(proto);
 }
+// Helper to get a property value, handling JXA specifiers (functions)
+function getPropValue(item, field) {
+    if (item && typeof item === 'object' && field in item) {
+        const val = item[field];
+        return typeof val === 'function' ? val() : val;
+    }
+    // JXA specifier: property access returns a function to call
+    if (typeof item === 'function' && typeof item[field] === 'function') {
+        return item[field]();
+    }
+    return undefined;
+}
 function applyQueryState(items, query) {
     let results = items;
     if (query.filter && Object.keys(query.filter).length > 0) {
         results = results.filter((item) => {
             for (const [field, pred] of Object.entries(query.filter)) {
-                if (!pred.operator.test(item[field], pred.value)) {
+                const val = getPropValue(item, field);
+                if (!pred.operator.test(val, pred.value)) {
                     return false;
                 }
             }
@@ -856,8 +869,8 @@ function applyQueryState(items, query) {
     if (query.sort) {
         const { by, direction = 'asc' } = query.sort;
         results = [...results].sort((a, b) => {
-            const aVal = a[by];
-            const bVal = b[by];
+            const aVal = getPropValue(a, by);
+            const bVal = getPropValue(b, by);
             const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
             return direction === 'desc' ? -cmp : cmp;
         });
@@ -1455,15 +1468,18 @@ class JXADelegate {
     // Query state methods - merge filters, don't replace
     withFilter(filter) {
         const mergedFilter = { ...this._query.filter, ...filter };
-        const newQuery = { ...this._query, filter: mergedFilter };
         // Try JXA whose() first
         try {
             const jxaFilter = toJxaFilter(filter);
             const filtered = this._jxaRef.whose(jxaFilter);
+            // JXA whose() succeeded - don't store filter in queryState (already applied)
+            // Keep other query state (sort, pagination, expand) but clear filter
+            const newQuery = { ...this._query, filter: undefined };
             return new JXADelegate(filtered, this._path, undefined, undefined, this._parentDelegate, newQuery);
         }
         catch {
             // JXA whose() failed - keep original ref, apply filter in JS at resolve time
+            const newQuery = { ...this._query, filter: mergedFilter };
             return new JXADelegate(this._jxaRef, this._path, this._jxaParent, this._key, this._parentDelegate, newQuery);
         }
     }
@@ -1484,6 +1500,10 @@ class JXADelegate {
     }
     queryState() {
         return this._query;
+    }
+    // Create a delegate from arbitrary JXA ref with explicit path
+    fromJxa(jxaRef, path) {
+        return new JXADelegate(jxaRef, path, undefined, undefined, this);
     }
 }
 // Convert WhoseFilter to JXA filter format
@@ -1672,9 +1692,48 @@ const MailAccountProto = {
     fullName: eagerScalar,
     emailAddresses: eagerScalar, // Returns string[] of account's email addresses
     mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
-    // Account inbox navigates to mailboxes.byName('INBOX')
-    inbox: computedNav((d) => d.prop('mailboxes').byName('INBOX'), MailboxProto),
+    // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
+    // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
+    inbox: computedNav((d) => {
+        if (!d.fromJxa) {
+            // Mock delegate: fall back to mailboxes.byName('INBOX')
+            return d.prop('mailboxes').byName('INBOX');
+        }
+        // JXA: Find inbox mailbox by matching account ID
+        const accountId = d._jxa().id();
+        const Mail = Application('Mail');
+        const inboxMailboxes = Mail.inbox.mailboxes();
+        const accountInbox = inboxMailboxes.find((mb) => mb.account.id() === accountId);
+        if (!accountInbox) {
+            throw new Error(`No inbox found for account ${accountId}`);
+        }
+        // Build path by parsing current URI and adding /inbox
+        // URI is like "mail://accounts%5B0%5D" -> path segments for "accounts[0]/inbox"
+        const currentUri = d.uri().href;
+        const afterScheme = currentUri.replace('mail://', '');
+        const decodedPath = decodeURIComponent(afterScheme);
+        // Parse into segments: e.g., "accounts[0]" -> [{root}, {prop: accounts}, {index: 0}]
+        const pathSegments = parsePathToSegments('mail', decodedPath);
+        pathSegments.push({ kind: 'prop', name: 'inbox' });
+        return d.fromJxa(accountInbox, pathSegments);
+    }, MailboxProto),
 };
+// Helper to parse a path string into PathSegment array
+function parsePathToSegments(scheme, path) {
+    const segments = [{ kind: 'root', scheme }];
+    const parts = path.split('/').filter(p => p);
+    for (const part of parts) {
+        const indexMatch = part.match(/^(.+)\[(\d+)\]$/);
+        if (indexMatch) {
+            segments.push({ kind: 'prop', name: indexMatch[1] });
+            segments.push({ kind: 'index', value: parseInt(indexMatch[2], 10) });
+        }
+        else {
+            segments.push({ kind: 'prop', name: part });
+        }
+    }
+    return segments;
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings proto (namespace for app-level preferences)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1757,6 +1816,8 @@ if (typeof _globalThis.Application !== 'undefined' && typeof _globalThis.createJ
 // ============================================================================
 // MCP Resource Handler
 // ============================================================================
+const DEFAULT_COLLECTION_LIMIT = 20;
+const MAX_COLLECTION_LIMIT = 100;
 function readResource(uri) {
     const resResult = resolveURI(uri.href);
     if (!resResult.ok) {
@@ -1764,10 +1825,41 @@ function readResource(uri) {
     }
     const res = resResult.value;
     try {
-        const data = res.resolve();
+        let data = res.resolve();
         // Get the canonical URI from the delegate
         const canonicalUri = res._delegate.uri();
         const fixedUri = canonicalUri.href !== uri.href ? canonicalUri : undefined;
+        // Protect against returning huge collections
+        if (Array.isArray(data)) {
+            const queryState = res._delegate.queryState();
+            const requestedLimit = queryState.pagination?.limit;
+            const requestedOffset = queryState.pagination?.offset ?? 0;
+            // Use requested limit (capped at max) or default
+            const effectiveLimit = requestedLimit
+                ? Math.min(requestedLimit, MAX_COLLECTION_LIMIT)
+                : DEFAULT_COLLECTION_LIMIT;
+            if (data.length > effectiveLimit) {
+                const totalCount = data.length;
+                const baseUri = (fixedUri || canonicalUri).href.split('?')[0];
+                const nextOffset = requestedOffset + effectiveLimit;
+                const nextUri = `${baseUri}?limit=${effectiveLimit}&offset=${nextOffset}`;
+                return {
+                    ok: true,
+                    mimeType: 'application/json',
+                    text: {
+                        _pagination: {
+                            total: totalCount,
+                            returned: effectiveLimit,
+                            offset: requestedOffset,
+                            limit: effectiveLimit,
+                            next: nextOffset < totalCount ? nextUri : null
+                        },
+                        items: data.slice(0, effectiveLimit)
+                    },
+                    fixedUri
+                };
+            }
+        }
         // Add _uri to the result if it's an object
         if (data && typeof data === 'object' && !Array.isArray(data)) {
             data._uri = (fixedUri || uri).href;
@@ -1798,13 +1890,13 @@ function listResources() {
     const resResult = resolveURI('mail://accounts');
     if (resResult.ok) {
         try {
-            const accounts = resResult.value.resolve();
-            for (let i = 0; i < accounts.length; i++) {
-                const acc = accounts[i];
+            const specifiers = resResult.value.resolve();
+            for (let i = 0; i < specifiers.length; i++) {
+                const acc = resResult.value.byIndex(i).resolve();
                 resources.push({
-                    uri: `mail://accounts[${i}]`,
-                    name: acc.name,
-                    description: `Account: ${acc.fullName}`
+                    uri: `mail://accounts/${encodeURIComponent(acc.id)}`,
+                    name: acc.fullName,
+                    description: acc.userName // email address
                 });
             }
         }

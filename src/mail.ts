@@ -229,9 +229,48 @@ const MailAccountProto = {
   fullName: eagerScalar,
   emailAddresses: eagerScalar,  // Returns string[] of account's email addresses
   mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
-  // Account inbox navigates to mailboxes.byName('INBOX')
-  inbox: computedNav((d) => d.prop('mailboxes').byName('INBOX'), MailboxProto),
+  // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
+  // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
+  inbox: computedNav((d) => {
+    if (!d.fromJxa) {
+      // Mock delegate: fall back to mailboxes.byName('INBOX')
+      return d.prop('mailboxes').byName('INBOX');
+    }
+    // JXA: Find inbox mailbox by matching account ID
+    const accountId = d._jxa().id();
+    const Mail = Application('Mail');
+    const inboxMailboxes = Mail.inbox.mailboxes();
+    const accountInbox = inboxMailboxes.find((mb: any) => mb.account.id() === accountId);
+    if (!accountInbox) {
+      throw new Error(`No inbox found for account ${accountId}`);
+    }
+    // Build path by parsing current URI and adding /inbox
+    // URI is like "mail://accounts%5B0%5D" -> path segments for "accounts[0]/inbox"
+    const currentUri = d.uri().href;
+    const afterScheme = currentUri.replace('mail://', '');
+    const decodedPath = decodeURIComponent(afterScheme);
+    // Parse into segments: e.g., "accounts[0]" -> [{root}, {prop: accounts}, {index: 0}]
+    const pathSegments = parsePathToSegments('mail', decodedPath);
+    pathSegments.push({ kind: 'prop' as const, name: 'inbox' });
+    return d.fromJxa(accountInbox, pathSegments);
+  }, MailboxProto),
 };
+
+// Helper to parse a path string into PathSegment array
+function parsePathToSegments(scheme: string, path: string): PathSegment[] {
+  const segments: PathSegment[] = [{ kind: 'root', scheme }];
+  const parts = path.split('/').filter(p => p);
+  for (const part of parts) {
+    const indexMatch = part.match(/^(.+)\[(\d+)\]$/);
+    if (indexMatch) {
+      segments.push({ kind: 'prop', name: indexMatch[1] });
+      segments.push({ kind: 'index', value: parseInt(indexMatch[2], 10) });
+    } else {
+      segments.push({ kind: 'prop', name: part });
+    }
+  }
+  return segments;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings proto (namespace for app-level preferences)
