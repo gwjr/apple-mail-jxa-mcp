@@ -31,7 +31,7 @@ const messageMoveHandler: MoveHandler = (msgDelegate, destCollectionDelegate): R
   const destMailboxUri = destMailbox.uri();
   // Get the message's RFC messageId (stable across moves)
   try {
-    const rfcMessageId = msgDelegate.prop('messageId')._jxa();
+    const rfcMessageId = msgDelegate.prop('messageId')._jxa() as string;
     const newUrl = new URL(`${destMailboxUri.href}/messages/${encodeURIComponent(rfcMessageId)}`);
     return { ok: true, value: newUrl };
   } catch {
@@ -82,10 +82,10 @@ function parseEmailAddress(raw: string): ParsedEmailAddress {
 
 const RuleConditionProto = {
   ...baseObject,
-  header: eagerScalar,
-  qualifier: eagerScalar,
-  ruleType: eagerScalar,
-  expression: eagerScalar,
+  header: t.string,
+  qualifier: t.string,
+  ruleType: t.string,
+  expression: t.string,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,7 +94,7 @@ const RuleConditionProto = {
 
 const _RuleProtoBase = {
   ...baseObject,
-  name: eagerScalar,
+  name: t.string,
   enabled: withSet(t.boolean),
   allConditionsMustBeMet: withSet(t.boolean),
   deleteMessage: withSet(t.boolean),
@@ -122,8 +122,8 @@ const RuleProto = pipe(_RuleProtoBase, withDelete());
 
 const SignatureProto = {
   ...baseObject,
-  name: eagerScalar,
-  content: specifierFor(baseScalar),
+  name: t.string,
+  content: lazy(t.string),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,8 +132,8 @@ const SignatureProto = {
 
 const RecipientProto = {
   ...baseObject,
-  name: eagerScalar,
-  address: eagerScalar,
+  name: t.string,
+  address: t.string,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,9 +142,9 @@ const RecipientProto = {
 
 const AttachmentProto = {
   ...baseObject,
-  id: eagerScalar,
-  name: eagerScalar,
-  fileSize: eagerScalar,
+  id: t.string,
+  name: t.string,
+  fileSize: t.number,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,18 +156,18 @@ type MessageProtoType = typeof _MessageProtoBase & MoveableProto<typeof _Message
 
 const _MessageProtoBase = {
   ...baseObject,
-  id: eagerScalar,
-  messageId: eagerScalar,
+  id: t.number,
+  messageId: t.string,
   subject: withSet(t.string),
   sender: computed<ParsedEmailAddress>(parseEmailAddress),
   replyTo: computed<ParsedEmailAddress>(parseEmailAddress),
-  dateSent: eagerScalar,
-  dateReceived: eagerScalar,
-  content: specifierFor(baseScalar),
+  dateSent: t.date,
+  dateReceived: t.date,
+  content: lazy(t.string),
   readStatus: withSet(t.boolean),
   flaggedStatus: withSet(t.boolean),
   junkMailStatus: withSet(t.boolean),
-  messageSize: eagerScalar,
+  messageSize: t.number,
   toRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
   ccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
   bccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
@@ -196,7 +196,7 @@ const messagesCollectionProto = pipe2(
 );
 
 // Lazy version for use in mailbox (returns specifier when parent is resolved)
-const lazyMessagesProto = specifierFor(messagesCollectionProto);
+const lazyMessagesProto = lazy(messagesCollectionProto);
 
 // Mailboxes collection for account-level (eager, since we enumerate accounts)
 // Uses null as any - forward reference workaround for self-referential MailboxProto
@@ -207,20 +207,20 @@ const mailboxesCollectionProto = pipe2(
 );
 
 // Lazy version for nested mailboxes in a mailbox
-const lazyMailboxesProto = specifierFor(mailboxesCollectionProto);
+const lazyMailboxesProto = lazy(mailboxesCollectionProto);
 
 // Mailbox is self-referential (contains mailboxes), so needs interface declaration
 interface MailboxProtoType extends BaseProtoType {
-  name: typeof eagerScalar;
-  unreadCount: typeof eagerScalar;
+  name: typeof t.string;
+  unreadCount: typeof t.number;
   messages: typeof lazyMessagesProto;
   mailboxes: typeof lazyMailboxesProto;
 }
 
 const MailboxProto: MailboxProtoType = {
   ...baseObject,
-  name: eagerScalar,
-  unreadCount: eagerScalar,
+  name: t.string,
+  unreadCount: t.number,
   messages: lazyMessagesProto,
   mailboxes: lazyMailboxesProto,
 };
@@ -231,10 +231,10 @@ const MailboxProto: MailboxProtoType = {
 
 const MailAccountProto = {
   ...baseObject,
-  id: eagerScalar,
-  name: eagerScalar,
-  fullName: eagerScalar,
-  emailAddresses: eagerScalar,  // Returns string[] of account's email addresses
+  id: t.string,
+  name: t.string,
+  fullName: t.string,
+  emailAddresses: t.stringArray,
   mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
   // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
   // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
@@ -244,7 +244,8 @@ const MailAccountProto = {
       return d.prop('mailboxes').byName('INBOX');
     }
     // JXA: Find inbox mailbox by matching account ID
-    const accountId = d._jxa().id();
+    const jxaAccount = d._jxa() as { id(): string };
+    const accountId = jxaAccount.id();
     const Mail = Application('Mail');
     const inboxMailboxes = Mail.inbox.mailboxes();
     const accountInbox = inboxMailboxes.find((mb: any) => mb.account.id() === accountId);
@@ -284,11 +285,11 @@ function parsePathToSegments(scheme: string, path: string): PathSegment[] {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MailSettingsProto = {
-  ...baseScalar,
+  ...passthrough,
   // App info (read-only)
-  name: eagerScalar,
-  version: eagerScalar,
-  frontmost: eagerScalar,
+  name: t.string,
+  version: t.string,
+  frontmost: t.boolean,
   // Behavior
   alwaysBccMyself: withSet(t.boolean),
   alwaysCcMyself: withSet(t.boolean),
@@ -327,9 +328,9 @@ const MailSettingsProto = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MailApplicationProto = {
-  ...baseScalar,
-  name: eagerScalar,
-  version: eagerScalar,
+  ...passthrough,
+  name: t.string,
+  version: t.string,
   accounts: pipe3(baseCollection, withByIndex(MailAccountProto), withByName(MailAccountProto), withById(MailAccountProto)),
   rules: pipe2(baseCollection, withByIndex(RuleProto), withByName(RuleProto)),
   signatures: pipe2(baseCollection, withByIndex(SignatureProto), withByName(SignatureProto)),

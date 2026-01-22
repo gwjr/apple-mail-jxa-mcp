@@ -21,8 +21,8 @@ declare const DeleteableBrand: unique symbol;
 declare const CreateableBrand: unique symbol;
 
 // Mark schema types
-declare const SchematicBrand: unique symbol;
-interface Schematic { [SchematicBrand]: void; }
+//declare const SchematicBrand: unique symbol;
+//interface Schematic { [SchematicBrand]: void; }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Type-level utilities
@@ -36,12 +36,12 @@ type CollectionResolveResult = { uri: URL }[] | { uri: URL; [key: string]: any }
 type Lazy<T> = T & { readonly [LazyBrand]: true };
 
 type ScalarType<T> = { readonly [ScalarBrand]: T };
-type EagerScalarType<T> = ScalarType<T> & { readonly [EagerBrand]: true };
-type LazyScalarType<T> = ScalarType<T> & { readonly [LazyBrand]: true };
+//type EagerScalarType<T> = ScalarType<T> & { readonly [EagerBrand]: true };
+//type LazyScalarType<T> = ScalarType<T> & { readonly [LazyBrand]: true };
 
 type CollectionType<Item> = { readonly [CollectionBrand]: Item };
-type EagerCollectionType<Item> = CollectionType<Item> & { readonly [EagerBrand]: true };
-type LazyCollectionType<Item> = CollectionType<Item> & { readonly [LazyBrand]: true };
+//type EagerCollectionType<Item> = CollectionType<Item> & { readonly [EagerBrand]: true };
+//type LazyCollectionType<Item> = CollectionType<Item> & { readonly [LazyBrand]: true };
 
 type ExtractScalar<T> = T extends { readonly [ScalarBrand]: infer S } ? S : never;
 type ExtractItem<T> = T extends { readonly [CollectionBrand]: infer I } ? I : never;
@@ -51,14 +51,17 @@ type IsLazy<T> = T extends { readonly [LazyBrand]: true } ? true : false;
 // Base Prototype Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-type BaseProtoType<T = any> = {
+// Base proto interface - common methods for all protos
+interface BaseProtoType<T = any> {
   exists(): boolean;
   specifier(): Specifier;
   resolve(): T;
-};
+}
 
-// Scalar proto: BaseProtoType with ScalarBrand for discrimination
-type ScalarProto<T = any> = BaseProtoType<T> & { readonly [ScalarBrand]: T };
+// Scalar proto: has ScalarBrand for discrimination
+type ScalarProto<T> = BaseProtoType<T> & {
+   readonly [ScalarBrand]: T;
+};
 
 // Accessor types for collections
 type IndexAccessor<Item = any> = { byIndex(n: number): Res<Item> };
@@ -137,28 +140,91 @@ const _objectProtoImpl = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Validators
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Validator<T> = (raw: unknown) => T;
+
+// Primitive validators
+const isString: Validator<string> = (v: unknown): string => {
+  if (typeof v !== 'string') throw new TypeError(`Expected string, got ${typeof v}`);
+  return v;
+};
+
+const isNumber: Validator<number> = (v: unknown): number => {
+  if (typeof v !== 'number') throw new TypeError(`Expected number, got ${typeof v}`);
+  return v;
+};
+
+const isBoolean: Validator<boolean> = (v: unknown): boolean => {
+  if (typeof v !== 'boolean') throw new TypeError(`Expected boolean, got ${typeof v}`);
+  return v;
+};
+
+const isDate: Validator<Date> = (v: unknown): Date => {
+  if (v instanceof Date) return v;
+  // Also accept ISO date strings
+  if (typeof v === 'string') {
+    const d = new Date(v);
+    if (!isNaN(d.getTime())) return d;
+  }
+  throw new TypeError(`Expected Date, got ${typeof v}`);
+};
+
+// Passthrough validator - no validation, explicit unknown type
+const isAny: Validator<unknown> = (v: unknown): unknown => v;
+
+// Array validators
+const isStringArray: Validator<string[]> = (v: unknown): string[] => {
+  if (!Array.isArray(v)) throw new TypeError(`Expected array, got ${typeof v}`);
+  return v.map(isString);
+};
+
+// Optional wrapper - allows null/undefined
+function optional<T>(validator: Validator<T>): Validator<T | null> {
+  return (v: unknown): T | null => {
+    if (v === null || v === undefined) return null;
+    return validator(v);
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Scalar Factories
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Typed scalar factory
-function scalar<T>(): ScalarProto<T> {
-  return { ..._baseProtoImpl } as ScalarProto<T>;
+// Typed scalar factory with runtime validation
+function scalar<T>(validate: Validator<T>): ScalarProto<T> {
+  return {
+    exists(this: { _delegate: Delegate }): boolean {
+      try {
+        const result = this._delegate._jxa();
+        return result !== undefined && result !== null;
+      } catch {
+        return false;
+      }
+    },
+    specifier(this: { _delegate: Delegate }): Specifier {
+      return { uri: this._delegate.uri() };
+    },
+    resolve(this: { _delegate: Delegate }): T {
+      const raw = this._delegate._jxa();
+      return validate(raw);
+    },
+  } as ScalarProto<T>;
 }
 
-// Base scalar for fallback
-const baseScalar = scalar<any>();
+// Passthrough scalar - no validation, for untyped content
+const passthrough = scalar(isAny);
 
-// Primitive type scalars
+// Primitive type scalars with runtime validation
 const t = {
-  string: scalar<string>(),
-  number: scalar<number>(),
-  boolean: scalar<boolean>(),
-  date: scalar<Date>(),
-  any: scalar<any>(),
+  string: scalar(isString),
+  number: scalar(isNumber),
+  boolean: scalar(isBoolean),
+  date: scalar(isDate),
+  stringArray: scalar(isStringArray),
+  any: passthrough,
 };
-
-// Eager scalar (resolves to value, not specifier) - same impl, different semantics
-const eagerScalar = scalar<any>();
 
 // Base object for complex types that need property gathering
 const baseObject: BaseProtoType<any> = { ..._objectProtoImpl };
@@ -171,9 +237,9 @@ const baseObject: BaseProtoType<any> = { ..._objectProtoImpl };
 // Track lazy protos for parent object resolution
 const lazyProtos = new WeakSet<object>();
 
-// specifierFor: marks a property as "lazy" - when resolved as part of a parent object,
+// lazy: marks a property as "lazy" - when resolved as part of a parent object,
 // returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
-function specifierFor<P extends BaseProtoType<any>>(proto: P): P & { readonly [LazyBrand]: true } {
+function lazy<P extends BaseProtoType<any>>(proto: P): P & { readonly [LazyBrand]: true } {
   const lazyProto = { ...proto } as P & { readonly [LazyBrand]: true };
   lazyProtos.add(lazyProto);
   // Copy over collection item proto if this is a collection
@@ -241,8 +307,10 @@ function collection<Item extends object, A extends CollectionAccessors<Item>>(
     // resolve() returns specifiers for each item
     resolve(this: { _delegate: Delegate }): CollectionResolveResult {
       const raw = this._delegate._jxa();
-      if (!Array.isArray(raw)) return raw;
-      return raw.map((_item: any, i: number) => {
+      if (!Array.isArray(raw)) {
+        throw new TypeError(`Collection expected array, got ${typeof raw}`);
+      }
+      return raw.map((_item: unknown, i: number) => {
         const itemDelegate = this._delegate.byIndex(i);
         return { uri: itemDelegate.uri() };
       });
@@ -535,6 +603,9 @@ function withQuery<P extends BaseProtoType<any>>(proto: P): P & QueryableProto<a
 
     resolve(this: { _delegate: Delegate }) {
       const raw = this._delegate._jxa();
+      if (!Array.isArray(raw)) {
+        throw new TypeError(`Query expected array, got ${typeof raw}`);
+      }
       const query = this._delegate.queryState();
       let results = applyQueryState(raw, query);
 

@@ -15,7 +15,7 @@ type Res<P> = P & { _delegate: Delegate; _isLazy?: boolean };
 function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
   // For namespace protos, get the target proto for property lookup
   const targetProto = getNamespaceNav(proto) || proto;
-  // Check if this proto is marked as lazy (specifierFor)
+  // Check if this proto is marked as lazy
   const isLazy = lazyProtos.has(proto);
 
   const handler: ProxyHandler<{ _delegate: Delegate; _isLazy?: boolean }> = {

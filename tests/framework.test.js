@@ -179,25 +179,84 @@ const _objectProtoImpl = {
         return { uri: this._delegate.uri() };
     },
 };
+// Primitive validators
+const isString = (v) => {
+    if (typeof v !== 'string')
+        throw new TypeError(`Expected string, got ${typeof v}`);
+    return v;
+};
+const isNumber = (v) => {
+    if (typeof v !== 'number')
+        throw new TypeError(`Expected number, got ${typeof v}`);
+    return v;
+};
+const isBoolean = (v) => {
+    if (typeof v !== 'boolean')
+        throw new TypeError(`Expected boolean, got ${typeof v}`);
+    return v;
+};
+const isDate = (v) => {
+    if (v instanceof Date)
+        return v;
+    // Also accept ISO date strings
+    if (typeof v === 'string') {
+        const d = new Date(v);
+        if (!isNaN(d.getTime()))
+            return d;
+    }
+    throw new TypeError(`Expected Date, got ${typeof v}`);
+};
+// Passthrough validator - no validation, explicit unknown type
+const isAny = (v) => v;
+// Array validators
+const isStringArray = (v) => {
+    if (!Array.isArray(v))
+        throw new TypeError(`Expected array, got ${typeof v}`);
+    return v.map(isString);
+};
+// Optional wrapper - allows null/undefined
+function optional(validator) {
+    return (v) => {
+        if (v === null || v === undefined)
+            return null;
+        return validator(v);
+    };
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Scalar Factories
 // ─────────────────────────────────────────────────────────────────────────────
-// Typed scalar factory
-function scalar() {
-    return { ..._baseProtoImpl };
+// Typed scalar factory with runtime validation
+function scalar(validate) {
+    return {
+        exists() {
+            try {
+                const result = this._delegate._jxa();
+                return result !== undefined && result !== null;
+            }
+            catch {
+                return false;
+            }
+        },
+        specifier() {
+            return { uri: this._delegate.uri() };
+        },
+        resolve() {
+            const raw = this._delegate._jxa();
+            return validate(raw);
+        },
+    };
 }
-// Base scalar for fallback
-const baseScalar = scalar();
-// Primitive type scalars
+// Passthrough scalar - no validation, for untyped content
+const passthrough = scalar(isAny);
+// Primitive type scalars with runtime validation
 const t = {
-    string: scalar(),
-    number: scalar(),
-    boolean: scalar(),
-    date: scalar(),
-    any: scalar(),
+    string: scalar(isString),
+    number: scalar(isNumber),
+    boolean: scalar(isBoolean),
+    date: scalar(isDate),
+    stringArray: scalar(isStringArray),
+    any: passthrough,
 };
-// Eager scalar (resolves to value, not specifier) - same impl, different semantics
-const eagerScalar = scalar();
 // Base object for complex types that need property gathering
 const baseObject = { ..._objectProtoImpl };
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,9 +264,9 @@ const baseObject = { ..._objectProtoImpl };
 // ─────────────────────────────────────────────────────────────────────────────
 // Track lazy protos for parent object resolution
 const lazyProtos = new WeakSet();
-// specifierFor: marks a property as "lazy" - when resolved as part of a parent object,
+// lazy: marks a property as "lazy" - when resolved as part of a parent object,
 // returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
-function specifierFor(proto) {
+function lazy(proto) {
     const lazyProto = { ...proto };
     lazyProtos.add(lazyProto);
     // Copy over collection item proto if this is a collection
@@ -247,8 +306,9 @@ function collection(accessors) {
         // resolve() returns specifiers for each item
         resolve() {
             const raw = this._delegate._jxa();
-            if (!Array.isArray(raw))
-                return raw;
+            if (!Array.isArray(raw)) {
+                throw new TypeError(`Collection expected array, got ${typeof raw}`);
+            }
             return raw.map((_item, i) => {
                 const itemDelegate = this._delegate.byIndex(i);
                 return { uri: itemDelegate.uri() };
@@ -446,6 +506,9 @@ function withQuery(proto) {
         ...proto,
         resolve() {
             const raw = this._delegate._jxa();
+            if (!Array.isArray(raw)) {
+                throw new TypeError(`Query expected array, got ${typeof raw}`);
+            }
             const query = this._delegate.queryState();
             let results = applyQueryState(raw, query);
             if (query.expand && query.expand.length > 0 && itemProto) {
@@ -513,7 +576,7 @@ function isChildProto(value) {
 function createRes(delegate, proto) {
     // For namespace protos, get the target proto for property lookup
     const targetProto = getNamespaceNav(proto) || proto;
-    // Check if this proto is marked as lazy (specifierFor)
+    // Check if this proto is marked as lazy
     const isLazy = lazyProtos.has(proto);
     const handler = {
         get(t, prop, receiver) {
@@ -956,6 +1019,15 @@ function resolveURI(uri) {
 // Legacy composers and factories for backwards compatibility with existing schemas.
 // New code should use the unified collection() factory instead.
 // ─────────────────────────────────────────────────────────────────────────────
+// Legacy Scalar Aliases
+// ─────────────────────────────────────────────────────────────────────────────
+// Base scalar for fallback (alias for passthrough)
+const baseScalar = passthrough;
+// Eager scalar (alias for passthrough - historical compatibility)
+const eagerScalar = passthrough;
+// Legacy alias for lazy()
+const specifierFor = lazy;
+// ─────────────────────────────────────────────────────────────────────────────
 // Legacy Base Collection (no accessors)
 // ─────────────────────────────────────────────────────────────────────────────
 // Base collection for use with legacy composers - returns raw array, no accessors
@@ -973,7 +1045,11 @@ const baseCollection = {
         return { uri: this._delegate.uri() };
     },
     resolve() {
-        return this._delegate._jxa();
+        const raw = this._delegate._jxa();
+        if (!Array.isArray(raw)) {
+            throw new TypeError(`Collection expected array, got ${typeof raw}`);
+        }
+        return raw;
     },
 };
 function withByIndex(itemProto) {
@@ -982,8 +1058,9 @@ function withByIndex(itemProto) {
             ...proto,
             resolve() {
                 const raw = this._delegate._jxa();
-                if (!Array.isArray(raw))
-                    return raw;
+                if (!Array.isArray(raw)) {
+                    throw new TypeError(`Collection expected array, got ${typeof raw}`);
+                }
                 return raw.map((_item, i) => {
                     const itemDelegate = this._delegate.byIndex(i);
                     return { uri: itemDelegate.uri() };
@@ -1298,17 +1375,17 @@ function parseEmailAddress(raw) {
 // ─────────────────────────────────────────────────────────────────────────────
 const RuleConditionProto = {
     ...baseObject,
-    header: eagerScalar,
-    qualifier: eagerScalar,
-    ruleType: eagerScalar,
-    expression: eagerScalar,
+    header: t.string,
+    qualifier: t.string,
+    ruleType: t.string,
+    expression: t.string,
 };
 // ─────────────────────────────────────────────────────────────────────────────
 // Rule proto
 // ─────────────────────────────────────────────────────────────────────────────
 const _RuleProtoBase = {
     ...baseObject,
-    name: eagerScalar,
+    name: t.string,
     enabled: withSet(t.boolean),
     allConditionsMustBeMet: withSet(t.boolean),
     deleteMessage: withSet(t.boolean),
@@ -1333,40 +1410,40 @@ const RuleProto = pipe(_RuleProtoBase, withDelete());
 // ─────────────────────────────────────────────────────────────────────────────
 const SignatureProto = {
     ...baseObject,
-    name: eagerScalar,
-    content: specifierFor(baseScalar),
+    name: t.string,
+    content: lazy(t.string),
 };
 // ─────────────────────────────────────────────────────────────────────────────
 // Recipient proto
 // ─────────────────────────────────────────────────────────────────────────────
 const RecipientProto = {
     ...baseObject,
-    name: eagerScalar,
-    address: eagerScalar,
+    name: t.string,
+    address: t.string,
 };
 // ─────────────────────────────────────────────────────────────────────────────
 // Attachment proto
 // ─────────────────────────────────────────────────────────────────────────────
 const AttachmentProto = {
     ...baseObject,
-    id: eagerScalar,
-    name: eagerScalar,
-    fileSize: eagerScalar,
+    id: t.string,
+    name: t.string,
+    fileSize: t.number,
 };
 const _MessageProtoBase = {
     ...baseObject,
-    id: eagerScalar,
-    messageId: eagerScalar,
+    id: t.number,
+    messageId: t.string,
     subject: withSet(t.string),
     sender: computed(parseEmailAddress),
     replyTo: computed(parseEmailAddress),
-    dateSent: eagerScalar,
-    dateReceived: eagerScalar,
-    content: specifierFor(baseScalar),
+    dateSent: t.date,
+    dateReceived: t.date,
+    content: lazy(t.string),
     readStatus: withSet(t.boolean),
     flaggedStatus: withSet(t.boolean),
     junkMailStatus: withSet(t.boolean),
-    messageSize: eagerScalar,
+    messageSize: t.number,
     toRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
     ccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
     bccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
@@ -1380,17 +1457,17 @@ const MessageProto = pipe2(_MessageProtoBase, withMove(_MessageProtoBase, messag
 // Messages collection - uses legacy composers from legacy.ts
 const messagesCollectionProto = pipe2(baseCollection, withByIndex(MessageProto), withById(MessageProto));
 // Lazy version for use in mailbox (returns specifier when parent is resolved)
-const lazyMessagesProto = specifierFor(messagesCollectionProto);
+const lazyMessagesProto = lazy(messagesCollectionProto);
 // Mailboxes collection for account-level (eager, since we enumerate accounts)
 // Uses null as any - forward reference workaround for self-referential MailboxProto
 const mailboxesCollectionProto = pipe2(baseCollection, withByIndex(null), // Proto set after MailboxProto defined
 withByName(null));
 // Lazy version for nested mailboxes in a mailbox
-const lazyMailboxesProto = specifierFor(mailboxesCollectionProto);
+const lazyMailboxesProto = lazy(mailboxesCollectionProto);
 const MailboxProto = {
     ...baseObject,
-    name: eagerScalar,
-    unreadCount: eagerScalar,
+    name: t.string,
+    unreadCount: t.number,
     messages: lazyMessagesProto,
     mailboxes: lazyMailboxesProto,
 };
@@ -1399,10 +1476,10 @@ const MailboxProto = {
 // ─────────────────────────────────────────────────────────────────────────────
 const MailAccountProto = {
     ...baseObject,
-    id: eagerScalar,
-    name: eagerScalar,
-    fullName: eagerScalar,
-    emailAddresses: eagerScalar, // Returns string[] of account's email addresses
+    id: t.string,
+    name: t.string,
+    fullName: t.string,
+    emailAddresses: t.stringArray,
     mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
     // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
     // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
@@ -1412,7 +1489,8 @@ const MailAccountProto = {
             return d.prop('mailboxes').byName('INBOX');
         }
         // JXA: Find inbox mailbox by matching account ID
-        const accountId = d._jxa().id();
+        const jxaAccount = d._jxa();
+        const accountId = jxaAccount.id();
         const Mail = Application('Mail');
         const inboxMailboxes = Mail.inbox.mailboxes();
         const accountInbox = inboxMailboxes.find((mb) => mb.account.id() === accountId);
@@ -1450,11 +1528,11 @@ function parsePathToSegments(scheme, path) {
 // Settings proto (namespace for app-level preferences)
 // ─────────────────────────────────────────────────────────────────────────────
 const MailSettingsProto = {
-    ...baseScalar,
+    ...passthrough,
     // App info (read-only)
-    name: eagerScalar,
-    version: eagerScalar,
-    frontmost: eagerScalar,
+    name: t.string,
+    version: t.string,
+    frontmost: t.boolean,
     // Behavior
     alwaysBccMyself: withSet(t.boolean),
     alwaysCcMyself: withSet(t.boolean),
@@ -1491,9 +1569,9 @@ const MailSettingsProto = {
 // Application proto
 // ─────────────────────────────────────────────────────────────────────────────
 const MailApplicationProto = {
-    ...baseScalar,
-    name: eagerScalar,
-    version: eagerScalar,
+    ...passthrough,
+    name: t.string,
+    version: t.string,
     accounts: pipe3(baseCollection, withByIndex(MailAccountProto), withByName(MailAccountProto), withById(MailAccountProto)),
     rules: pipe2(baseCollection, withByIndex(RuleProto), withByName(RuleProto)),
     signatures: pipe2(baseCollection, withByIndex(SignatureProto), withByName(SignatureProto)),

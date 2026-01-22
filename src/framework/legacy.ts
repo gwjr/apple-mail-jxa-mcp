@@ -4,6 +4,19 @@
 // New code should use the unified collection() factory instead.
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Legacy Scalar Aliases
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Base scalar for fallback (alias for passthrough)
+const baseScalar = passthrough;
+
+// Eager scalar (alias for passthrough - historical compatibility)
+const eagerScalar = passthrough;
+
+// Legacy alias for lazy()
+const specifierFor = lazy;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Legacy Base Collection (no accessors)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -21,7 +34,11 @@ const baseCollection: BaseProtoType<any[]> = {
     return { uri: this._delegate.uri() };
   },
   resolve(this: { _delegate: Delegate }): any[] {
-    return this._delegate._jxa();
+    const raw = this._delegate._jxa();
+    if (!Array.isArray(raw)) {
+      throw new TypeError(`Collection expected array, got ${typeof raw}`);
+    }
+    return raw;
   },
 };
 
@@ -39,8 +56,10 @@ function withByIndex<Item extends object>(itemProto: Item) {
       ...proto,
       resolve(this: { _delegate: Delegate }): CollectionResolveResult {
         const raw = this._delegate._jxa();
-        if (!Array.isArray(raw)) return raw;
-        return raw.map((_item: any, i: number) => {
+        if (!Array.isArray(raw)) {
+          throw new TypeError(`Collection expected array, got ${typeof raw}`);
+        }
+        return raw.map((_item: unknown, i: number) => {
           const itemDelegate = this._delegate.byIndex(i);
           return { uri: itemDelegate.uri() };
         });

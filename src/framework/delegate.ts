@@ -68,7 +68,7 @@ interface FilterOperator<T> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface Delegate {
-  _jxa(): any;
+  _jxa(): unknown;
   prop(key: string): Delegate;
   propWithAlias(jxaName: string, uriName: string): Delegate;
   byIndex(n: number): Delegate;
