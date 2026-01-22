@@ -407,6 +407,145 @@ function testSetOperation() {
   }
 }
 
+function testObjectResolution() {
+  group('Object Resolution (baseObject vs baseScalar)');
+
+  const mockData = createMockMailData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+
+  // Mailbox uses baseObject - resolve() should return a plain object with properties
+  const inboxResult = resolveURI('mail://accounts[0]/mailboxes/INBOX');
+  if (inboxResult.ok) {
+    const resolved = inboxResult.value.resolve();
+    assert(typeof resolved === 'object', 'Mailbox resolves to object');
+    assertEqual(resolved.name, 'INBOX', 'Resolved mailbox has name property');
+    assertEqual(resolved.unreadCount, 5, 'Resolved mailbox has unreadCount property');
+    assert(Array.isArray(resolved.messages), 'Resolved mailbox has messages array');
+    assert(Array.isArray(resolved.mailboxes), 'Resolved mailbox has mailboxes array');
+  }
+
+  // Message uses baseScalar - resolve() should also return object with properties
+  // This test will FAIL with current code because MessageProto uses baseScalar
+  const msgResult = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1001');
+  if (msgResult.ok) {
+    const resolved = msgResult.value.resolve();
+    assert(typeof resolved === 'object', 'Message resolves to object');
+    assertEqual(resolved.id, 1001, 'Resolved message has id property');
+    assertEqual(resolved.subject, 'Hello World', 'Resolved message has subject property');
+    // sender should be the computed value (parsed email), not raw string
+    assert(typeof resolved.sender === 'object', 'Resolved message has parsed sender');
+    assertEqual(resolved.sender.address, 'alice@example.com', 'Sender address is parsed');
+  }
+
+  // Rule uses baseScalar - should also return object with properties
+  const ruleResult = resolveURI('mail://rules[0]');
+  if (ruleResult.ok) {
+    const resolved = ruleResult.value.resolve();
+    assert(typeof resolved === 'object', 'Rule resolves to object');
+    assertEqual(resolved.name, 'Spam Filter', 'Resolved rule has name property');
+    assertEqual(resolved.enabled, true, 'Resolved rule has enabled property');
+  }
+
+  // Account uses baseScalar - should also return object with properties
+  const accResult = resolveURI('mail://accounts[0]');
+  if (accResult.ok) {
+    const resolved = accResult.value.resolve();
+    assert(typeof resolved === 'object', 'Account resolves to object');
+    assertEqual(resolved.name, 'Work', 'Resolved account has name property');
+    assertEqual(resolved.fullName, 'John Doe', 'Resolved account has fullName property');
+  }
+}
+
+function testCollectionResolution() {
+  group('Collection Resolution');
+
+  const mockData = createMockMailData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+
+  // messages collection resolve() should return array of specifiers (URIs)
+  const messagesResult = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages');
+  if (messagesResult.ok) {
+    const resolved = messagesResult.value.resolve() as any[];
+    assert(Array.isArray(resolved), 'Messages collection resolves to array');
+    assertEqual(resolved.length, 2, 'Messages array has 2 items');
+
+    // Each item should be a specifier with uri property
+    assert(resolved[0] !== null, 'First message is not null');
+    assert('uri' in resolved[0], 'First message is a specifier with uri');
+    assert(resolved[0].uri.href.includes('messages%5B0%5D'), 'First message URI has correct index');
+    assert('uri' in resolved[1], 'Second message is a specifier with uri');
+  }
+
+  // To get actual data, use byIndex() or byId() then resolve()
+  if (messagesResult.ok) {
+    const firstMsg = messagesResult.value.byIndex(0).resolve() as any;
+    assertEqual(firstMsg.subject, 'Hello World', 'First message has subject via byIndex');
+
+    const secondMsg = messagesResult.value.byIndex(1).resolve() as any;
+    assertEqual(secondMsg.subject, 'Meeting Tomorrow', 'Second message has subject via byIndex');
+  }
+
+  // Rules collection should resolve to array of specifiers
+  const rulesResult = resolveURI('mail://rules');
+  if (rulesResult.ok) {
+    const resolved = rulesResult.value.resolve() as any[];
+    assert(Array.isArray(resolved), 'Rules collection resolves to array');
+    assertEqual(resolved.length, 2, 'Rules array has 2 items');
+    assert('uri' in resolved[0], 'First rule is a specifier');
+
+    // To get data, use byIndex/byName
+    const firstRule = rulesResult.value.byIndex(0).resolve() as any;
+    assertEqual(firstRule.name, 'Spam Filter', 'First rule name via byIndex');
+  }
+
+  // Accounts collection
+  const accountsResult = resolveURI('mail://accounts');
+  if (accountsResult.ok) {
+    const resolved = accountsResult.value.resolve() as any[];
+    assert(Array.isArray(resolved), 'Accounts collection resolves to array');
+    assertEqual(resolved.length, 2, 'Accounts array has 2 items');
+    assert('uri' in resolved[0], 'First account is a specifier');
+
+    // To get data, use byIndex/byName
+    const firstAccount = accountsResult.value.byIndex(0).resolve() as any;
+    assertEqual(firstAccount.name, 'Work', 'First account name via byIndex');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compile-time type tests
+// ─────────────────────────────────────────────────────────────────────────────
+// These use @ts-expect-error to verify that unsupported patterns are type errors.
+// If the pattern becomes valid, TypeScript will error on the @ts-expect-error comment.
+
+function compileTimeTypeTests() {
+  // These tests don't run - they verify type checking at compile time
+  const mockData = createOperationsMockData();
+  registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+  const delegate = createMockDelegate(mockData, 'mail');
+  const mail = getMailApp(delegate);
+
+  const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
+
+  // VALID: collection.resolve() returns CollectionResolveResult
+  // (array of {uri: URL} possibly with extra fields)
+  const specifiers = inbox.messages.resolve();
+  // Can access uri on first element
+  if (specifiers.length > 0) {
+    const firstUri: URL = specifiers[0].uri;
+  }
+
+  // VALID: item.resolve() returns data
+  const message = inbox.messages.byId(1001);
+  const subject: string = message.subject.resolve();
+
+  // @ts-expect-error - resolve_eager() no longer exists
+  inbox.messages.resolve_eager();
+
+  // @ts-expect-error - resolve_eager() no longer exists on items
+  message.resolve_eager();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Run tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -421,6 +560,8 @@ testComputedProperties();
 testJxaNameMapping();
 testQueryOperations();
 testSetOperation();
+testObjectResolution();
+testCollectionResolution();
 
 const frameworkTestResult = summary();
 resetCounters();

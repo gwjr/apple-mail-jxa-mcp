@@ -37,7 +37,10 @@ function isRoot(d: Delegate | RootMarker): d is RootMarker {
 // Type-level utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
-type Specifier = { uri: string };
+type Specifier = { uri: URL };
+
+// Collection resolve returns array of specifiers - either bare {uri} or enriched with extra fields
+type CollectionResolveResult = { uri: URL }[] | { uri: URL; [key: string]: any }[];
 
 type Lazy<T> = T & { readonly [LazyBrand]: true };
 
@@ -173,20 +176,32 @@ interface Delegate {
 type Res<P> = P & { _delegate: Delegate };
 
 function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
+  // For namespace protos, get the target proto for property lookup
+  const targetProto = getNamespaceNav(proto) || proto;
+
   const handler: ProxyHandler<{ _delegate: Delegate }> = {
     get(t, prop: string | symbol, receiver) {
       if (prop === '_delegate') return t._delegate;
 
+      // First check the main proto for methods (resolve, exists, etc.)
       if (prop in proto) {
         const value = (proto as any)[prop];
         if (typeof value === 'function') {
           return value.bind(receiver);
         }
+      }
+
+      // Then check targetProto for properties (works for both namespaces and regular protos)
+      if (prop in targetProto) {
+        const value = (targetProto as any)[prop];
+        if (typeof value === 'function') {
+          return value.bind(receiver);
+        }
         if (typeof value === 'object' && value !== null) {
           // Check for namespace navigation first
-          const namespaceProto = getNamespaceNav(value);
-          if (namespaceProto) {
-            return createRes(t._delegate.namespace(prop as string), namespaceProto);
+          const innerNamespaceProto = getNamespaceNav(value);
+          if (innerNamespaceProto) {
+            return createRes(t._delegate.namespace(prop as string), value);
           }
           // Check for computed navigation
           const navInfo = getComputedNav(value);
@@ -211,7 +226,21 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
     },
     has(t, prop: string | symbol) {
       if (prop === '_delegate') return true;
-      return prop in proto;
+      return prop in proto || prop in targetProto;
+    },
+    ownKeys(t) {
+      // Combine keys from proto and targetProto, plus _delegate
+      const keys = new Set<string | symbol>(['_delegate']);
+      for (const key of Object.keys(proto)) keys.add(key);
+      for (const key of Object.keys(targetProto)) keys.add(key);
+      return [...keys];
+    },
+    getOwnPropertyDescriptor(t, prop) {
+      // Make properties enumerable for Object.keys() to work
+      if (prop === '_delegate' || prop in proto || prop in targetProto) {
+        return { enumerable: true, configurable: true };
+      }
+      return undefined;
     }
   };
 
@@ -224,7 +253,6 @@ function createRes<P extends object>(delegate: Delegate, proto: P): Res<P> {
 
 interface BaseProtoType<T = any> {
   resolve(): T;
-  resolve_eager(): T | Specifier;
   exists(): boolean;
   specifier(): Specifier;
 }
@@ -232,29 +260,78 @@ interface BaseProtoType<T = any> {
 // Scalar proto: BaseProtoType<T> + ScalarBrand for discrimination
 type ScalarProto<T> = BaseProtoType<T> & { readonly [ScalarBrand]: T };
 
-// Collection proto: BaseProtoType<Item[]> + CollectionBrand
-type CollectionProto<Item> = BaseProtoType<Item[]> & { readonly [CollectionBrand]: Item };
+// Collection proto: distinct from BaseProtoType because resolve() returns specifiers, not items
+interface CollectionProtoType {
+  resolve(): CollectionResolveResult;
+  exists(): boolean;
+  specifier(): Specifier;
+}
+
+type CollectionProto<Item> = CollectionProtoType & { readonly [CollectionBrand]: Item };
 
 // Shared implementation for base proto methods
 const _baseProtoImpl = {
   resolve(this: { _delegate: Delegate }) {
     return this._delegate._jxa();
   },
-  resolve_eager(this: { _delegate: Delegate; resolve(): any }) {
-    return this.resolve();
-  },
   exists(this: { _delegate: Delegate }) {
     try {
-      this._delegate._jxa();
-      return true;
+      const result = this._delegate._jxa();
+      return result !== undefined && result !== null;
     } catch {
       return false;
     }
   },
-  specifier(this: { _delegate: Delegate }) {
-    return { uri: this._delegate.uri().href };
+  specifier(this: { _delegate: Delegate }): Specifier {
+    return { uri: this._delegate.uri() };
   },
 };
+
+// Object proto implementation - gathers properties on resolve instead of returning JXA specifier
+// Use this for complex objects (mailboxes, messages, etc.) that have child properties
+const _objectProtoImpl = {
+  resolve(this: Res<any>): any {
+    // First try to get the proto from the Res proxy by getting a known property
+    // We iterate over all enumerable properties and resolve them
+    const result: Record<string, any> = {};
+    const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
+
+    // Get the proto by accessing it through the handler
+    // We use Object.keys which will trigger the 'has' trap, giving us the keys
+    for (const key of Object.keys(this)) {
+      if (baseKeys.has(key)) continue;
+      try {
+        const propRes = (this as any)[key];
+        if (propRes && typeof propRes === 'object' && '_delegate' in propRes) {
+          // It's a Res - resolve it
+          const resolved = propRes.resolve();
+          if (resolved !== undefined) {
+            result[key] = resolved;
+          }
+        } else if (propRes !== undefined) {
+          result[key] = propRes;
+        }
+      } catch {
+        // Skip properties that fail to resolve
+      }
+    }
+    return result;
+  },
+  exists(this: { _delegate: Delegate }) {
+    try {
+      const result = this._delegate._jxa();
+      return result !== undefined && result !== null;
+    } catch {
+      return false;
+    }
+  },
+  specifier(this: { _delegate: Delegate }): Specifier {
+    return { uri: this._delegate.uri() };
+  },
+};
+
+// Base object for complex types that need property gathering
+const baseObject = { ..._objectProtoImpl } as BaseProtoType<any>;
 
 // Typed scalar factory
 function scalar<T>(): ScalarProto<T> {
@@ -286,11 +363,14 @@ const eagerScalar = baseScalar;
 // Composers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function makeLazy<P extends BaseProtoType>(proto: P): P & { readonly [LazyBrand]: true } {
+// specifierFor: marks a property as returning a specifier (URL) rather than a resolved value
+// When the parent object is resolved, this property will be { uri: URL } instead of the actual value
+function specifierFor<P extends BaseProtoType>(proto: P): P & { readonly [LazyBrand]: true } {
   return {
     ...proto,
-    resolve_eager(this: { specifier(): Specifier }): Specifier {
-      return this.specifier();
+    // Override resolve to return specifier instead of value
+    resolve(this: { _delegate: Delegate }): Specifier {
+      return { uri: this._delegate.uri() };
     },
   } as P & { readonly [LazyBrand]: true };
 }
@@ -318,13 +398,32 @@ interface ByIndexProto<Item> {
 }
 
 function withByIndex<Item extends object>(itemProto: Item) {
-  return function<P extends BaseProtoType>(proto: P): P & ByIndexProto<Item> & { readonly [ByIndexBrand]: true } {
+  return function<P extends BaseProtoType>(proto: P): P & ByIndexProto<Item> & { readonly [ByIndexBrand]: true; resolve(): CollectionResolveResult } {
     const result = {
       ...proto,
+      // resolve() returns specifiers for each item - guaranteed to have uri (URL object),
+      // may include additional metadata (id, name) if cheap to obtain
+      resolve(this: { _delegate: Delegate }): CollectionResolveResult {
+        const raw = this._delegate._jxa();
+        if (!Array.isArray(raw)) return raw;
+        // Map each item to its specifier - uri is guaranteed, other fields optional
+        return raw.map((item: any, i: number) => {
+          const itemDelegate = this._delegate.byIndex(i);
+          const entry: { uri: URL; [key: string]: any } = {
+            uri: itemDelegate.uri()
+          };
+          // Include id/name if available in raw data (cheap - no extra JXA calls)
+          if (item && typeof item === 'object') {
+            if ('id' in item) entry.id = item.id;
+            if ('name' in item) entry.name = item.name;
+          }
+          return entry;
+        });
+      },
       byIndex(this: { _delegate: Delegate }, n: number): Res<Item> {
         return createRes(this._delegate.byIndex(n), itemProto);
       },
-    } as P & ByIndexProto<Item> & { readonly [ByIndexBrand]: true };
+    } as P & ByIndexProto<Item> & { readonly [ByIndexBrand]: true; resolve(): CollectionResolveResult };
     collectionItemProtos.set(result, itemProto);
     return result;
   };
@@ -479,9 +578,6 @@ function computed<T>(transform: (raw: any) => T): BaseProtoType {
       const raw = this._delegate._jxa();
       return transform(raw);
     },
-    resolve_eager(this: { resolve(): T }) {
-      return this.resolve();
-    },
     exists(this: { _delegate: Delegate }) {
       try {
         this._delegate._jxa();
@@ -491,14 +587,9 @@ function computed<T>(transform: (raw: any) => T): BaseProtoType {
       }
     },
     specifier(this: { _delegate: Delegate }) {
-      return { uri: this._delegate.uri().href };
+      return { uri: this._delegate.uri() };
     },
   };
-}
-
-// Lazy computed - resolve_eager returns specifier instead of value
-function lazyComputed<T>(transform: (raw: any) => T): BaseProtoType & { readonly [LazyBrand]: true } {
-  return makeLazy(computed(transform));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -525,9 +616,6 @@ function computedNav<P extends object>(
     resolve(this: { _delegate: Delegate }) {
       return navigate(this._delegate)._jxa();
     },
-    resolve_eager(this: { resolve(): any }) {
-      return this.resolve();
-    },
     exists(this: { _delegate: Delegate }) {
       try {
         navigate(this._delegate)._jxa();
@@ -537,7 +625,7 @@ function computedNav<P extends object>(
       }
     },
     specifier(this: { _delegate: Delegate }) {
-      return { uri: navigate(this._delegate).uri().href };
+      return { uri: navigate(this._delegate).uri() };
     },
   } as unknown as ComputedNavProto<P>;
 
@@ -557,6 +645,7 @@ function getComputedNav(proto: object): { navigate: NavigationFn; targetProto: o
 // 1. Shares its parent's delegate (no JXA navigation)
 // 2. Adds a segment to the URI path for schema clarity
 // 3. Has its own proto with the grouped properties
+// When resolved, a namespace gathers all its properties and returns them as an object
 
 declare const NamespaceBrand: unique symbol;
 const namespaceNavMap = new WeakMap<object, object>();
@@ -564,8 +653,32 @@ const namespaceNavMap = new WeakMap<object, object>();
 type NamespaceProto<P> = P & { readonly [NamespaceBrand]: true };
 
 function namespaceNav<P extends object>(targetProto: P): NamespaceProto<P> {
+  // Custom resolve that gathers all properties from the target proto
   const navProto = {
-    ...baseScalar,
+    resolve(this: Res<any>): any {
+      const result: Record<string, any> = {};
+      // Get all property names from the target proto (excluding base methods)
+      const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
+      for (const key of Object.keys(targetProto)) {
+        if (baseKeys.has(key)) continue;
+        try {
+          // Navigate to the property and resolve it
+          const propRes = (this as any)[key];
+          if (propRes && typeof propRes.resolve === 'function') {
+            result[key] = propRes.resolve();
+          }
+        } catch {
+          // Skip properties that fail to resolve
+        }
+      }
+      return result;
+    },
+    exists(this: Res<any>): boolean {
+      return true; // Namespaces always exist
+    },
+    specifier(this: Res<any>): Specifier {
+      return { uri: this._delegate.uri() };
+    },
   } as unknown as NamespaceProto<P>;
   namespaceNavMap.set(navProto, targetProto);
   return navProto;
@@ -678,11 +791,6 @@ type HasAccessor<P> = P extends { byIndex: any } | { byName: any } | { byId: any
   ? P
   : never;
 
-type ProtoMatchesLaziness<IsLazyFlag extends boolean, P> =
-  IsLazyFlag extends true
-    ? P extends { resolve_eager(): Specifier } ? P : never
-    : P;
-
 type ValidCollectionProto<P> = HasAccessor<P>;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -707,7 +815,7 @@ function buildURIString(segments: PathSegment[]): string {
         uri += (uri.endsWith('://') ? '' : '/') + seg.name;
         break;
       case 'index':
-        uri += `[${seg.value}]`;
+        uri += `%5B${seg.value}%5D`;  // URL-encoded [ and ]
         break;
       case 'name':
         uri += '/' + encodeURIComponent(seg.value);
@@ -889,11 +997,21 @@ function parseSegments(path: string): URISegment[] {
       if (!remaining) break;
     }
 
+    // Check for literal or encoded brackets/query
     let headEnd = remaining.length;
     for (let i = 0; i < remaining.length; i++) {
-      if (remaining[i] === '/' || remaining[i] === '[' || remaining[i] === '?') {
+      const ch = remaining[i];
+      if (ch === '/' || ch === '[' || ch === '?') {
         headEnd = i;
         break;
+      }
+      // Check for URL-encoded [ (%5B or %5b)
+      if (ch === '%' && i + 2 < remaining.length) {
+        const encoded = remaining.slice(i, i + 3).toUpperCase();
+        if (encoded === '%5B' || encoded === '%3F') {
+          headEnd = i;
+          break;
+        }
       }
     }
 
@@ -910,13 +1028,18 @@ function parseSegments(path: string): URISegment[] {
 
     const segment: URISegment = { head };
 
-    if (remaining.startsWith('[')) {
-      const closeIdx = remaining.indexOf(']');
+    // Check for literal [ or URL-encoded %5B
+    if (remaining.startsWith('[') || remaining.toUpperCase().startsWith('%5B')) {
+      const isEncoded = remaining.toUpperCase().startsWith('%5B');
+      const openLen = isEncoded ? 3 : 1;  // '%5B' vs '['
+      const closeChar = isEncoded ? '%5D' : ']';
+      const closeIdx = remaining.toUpperCase().indexOf(isEncoded ? '%5D' : ']');
+      const closeLen = isEncoded ? 3 : 1;
       if (closeIdx !== -1) {
-        const indexStr = remaining.slice(1, closeIdx);
+        const indexStr = remaining.slice(openLen, closeIdx);
         if (isInteger(indexStr)) {
           segment.qualifier = { kind: 'index', value: parseInt(indexStr, 10) };
-          remaining = remaining.slice(closeIdx + 1);
+          remaining = remaining.slice(closeIdx + closeLen);
         }
       }
     }
@@ -1070,13 +1193,16 @@ function resolveURI(uri: string): Result<Res<any>> {
     const segment = segments[i];
     const { head, qualifier } = segment;
 
-    const childProto = proto[head];
+    // For namespace protos, look up properties in the target proto
+    const lookupProto = getNamespaceNav(proto) || proto;
+    const childProto = lookupProto[head];
 
     // Check for namespaceNav first (virtual grouping, no JXA navigation)
-    const namespaceProto = childProto ? getNamespaceNav(childProto) : undefined;
-    if (namespaceProto) {
+    const namespaceTargetProto = childProto ? getNamespaceNav(childProto) : undefined;
+    if (namespaceTargetProto) {
       delegate = delegate.namespace(head);
-      proto = namespaceProto;
+      // Keep the navProto (childProto) which has the custom resolve, not the inner targetProto
+      proto = childProto!;
       // Namespaces don't have qualifiers - if there's a qualifier, it's an error
       if (qualifier) {
         return { ok: false, error: `Namespace '${head}' does not support qualifiers` };
@@ -1159,8 +1285,8 @@ function resolveURI(uri: string): Result<Res<any>> {
         }
       }
     } else {
-      const available = Object.keys(proto).filter(k => {
-        const v = proto[k];
+      const available = Object.keys(lookupProto).filter(k => {
+        const v = lookupProto[k];
         return isChildProto(v);
       });
       return { ok: false, error: `Unknown segment '${head}'. Available: ${available.join(', ')}` };

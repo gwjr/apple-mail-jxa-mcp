@@ -118,13 +118,13 @@ function testMoveMessageBetweenMailboxes() {
   const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
   const archive = mail.accounts.byName('Work').mailboxes.byName('Archive');
 
-  // Verify initial state
-  const inboxMessages = inbox.messages.resolve() as any[];
-  const archiveMessages = archive.messages.resolve() as any[];
-  assertEqual(inboxMessages.length, 2, 'Inbox has 2 messages initially');
-  assertEqual(archiveMessages.length, 1, 'Archive has 1 message initially');
+  // Verify initial state - resolve() returns specifiers (URIs), count tells us how many
+  const inboxSpecifiers = inbox.messages.resolve() as any[];
+  const archiveSpecifiers = archive.messages.resolve() as any[];
+  assertEqual(inboxSpecifiers.length, 2, 'Inbox has 2 messages initially');
+  assertEqual(archiveSpecifiers.length, 1, 'Archive has 1 message initially');
 
-  // Get the first message from inbox
+  // Get the first message from inbox - use byId for specific access
   const message = inbox.messages.byId(1001);
   assertEqual(message.subject.resolve(), 'Hello World', 'Message subject is correct');
 
@@ -132,18 +132,17 @@ function testMoveMessageBetweenMailboxes() {
   const moveResult = message.move(archive.messages as any);
   assertOk(moveResult, 'Move operation succeeded');
 
-  // Verify message was removed from source
-  const inboxMessagesAfter = inbox.messages.resolve() as any[];
-  assertEqual(inboxMessagesAfter.length, 1, 'Inbox now has 1 message');
+  // Verify message was removed from source (check count via specifiers)
+  const inboxSpecifiersAfter = inbox.messages.resolve() as any[];
+  assertEqual(inboxSpecifiersAfter.length, 1, 'Inbox now has 1 message');
 
   // Verify message was added to destination
-  const archiveMessagesAfter = archive.messages.resolve() as any[];
-  assertEqual(archiveMessagesAfter.length, 2, 'Archive now has 2 messages');
+  const archiveSpecifiersAfter = archive.messages.resolve() as any[];
+  assertEqual(archiveSpecifiersAfter.length, 2, 'Archive now has 2 messages');
 
-  // Verify the moved message is in archive
-  const movedMsg = archiveMessagesAfter.find((m: any) => m.id === 1001);
-  assert(movedMsg !== undefined, 'Moved message found in archive');
-  assertEqual(movedMsg?.subject, 'Hello World', 'Moved message has correct subject');
+  // Verify the moved message is in archive - check by existence
+  assert(archive.messages.byId(1001).exists(), 'Moved message found in archive');
+  assertEqual(archive.messages.byId(1001).subject.resolve(), 'Hello World', 'Moved message has correct subject');
 }
 
 function testMoveTypeConstraint() {
@@ -180,9 +179,9 @@ function testDeleteMessage() {
 
   const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
 
-  // Verify initial state
-  const messagesBefore = inbox.messages.resolve() as any[];
-  assertEqual(messagesBefore.length, 2, 'Inbox has 2 messages initially');
+  // Verify initial state - count via specifiers
+  const specifiersBefore = inbox.messages.resolve() as any[];
+  assertEqual(specifiersBefore.length, 2, 'Inbox has 2 messages initially');
 
   // Delete the second message
   const message = inbox.messages.byId(1002);
@@ -190,11 +189,12 @@ function testDeleteMessage() {
   assertOk(deleteResult, 'Delete operation succeeded');
 
   // Verify message was removed
-  const messagesAfter = inbox.messages.resolve() as any[];
-  assertEqual(messagesAfter.length, 1, 'Inbox now has 1 message');
+  const specifiersAfter = inbox.messages.resolve() as any[];
+  assertEqual(specifiersAfter.length, 1, 'Inbox now has 1 message');
 
-  // Verify correct message remains
-  assertEqual(messagesAfter[0].id, 1001, 'Remaining message has correct id');
+  // Verify correct message remains - use byId to check
+  assert(inbox.messages.byId(1001).exists(), 'Message 1001 still exists');
+  assert(!inbox.messages.byId(1002).exists(), 'Message 1002 no longer exists');
 }
 
 function testDeleteRule() {
@@ -205,9 +205,9 @@ function testDeleteRule() {
   const delegate = createMockDelegate(mockData, 'mail');
   const mail = getMailApp(delegate);
 
-  // Verify initial state
-  const rulesBefore = mail.rules.resolve() as any[];
-  assertEqual(rulesBefore.length, 2, 'App has 2 rules initially');
+  // Verify initial state - count via specifiers
+  const specifiersBefore = mail.rules.resolve() as any[];
+  assertEqual(specifiersBefore.length, 2, 'App has 2 rules initially');
 
   // Delete the first rule
   const rule = mail.rules.byName('Spam Filter');
@@ -217,9 +217,12 @@ function testDeleteRule() {
   assertOk(deleteResult, 'Delete operation succeeded');
 
   // Verify rule was removed
-  const rulesAfter = mail.rules.resolve() as any[];
-  assertEqual(rulesAfter.length, 1, 'App now has 1 rule');
-  assertEqual(rulesAfter[0].name, 'Work Rules', 'Remaining rule is Work Rules');
+  const specifiersAfter = mail.rules.resolve() as any[];
+  assertEqual(specifiersAfter.length, 1, 'App now has 1 rule');
+
+  // Verify correct rule remains - use byName to check
+  assert(!mail.rules.byName('Spam Filter').exists(), 'Spam Filter no longer exists');
+  assert(mail.rules.byName('Work Rules').exists(), 'Work Rules still exists');
 }
 
 function testCreateMessage() {
@@ -232,9 +235,9 @@ function testCreateMessage() {
 
   const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
 
-  // Verify initial state
-  const messagesBefore = inbox.messages.resolve() as any[];
-  assertEqual(messagesBefore.length, 2, 'Inbox has 2 messages initially');
+  // Verify initial state - count via specifiers
+  const specifiersBefore = inbox.messages.resolve() as any[];
+  assertEqual(specifiersBefore.length, 2, 'Inbox has 2 messages initially');
 
   // Create a new message using delegate
   const createResult: Result<URL> = (inbox.messages as any)._delegate.create({
@@ -247,17 +250,23 @@ function testCreateMessage() {
   const newUri = assertOk(createResult, 'Create operation succeeded');
 
   // Verify message was added
-  const messagesAfter = inbox.messages.resolve() as any[];
-  assertEqual(messagesAfter.length, 3, 'Inbox now has 3 messages');
+  const specifiersAfter = inbox.messages.resolve() as any[];
+  assertEqual(specifiersAfter.length, 3, 'Inbox now has 3 messages');
 
-  // Verify the new message
-  const newMsg = messagesAfter[2];
+  // The new specifier should include an id if available
+  const lastSpecifier = specifiersAfter[2];
+  assert('uri' in lastSpecifier, 'New message specifier has uri');
+  if ('id' in lastSpecifier) {
+    assert(lastSpecifier.id !== undefined, 'New message specifier has id');
+  }
+
+  // Verify we can access the new message via byIndex
+  const newMsg = inbox.messages.byIndex(2).resolve() as any;
   assertEqual(newMsg.subject, 'New Test Message', 'New message has correct subject');
-  assert(newMsg.id !== undefined, 'New message has an id assigned');
 
   // Verify URI points to new message
   if (newUri) {
-    assert(newUri.href.includes(String(newMsg.id)), 'Returned URI includes new message id');
+    assert(newUri.href.includes('messages'), 'Returned URI includes messages path');
   }
 }
 

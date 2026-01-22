@@ -81,7 +81,7 @@ function parseEmailAddress(raw: string): ParsedEmailAddress {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RuleConditionProto = {
-  ...baseScalar,
+  ...baseObject,
   header: eagerScalar,
   qualifier: eagerScalar,
   ruleType: eagerScalar,
@@ -93,7 +93,7 @@ const RuleConditionProto = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const _RuleProtoBase = {
-  ...baseScalar,
+  ...baseObject,
   name: eagerScalar,
   enabled: withSet(t.boolean),
   allConditionsMustBeMet: withSet(t.boolean),
@@ -121,9 +121,9 @@ const RuleProto = pipe(_RuleProtoBase, withDelete());
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SignatureProto = {
-  ...baseScalar,
+  ...baseObject,
   name: eagerScalar,
-  content: makeLazy(baseScalar),
+  content: specifierFor(baseScalar),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,7 +131,7 @@ const SignatureProto = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RecipientProto = {
-  ...baseScalar,
+  ...baseObject,
   name: eagerScalar,
   address: eagerScalar,
 };
@@ -141,7 +141,7 @@ const RecipientProto = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const AttachmentProto = {
-  ...baseScalar,
+  ...baseObject,
   id: eagerScalar,
   name: eagerScalar,
   fileSize: eagerScalar,
@@ -155,7 +155,7 @@ const AttachmentProto = {
 type MessageProtoType = typeof _MessageProtoBase & MoveableProto<typeof _MessageProtoBase> & DeleteableProto;
 
 const _MessageProtoBase = {
-  ...baseScalar,
+  ...baseObject,
   id: eagerScalar,
   messageId: eagerScalar,
   subject: withSet(t.string),
@@ -163,7 +163,7 @@ const _MessageProtoBase = {
   replyTo: computed<ParsedEmailAddress>(parseEmailAddress),
   dateSent: eagerScalar,
   dateReceived: eagerScalar,
-  content: makeLazy(baseScalar),
+  content: specifierFor(baseScalar),
   readStatus: withSet(t.boolean),
   flaggedStatus: withSet(t.boolean),
   junkMailStatus: withSet(t.boolean),
@@ -184,39 +184,46 @@ const MessageProto = pipe2(
   withDelete(messageDeleteHandler)
 );
 
-const LazyMessageProto = makeLazy(MessageProto);
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Mailbox proto (recursive - interface required for self-reference)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Collection type with CollectionBrand for type-safe move operations
-type MessageCollectionProto = CollectionProto<typeof LazyMessageProto> & ByIndexProto<typeof LazyMessageProto> & ByIdProto<typeof LazyMessageProto>;
-type MailboxCollectionProto = CollectionProto<MailboxProtoType> & ByIndexProto<MailboxProtoType> & ByNameProto<MailboxProtoType>;
+// Messages collection - inferred from composers, no manual type needed
+const messagesCollectionProto = pipe2(
+  collection<typeof MessageProto>(),
+  withByIndex(MessageProto),
+  withById(MessageProto)
+);
 
+// Mailbox is self-referential (contains mailboxes), so needs interface declaration
 interface MailboxProtoType extends BaseProtoType {
   name: typeof eagerScalar;
   unreadCount: typeof eagerScalar;
-  messages: MessageCollectionProto;
-  mailboxes: MailboxCollectionProto;
+  messages: typeof messagesCollectionProto;
+  mailboxes: CollectionProto<MailboxProtoType> & ByIndexProto<MailboxProtoType> & ByNameProto<MailboxProtoType>;
 }
 
 const MailboxProto: MailboxProtoType = {
-  ...baseScalar,
+  ...baseObject,
   name: eagerScalar,
   unreadCount: eagerScalar,
-  messages: pipe2(collection<typeof LazyMessageProto>(), withByIndex(LazyMessageProto), withById(LazyMessageProto)) as MessageCollectionProto,
-  mailboxes: null as any,
+  messages: messagesCollectionProto,
+  mailboxes: null as any,  // Set below due to self-reference
 };
 
-MailboxProto.mailboxes = pipe2(collection<MailboxProtoType>(), withByIndex(MailboxProto), withByName(MailboxProto)) as MailboxCollectionProto;
+// Self-referential assignment
+MailboxProto.mailboxes = pipe2(
+  collection<MailboxProtoType>(),
+  withByIndex(MailboxProto),
+  withByName(MailboxProto)
+) as MailboxProtoType['mailboxes'];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MailAccountProto = {
-  ...baseScalar,
+  ...baseObject,
   id: eagerScalar,
   name: eagerScalar,
   fullName: eagerScalar,

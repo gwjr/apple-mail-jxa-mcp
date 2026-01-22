@@ -1,4 +1,84 @@
 "use strict";
+// URL polyfill for JXA
+// JXA doesn't have the native URL constructor, so we provide a minimal implementation
+// Only define if URL doesn't exist (avoids overriding in Node test environment)
+if (typeof globalThis.URL === 'undefined') {
+    globalThis.URL = class URL {
+        href;
+        protocol;
+        pathname;
+        search;
+        hash;
+        host;
+        hostname;
+        port;
+        origin;
+        constructor(url, base) {
+            let fullUrl = url;
+            if (base) {
+                const baseStr = typeof base === 'string' ? base : base.href;
+                // Simple base resolution - just prepend base if url is relative
+                if (!url.includes('://')) {
+                    fullUrl = baseStr.replace(/\/[^/]*$/, '/') + url;
+                }
+            }
+            this.href = fullUrl;
+            // Parse the URL
+            const schemeMatch = fullUrl.match(/^([a-z][a-z0-9+.-]*):\/\//i);
+            if (!schemeMatch) {
+                throw new TypeError(`Invalid URL: ${url}`);
+            }
+            this.protocol = schemeMatch[1] + ':';
+            const afterScheme = fullUrl.slice(schemeMatch[0].length);
+            // Split off hash
+            const hashIdx = afterScheme.indexOf('#');
+            const beforeHash = hashIdx >= 0 ? afterScheme.slice(0, hashIdx) : afterScheme;
+            this.hash = hashIdx >= 0 ? afterScheme.slice(hashIdx) : '';
+            // Split off search/query
+            const searchIdx = beforeHash.indexOf('?');
+            const beforeSearch = searchIdx >= 0 ? beforeHash.slice(0, searchIdx) : beforeHash;
+            this.search = searchIdx >= 0 ? beforeHash.slice(searchIdx) : '';
+            // For mail:// URLs, there's no host - everything is pathname
+            // For http:// URLs, we'd parse host differently
+            if (this.protocol === 'mail:') {
+                this.host = '';
+                this.hostname = '';
+                this.port = '';
+                this.origin = 'null';
+                this.pathname = beforeSearch || '/';
+            }
+            else {
+                // Basic parsing for other schemes - extract host from path
+                const slashIdx = beforeSearch.indexOf('/');
+                if (slashIdx >= 0) {
+                    this.host = beforeSearch.slice(0, slashIdx);
+                    this.pathname = beforeSearch.slice(slashIdx);
+                }
+                else {
+                    this.host = beforeSearch;
+                    this.pathname = '/';
+                }
+                // Parse hostname and port from host
+                const colonIdx = this.host.lastIndexOf(':');
+                if (colonIdx >= 0 && !this.host.includes(']')) {
+                    this.hostname = this.host.slice(0, colonIdx);
+                    this.port = this.host.slice(colonIdx + 1);
+                }
+                else {
+                    this.hostname = this.host;
+                    this.port = '';
+                }
+                this.origin = `${this.protocol}//${this.host}`;
+            }
+        }
+        toString() {
+            return this.href;
+        }
+        toJSON() {
+            return this.href;
+        }
+    };
+}
 /// <reference path="../types/jxa.d.ts" />
 /// <reference path="../types/mcp.d.ts" />
 // ============================================================================
@@ -161,36 +241,39 @@ class MCPServer {
         }
     }
     handleResourcesRead(id, params) {
-        const uri = params.uri;
-        this.log(`Resource read: ${uri}`);
+        const uriString = params.uri;
+        this.log(`Resource read: ${uriString}`);
         if (!this.resourceReader) {
             this.sendError(id, JsonRpcErrorCodes.METHOD_NOT_FOUND, "Resources not supported");
             return;
         }
+        // Parse URI string to URL early for type safety
+        let uri;
         try {
-            this.log(`[DBG] calling resourceReader...`);
-            const content = this.resourceReader(uri);
-            this.log(`[DBG] resourceReader returned`);
-            if (content === null || content === undefined) {
-                this.sendError(id, JsonRpcErrorCodes.RESOURCE_NOT_FOUND, `Resource not found: ${uri}`);
+            uri = new URL(uriString);
+        }
+        catch (e) {
+            this.sendError(id, JsonRpcErrorCodes.INVALID_PARAMS, `Invalid URI: ${uriString}`);
+            return;
+        }
+        try {
+            const readResult = this.resourceReader(uri);
+            // Handle Result<T> type from readResource
+            if (!readResult.ok) {
+                this.sendError(id, JsonRpcErrorCodes.RESOURCE_NOT_FOUND, readResult.error);
                 return;
             }
-            this.log(`[DBG] stringifying content...`);
-            const textContent = typeof content.text === 'string'
-                ? content.text
-                : JSON.stringify(content.text, null, 2);
-            this.log(`[DBG] stringified, length: ${textContent.length}`);
-            this.log(`[DBG] building result...`);
-            const result = {
+            const textContent = typeof readResult.text === 'string'
+                ? readResult.text
+                : JSON.stringify(readResult.text, null, 2);
+            const response = {
                 contents: [{
-                        uri,
-                        mimeType: content.mimeType || 'application/json',
+                        uri: uriString,
+                        mimeType: readResult.mimeType || 'application/json',
                         text: textContent
                     }]
             };
-            this.log(`[DBG] calling sendResult...`);
-            this.sendResult(id, result);
-            this.log(`[DBG] sendResult done`);
+            this.sendResult(id, response);
         }
         catch (e) {
             const error = e;
@@ -361,20 +444,30 @@ const startsWith = (value) => ({ operator: startsWithOp, value });
 const gt = (value) => ({ operator: gtOp, value });
 const lt = (value) => ({ operator: ltOp, value });
 function createRes(delegate, proto) {
+    // For namespace protos, get the target proto for property lookup
+    const targetProto = getNamespaceNav(proto) || proto;
     const handler = {
         get(t, prop, receiver) {
             if (prop === '_delegate')
                 return t._delegate;
+            // First check the main proto for methods (resolve, exists, etc.)
             if (prop in proto) {
                 const value = proto[prop];
                 if (typeof value === 'function') {
                     return value.bind(receiver);
                 }
+            }
+            // Then check targetProto for properties (works for both namespaces and regular protos)
+            if (prop in targetProto) {
+                const value = targetProto[prop];
+                if (typeof value === 'function') {
+                    return value.bind(receiver);
+                }
                 if (typeof value === 'object' && value !== null) {
                     // Check for namespace navigation first
-                    const namespaceProto = getNamespaceNav(value);
-                    if (namespaceProto) {
-                        return createRes(t._delegate.namespace(prop), namespaceProto);
+                    const innerNamespaceProto = getNamespaceNav(value);
+                    if (innerNamespaceProto) {
+                        return createRes(t._delegate.namespace(prop), value);
                     }
                     // Check for computed navigation
                     const navInfo = getComputedNav(value);
@@ -400,7 +493,23 @@ function createRes(delegate, proto) {
         has(t, prop) {
             if (prop === '_delegate')
                 return true;
-            return prop in proto;
+            return prop in proto || prop in targetProto;
+        },
+        ownKeys(t) {
+            // Combine keys from proto and targetProto, plus _delegate
+            const keys = new Set(['_delegate']);
+            for (const key of Object.keys(proto))
+                keys.add(key);
+            for (const key of Object.keys(targetProto))
+                keys.add(key);
+            return [...keys];
+        },
+        getOwnPropertyDescriptor(t, prop) {
+            // Make properties enumerable for Object.keys() to work
+            if (prop === '_delegate' || prop in proto || prop in targetProto) {
+                return { enumerable: true, configurable: true };
+            }
+            return undefined;
         }
     };
     return new Proxy({ _delegate: delegate }, handler);
@@ -410,22 +519,66 @@ const _baseProtoImpl = {
     resolve() {
         return this._delegate._jxa();
     },
-    resolve_eager() {
-        return this.resolve();
-    },
     exists() {
         try {
-            this._delegate._jxa();
-            return true;
+            const result = this._delegate._jxa();
+            return result !== undefined && result !== null;
         }
         catch {
             return false;
         }
     },
     specifier() {
-        return { uri: this._delegate.uri().href };
+        return { uri: this._delegate.uri() };
     },
 };
+// Object proto implementation - gathers properties on resolve instead of returning JXA specifier
+// Use this for complex objects (mailboxes, messages, etc.) that have child properties
+const _objectProtoImpl = {
+    resolve() {
+        // First try to get the proto from the Res proxy by getting a known property
+        // We iterate over all enumerable properties and resolve them
+        const result = {};
+        const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
+        // Get the proto by accessing it through the handler
+        // We use Object.keys which will trigger the 'has' trap, giving us the keys
+        for (const key of Object.keys(this)) {
+            if (baseKeys.has(key))
+                continue;
+            try {
+                const propRes = this[key];
+                if (propRes && typeof propRes === 'object' && '_delegate' in propRes) {
+                    // It's a Res - resolve it
+                    const resolved = propRes.resolve();
+                    if (resolved !== undefined) {
+                        result[key] = resolved;
+                    }
+                }
+                else if (propRes !== undefined) {
+                    result[key] = propRes;
+                }
+            }
+            catch {
+                // Skip properties that fail to resolve
+            }
+        }
+        return result;
+    },
+    exists() {
+        try {
+            const result = this._delegate._jxa();
+            return result !== undefined && result !== null;
+        }
+        catch {
+            return false;
+        }
+    },
+    specifier() {
+        return { uri: this._delegate.uri() };
+    },
+};
+// Base object for complex types that need property gathering
+const baseObject = { ..._objectProtoImpl };
 // Typed scalar factory
 function scalar() {
     return { ..._baseProtoImpl };
@@ -450,11 +603,14 @@ const eagerScalar = baseScalar;
 // ─────────────────────────────────────────────────────────────────────────────
 // Composers
 // ─────────────────────────────────────────────────────────────────────────────
-function makeLazy(proto) {
+// specifierFor: marks a property as returning a specifier (URL) rather than a resolved value
+// When the parent object is resolved, this property will be { uri: URL } instead of the actual value
+function specifierFor(proto) {
     return {
         ...proto,
-        resolve_eager() {
-            return this.specifier();
+        // Override resolve to return specifier instead of value
+        resolve() {
+            return { uri: this._delegate.uri() };
         },
     };
 }
@@ -471,6 +627,28 @@ function withByIndex(itemProto) {
     return function (proto) {
         const result = {
             ...proto,
+            // resolve() returns specifiers for each item - guaranteed to have uri (URL object),
+            // may include additional metadata (id, name) if cheap to obtain
+            resolve() {
+                const raw = this._delegate._jxa();
+                if (!Array.isArray(raw))
+                    return raw;
+                // Map each item to its specifier - uri is guaranteed, other fields optional
+                return raw.map((item, i) => {
+                    const itemDelegate = this._delegate.byIndex(i);
+                    const entry = {
+                        uri: itemDelegate.uri()
+                    };
+                    // Include id/name if available in raw data (cheap - no extra JXA calls)
+                    if (item && typeof item === 'object') {
+                        if ('id' in item)
+                            entry.id = item.id;
+                        if ('name' in item)
+                            entry.name = item.name;
+                    }
+                    return entry;
+                });
+            },
             byIndex(n) {
                 return createRes(this._delegate.byIndex(n), itemProto);
             },
@@ -586,9 +764,6 @@ function computed(transform) {
             const raw = this._delegate._jxa();
             return transform(raw);
         },
-        resolve_eager() {
-            return this.resolve();
-        },
         exists() {
             try {
                 this._delegate._jxa();
@@ -599,13 +774,9 @@ function computed(transform) {
             }
         },
         specifier() {
-            return { uri: this._delegate.uri().href };
+            return { uri: this._delegate.uri() };
         },
     };
-}
-// Lazy computed - resolve_eager returns specifier instead of value
-function lazyComputed(transform) {
-    return makeLazy(computed(transform));
 }
 const computedNavMap = new WeakMap();
 function computedNav(navigate, targetProto) {
@@ -613,9 +784,6 @@ function computedNav(navigate, targetProto) {
     const navProto = {
         resolve() {
             return navigate(this._delegate)._jxa();
-        },
-        resolve_eager() {
-            return this.resolve();
         },
         exists() {
             try {
@@ -627,7 +795,7 @@ function computedNav(navigate, targetProto) {
             }
         },
         specifier() {
-            return { uri: navigate(this._delegate).uri().href };
+            return { uri: navigate(this._delegate).uri() };
         },
     };
     computedNavMap.set(navProto, { navigate, targetProto });
@@ -638,8 +806,34 @@ function getComputedNav(proto) {
 }
 const namespaceNavMap = new WeakMap();
 function namespaceNav(targetProto) {
+    // Custom resolve that gathers all properties from the target proto
     const navProto = {
-        ...baseScalar,
+        resolve() {
+            const result = {};
+            // Get all property names from the target proto (excluding base methods)
+            const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
+            for (const key of Object.keys(targetProto)) {
+                if (baseKeys.has(key))
+                    continue;
+                try {
+                    // Navigate to the property and resolve it
+                    const propRes = this[key];
+                    if (propRes && typeof propRes.resolve === 'function') {
+                        result[key] = propRes.resolve();
+                    }
+                }
+                catch {
+                    // Skip properties that fail to resolve
+                }
+            }
+            return result;
+        },
+        exists() {
+            return true; // Namespaces always exist
+        },
+        specifier() {
+            return { uri: this._delegate.uri() };
+        },
     };
     namespaceNavMap.set(navProto, targetProto);
     return navProto;
@@ -734,7 +928,7 @@ function buildURIString(segments) {
                 uri += (uri.endsWith('://') ? '' : '/') + seg.name;
                 break;
             case 'index':
-                uri += `[${seg.value}]`;
+                uri += `%5B${seg.value}%5D`; // URL-encoded [ and ]
                 break;
             case 'name':
                 uri += '/' + encodeURIComponent(seg.value);
@@ -859,11 +1053,21 @@ function parseSegments(path) {
             if (!remaining)
                 break;
         }
+        // Check for literal or encoded brackets/query
         let headEnd = remaining.length;
         for (let i = 0; i < remaining.length; i++) {
-            if (remaining[i] === '/' || remaining[i] === '[' || remaining[i] === '?') {
+            const ch = remaining[i];
+            if (ch === '/' || ch === '[' || ch === '?') {
                 headEnd = i;
                 break;
+            }
+            // Check for URL-encoded [ (%5B or %5b)
+            if (ch === '%' && i + 2 < remaining.length) {
+                const encoded = remaining.slice(i, i + 3).toUpperCase();
+                if (encoded === '%5B' || encoded === '%3F') {
+                    headEnd = i;
+                    break;
+                }
             }
         }
         const head = decodeURIComponent(remaining.slice(0, headEnd));
@@ -876,13 +1080,18 @@ function parseSegments(path) {
             }
         }
         const segment = { head };
-        if (remaining.startsWith('[')) {
-            const closeIdx = remaining.indexOf(']');
+        // Check for literal [ or URL-encoded %5B
+        if (remaining.startsWith('[') || remaining.toUpperCase().startsWith('%5B')) {
+            const isEncoded = remaining.toUpperCase().startsWith('%5B');
+            const openLen = isEncoded ? 3 : 1; // '%5B' vs '['
+            const closeChar = isEncoded ? '%5D' : ']';
+            const closeIdx = remaining.toUpperCase().indexOf(isEncoded ? '%5D' : ']');
+            const closeLen = isEncoded ? 3 : 1;
             if (closeIdx !== -1) {
-                const indexStr = remaining.slice(1, closeIdx);
+                const indexStr = remaining.slice(openLen, closeIdx);
                 if (isInteger(indexStr)) {
                     segment.qualifier = { kind: 'index', value: parseInt(indexStr, 10) };
-                    remaining = remaining.slice(closeIdx + 1);
+                    remaining = remaining.slice(closeIdx + closeLen);
                 }
             }
         }
@@ -988,12 +1197,15 @@ function resolveURI(uri) {
     for (let i = 0; i < segments.length; i++) {
         const segment = segments[i];
         const { head, qualifier } = segment;
-        const childProto = proto[head];
+        // For namespace protos, look up properties in the target proto
+        const lookupProto = getNamespaceNav(proto) || proto;
+        const childProto = lookupProto[head];
         // Check for namespaceNav first (virtual grouping, no JXA navigation)
-        const namespaceProto = childProto ? getNamespaceNav(childProto) : undefined;
-        if (namespaceProto) {
+        const namespaceTargetProto = childProto ? getNamespaceNav(childProto) : undefined;
+        if (namespaceTargetProto) {
             delegate = delegate.namespace(head);
-            proto = namespaceProto;
+            // Keep the navProto (childProto) which has the custom resolve, not the inner targetProto
+            proto = childProto;
             // Namespaces don't have qualifiers - if there's a qualifier, it's an error
             if (qualifier) {
                 return { ok: false, error: `Namespace '${head}' does not support qualifiers` };
@@ -1077,8 +1289,8 @@ function resolveURI(uri) {
             }
         }
         else {
-            const available = Object.keys(proto).filter(k => {
-                const v = proto[k];
+            const available = Object.keys(lookupProto).filter(k => {
+                const v = lookupProto[k];
                 return isChildProto(v);
             });
             return { ok: false, error: `Unknown segment '${head}'. Available: ${available.join(', ')}` };
@@ -1286,6 +1498,8 @@ function toJxaFilter(filter) {
 function createJXADelegate(app, scheme = 'mail') {
     return new JXADelegate(app, [{ kind: 'root', scheme }], undefined, undefined, undefined);
 }
+// Export to globalThis for JXA environment detection
+globalThis.createJXADelegate = createJXADelegate;
 // scratch/mail.ts - Mail.app Schema
 //
 // Uses framework.ts building blocks. No framework code here.
@@ -1357,7 +1571,7 @@ function parseEmailAddress(raw) {
 // RuleCondition proto
 // ─────────────────────────────────────────────────────────────────────────────
 const RuleConditionProto = {
-    ...baseScalar,
+    ...baseObject,
     header: eagerScalar,
     qualifier: eagerScalar,
     ruleType: eagerScalar,
@@ -1367,7 +1581,7 @@ const RuleConditionProto = {
 // Rule proto
 // ─────────────────────────────────────────────────────────────────────────────
 const _RuleProtoBase = {
-    ...baseScalar,
+    ...baseObject,
     name: eagerScalar,
     enabled: withSet(t.boolean),
     allConditionsMustBeMet: withSet(t.boolean),
@@ -1392,15 +1606,15 @@ const RuleProto = pipe(_RuleProtoBase, withDelete());
 // Signature proto
 // ─────────────────────────────────────────────────────────────────────────────
 const SignatureProto = {
-    ...baseScalar,
+    ...baseObject,
     name: eagerScalar,
-    content: makeLazy(baseScalar),
+    content: specifierFor(baseScalar),
 };
 // ─────────────────────────────────────────────────────────────────────────────
 // Recipient proto
 // ─────────────────────────────────────────────────────────────────────────────
 const RecipientProto = {
-    ...baseScalar,
+    ...baseObject,
     name: eagerScalar,
     address: eagerScalar,
 };
@@ -1408,13 +1622,13 @@ const RecipientProto = {
 // Attachment proto
 // ─────────────────────────────────────────────────────────────────────────────
 const AttachmentProto = {
-    ...baseScalar,
+    ...baseObject,
     id: eagerScalar,
     name: eagerScalar,
     fileSize: eagerScalar,
 };
 const _MessageProtoBase = {
-    ...baseScalar,
+    ...baseObject,
     id: eagerScalar,
     messageId: eagerScalar,
     subject: withSet(t.string),
@@ -1422,7 +1636,7 @@ const _MessageProtoBase = {
     replyTo: computed(parseEmailAddress),
     dateSent: eagerScalar,
     dateReceived: eagerScalar,
-    content: makeLazy(baseScalar),
+    content: specifierFor(baseScalar),
     readStatus: withSet(t.boolean),
     flaggedStatus: withSet(t.boolean),
     junkMailStatus: withSet(t.boolean),
@@ -1434,20 +1648,25 @@ const _MessageProtoBase = {
 };
 // MessageProto with move and delete operations
 const MessageProto = pipe2(_MessageProtoBase, withMove(_MessageProtoBase, messageMoveHandler), withDelete(messageDeleteHandler));
-const LazyMessageProto = makeLazy(MessageProto);
+// ─────────────────────────────────────────────────────────────────────────────
+// Mailbox proto (recursive - interface required for self-reference)
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages collection - inferred from composers, no manual type needed
+const messagesCollectionProto = pipe2(collection(), withByIndex(MessageProto), withById(MessageProto));
 const MailboxProto = {
-    ...baseScalar,
+    ...baseObject,
     name: eagerScalar,
     unreadCount: eagerScalar,
-    messages: pipe2(collection(), withByIndex(LazyMessageProto), withById(LazyMessageProto)),
-    mailboxes: null,
+    messages: messagesCollectionProto,
+    mailboxes: null, // Set below due to self-reference
 };
+// Self-referential assignment
 MailboxProto.mailboxes = pipe2(collection(), withByIndex(MailboxProto), withByName(MailboxProto));
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto
 // ─────────────────────────────────────────────────────────────────────────────
 const MailAccountProto = {
-    ...baseScalar,
+    ...baseObject,
     id: eagerScalar,
     name: eagerScalar,
     fullName: eagerScalar,
@@ -1539,26 +1758,25 @@ if (typeof _globalThis.Application !== 'undefined' && typeof _globalThis.createJ
 // MCP Resource Handler
 // ============================================================================
 function readResource(uri) {
-    const resResult = resolveURI(uri);
+    const resResult = resolveURI(uri.href);
     if (!resResult.ok) {
-        // Return null to trigger JSON-RPC error response
-        return null;
+        return { ok: false, error: `URI resolution failed: ${resResult.error}` };
     }
     const res = resResult.value;
     try {
         const data = res.resolve();
         // Get the canonical URI from the delegate
-        const canonicalUri = res._delegate.uri().href;
-        const fixedUri = canonicalUri !== uri ? canonicalUri : undefined;
+        const canonicalUri = res._delegate.uri();
+        const fixedUri = canonicalUri.href !== uri.href ? canonicalUri : undefined;
         // Add _uri to the result if it's an object
         if (data && typeof data === 'object' && !Array.isArray(data)) {
-            data._uri = fixedUri || uri;
+            data._uri = (fixedUri || uri).href;
         }
-        return { mimeType: 'application/json', text: data, fixedUri };
+        return { ok: true, mimeType: 'application/json', text: data, fixedUri };
     }
     catch (e) {
-        // Return null to trigger JSON-RPC error response
-        return null;
+        const errorMessage = e.message || String(e);
+        return { ok: false, error: `JXA error: ${errorMessage}` };
     }
 }
 function listResources() {
