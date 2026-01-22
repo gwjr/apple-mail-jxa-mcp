@@ -1,6 +1,6 @@
-// scratch/mail.ts - Mail.app Schema
+// src/mail.ts - Mail.app Schema
 //
-// Uses framework.ts building blocks. No framework code here.
+// Uses framework/ building blocks. No framework code here.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App-specific utilities
@@ -188,35 +188,42 @@ const MessageProto = pipe2(
 // Mailbox proto (recursive - interface required for self-reference)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Messages collection - inferred from composers, no manual type needed
+// Messages collection - uses legacy composers from legacy.ts
 const messagesCollectionProto = pipe2(
-  collection<typeof MessageProto>(),
+  baseCollection,
   withByIndex(MessageProto),
   withById(MessageProto)
 );
+
+// Lazy version for use in mailbox (returns specifier when parent is resolved)
+const lazyMessagesProto = specifierFor(messagesCollectionProto);
+
+// Mailboxes collection for account-level (eager, since we enumerate accounts)
+// Uses null as any - forward reference workaround for self-referential MailboxProto
+const mailboxesCollectionProto = pipe2(
+  baseCollection,
+  withByIndex<MailboxProtoType>(null as any),  // Proto set after MailboxProto defined
+  withByName<MailboxProtoType>(null as any)
+);
+
+// Lazy version for nested mailboxes in a mailbox
+const lazyMailboxesProto = specifierFor(mailboxesCollectionProto);
 
 // Mailbox is self-referential (contains mailboxes), so needs interface declaration
 interface MailboxProtoType extends BaseProtoType {
   name: typeof eagerScalar;
   unreadCount: typeof eagerScalar;
-  messages: typeof messagesCollectionProto;
-  mailboxes: CollectionProto<MailboxProtoType> & ByIndexProto<MailboxProtoType> & ByNameProto<MailboxProtoType>;
+  messages: typeof lazyMessagesProto;
+  mailboxes: typeof lazyMailboxesProto;
 }
 
 const MailboxProto: MailboxProtoType = {
   ...baseObject,
   name: eagerScalar,
   unreadCount: eagerScalar,
-  messages: messagesCollectionProto,
-  mailboxes: null as any,  // Set below due to self-reference
+  messages: lazyMessagesProto,
+  mailboxes: lazyMailboxesProto,
 };
-
-// Self-referential assignment
-MailboxProto.mailboxes = pipe2(
-  collection<MailboxProtoType>(),
-  withByIndex(MailboxProto),
-  withByName(MailboxProto)
-) as MailboxProtoType['mailboxes'];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto

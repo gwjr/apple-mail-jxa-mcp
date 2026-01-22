@@ -386,10 +386,9 @@ class MCPServer {
         this.log("Server shutting down");
     }
 }
-// scratch/framework.ts - Plugboard v4 Framework
+// src/framework/delegate.ts - Delegate Interface
 //
-// Core types, proto system, URI parsing - no app-specific code.
-// App schemas (mail.ts, notes.ts) use these building blocks.
+// The abstraction layer between schema and backing store (JXA/Mock).
 // ─────────────────────────────────────────────────────────────────────────────
 // Root Marker (for parent navigation)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -399,6 +398,12 @@ const ROOT = { [RootBrand]: true };
 function isRoot(d) {
     return RootBrand in d;
 }
+// src/framework/filter-query.ts - Query & Filter System
+//
+// Filtering, sorting, pagination for collections.
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter Operators
+// ─────────────────────────────────────────────────────────────────────────────
 const equalsOp = {
     name: 'equals',
     parseUri: (s) => s,
@@ -438,91 +443,66 @@ const filterOperators = [equalsOp, containsOp, startsWithOp, gtOp, ltOp];
 function getOperatorByName(name) {
     return filterOperators.find(op => op.name === name);
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// Predicate Factories
+// ─────────────────────────────────────────────────────────────────────────────
 const equals = (value) => ({ operator: equalsOp, value });
 const contains = (value) => ({ operator: containsOp, value });
 const startsWith = (value) => ({ operator: startsWithOp, value });
 const gt = (value) => ({ operator: gtOp, value });
 const lt = (value) => ({ operator: ltOp, value });
-function createRes(delegate, proto) {
-    // For namespace protos, get the target proto for property lookup
-    const targetProto = getNamespaceNav(proto) || proto;
-    // Check if this proto is marked as lazy (specifierFor)
-    const isLazy = lazyProtos.has(proto);
-    const handler = {
-        get(t, prop, receiver) {
-            if (prop === '_delegate')
-                return t._delegate;
-            if (prop === '_isLazy')
-                return isLazy;
-            // First check the main proto for methods (resolve, exists, etc.)
-            if (prop in proto) {
-                const value = proto[prop];
-                if (typeof value === 'function') {
-                    return value.bind(receiver);
-                }
-            }
-            // Then check targetProto for properties (works for both namespaces and regular protos)
-            if (prop in targetProto) {
-                const value = targetProto[prop];
-                if (typeof value === 'function') {
-                    return value.bind(receiver);
-                }
-                if (typeof value === 'object' && value !== null) {
-                    // Check for namespace navigation first
-                    const innerNamespaceProto = getNamespaceNav(value);
-                    if (innerNamespaceProto) {
-                        return createRes(t._delegate.namespace(prop), value);
-                    }
-                    // Check for computed navigation
-                    const navInfo = getComputedNav(value);
-                    if (navInfo) {
-                        const targetDelegate = navInfo.navigate(t._delegate);
-                        return createRes(targetDelegate, navInfo.targetProto);
-                    }
-                    // Normal property navigation - use jxaName if defined, otherwise use the property name
-                    const jxaName = getJxaName(value);
-                    const schemaName = prop;
-                    if (jxaName) {
-                        // Navigate with JXA name but track schema name for URI
-                        return createRes(t._delegate.propWithAlias(jxaName, schemaName), value);
-                    }
-                    else {
-                        return createRes(t._delegate.prop(schemaName), value);
-                    }
-                }
-                return value;
-            }
-            return undefined;
-        },
-        has(t, prop) {
-            if (prop === '_delegate' || prop === '_isLazy')
-                return true;
-            return prop in proto || prop in targetProto;
-        },
-        ownKeys(t) {
-            // Combine keys from proto and targetProto, plus _delegate (but not _isLazy - it's internal)
-            const keys = new Set(['_delegate']);
-            for (const key of Object.keys(proto))
-                keys.add(key);
-            for (const key of Object.keys(targetProto))
-                keys.add(key);
-            return [...keys];
-        },
-        getOwnPropertyDescriptor(t, prop) {
-            // Make properties enumerable for Object.keys() to work
-            if (prop === '_delegate' || prop === '_isLazy' || prop in proto || prop in targetProto) {
-                return { enumerable: true, configurable: true };
-            }
-            return undefined;
-        }
-    };
-    return new Proxy({ _delegate: delegate }, handler);
+// ─────────────────────────────────────────────────────────────────────────────
+// Query State Application
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper to get a property value, handling JXA specifiers (functions)
+function getPropValue(item, field) {
+    if (item && typeof item === 'object' && field in item) {
+        const val = item[field];
+        return typeof val === 'function' ? val() : val;
+    }
+    // JXA specifier: property access returns a function to call
+    if (typeof item === 'function' && typeof item[field] === 'function') {
+        return item[field]();
+    }
+    return undefined;
 }
-// Shared implementation for base proto methods
+function applyQueryState(items, query) {
+    let results = items;
+    if (query.filter && Object.keys(query.filter).length > 0) {
+        results = results.filter((item) => {
+            for (const [field, pred] of Object.entries(query.filter)) {
+                const val = getPropValue(item, field);
+                if (!pred.operator.test(val, pred.value)) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+    if (query.sort) {
+        const { by, direction = 'asc' } = query.sort;
+        results = [...results].sort((a, b) => {
+            const aVal = getPropValue(a, by);
+            const bVal = getPropValue(b, by);
+            const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+            return direction === 'desc' ? -cmp : cmp;
+        });
+    }
+    if (query.pagination) {
+        const { offset = 0, limit } = query.pagination;
+        results = limit !== undefined ? results.slice(offset, offset + limit) : results.slice(offset);
+    }
+    return results;
+}
+// src/framework/schematic.ts - Schema DSL & Type Composition
+//
+// The core typing system for schema definitions. Types and proto implementations
+// live together - the DSL specifies the schema by building the proto.
+// ─────────────────────────────────────────────────────────────────────────────
+// Proto Implementation Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared implementation for base proto methods (scalar resolve)
 const _baseProtoImpl = {
-    resolve() {
-        return this._delegate._jxa();
-    },
     exists() {
         try {
             const result = this._delegate._jxa();
@@ -535,17 +515,17 @@ const _baseProtoImpl = {
     specifier() {
         return { uri: this._delegate.uri() };
     },
+    resolve() {
+        return this._delegate._jxa();
+    },
 };
 // Object proto implementation - gathers properties on resolve instead of returning JXA specifier
 // Use this for complex objects (mailboxes, messages, etc.) that have child properties
 const _objectProtoImpl = {
     resolve() {
-        // First try to get the proto from the Res proxy by getting a known property
-        // We iterate over all enumerable properties and resolve them
+        // Iterate over all enumerable properties and resolve them
         const result = {};
         const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate', '_isLazy']);
-        // Get the proto by accessing it through the handler
-        // We use Object.keys which will trigger the 'has' trap, giving us the keys
         for (const key of Object.keys(this)) {
             if (baseKeys.has(key))
                 continue;
@@ -586,16 +566,15 @@ const _objectProtoImpl = {
         return { uri: this._delegate.uri() };
     },
 };
-// Base object for complex types that need property gathering
-const baseObject = { ..._objectProtoImpl };
+// ─────────────────────────────────────────────────────────────────────────────
+// Scalar Factories
+// ─────────────────────────────────────────────────────────────────────────────
 // Typed scalar factory
 function scalar() {
     return { ..._baseProtoImpl };
 }
-// Typed collection factory
-function collection() {
-    return { ..._baseProtoImpl };
-}
+// Base scalar for fallback
+const baseScalar = scalar();
 // Primitive type scalars
 const t = {
     string: scalar(),
@@ -604,13 +583,12 @@ const t = {
     date: scalar(),
     any: scalar(),
 };
-// Legacy aliases (untyped, for backwards compatibility)
-const baseScalar = scalar();
-const baseCollection = collection();
-// Convenience alias
-const eagerScalar = baseScalar;
+// Eager scalar (resolves to value, not specifier) - same impl, different semantics
+const eagerScalar = scalar();
+// Base object for complex types that need property gathering
+const baseObject = { ..._objectProtoImpl };
 // ─────────────────────────────────────────────────────────────────────────────
-// Composers
+// Lazy Proto Tracking
 // ─────────────────────────────────────────────────────────────────────────────
 // Track lazy protos for parent object resolution
 const lazyProtos = new WeakSet();
@@ -619,10 +597,68 @@ const lazyProtos = new WeakSet();
 function specifierFor(proto) {
     const lazyProto = { ...proto };
     lazyProtos.add(lazyProto);
+    // Copy over collection item proto if this is a collection
+    // (since spread creates new object that won't be in the WeakMap)
+    const itemProto = collectionItemProtos.get(proto);
+    if (itemProto) {
+        collectionItemProtos.set(lazyProto, itemProto);
+    }
     return lazyProto;
 }
 function isLazyProto(proto) {
     return lazyProtos.has(proto);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Collection Item Proto Tracking
+// ─────────────────────────────────────────────────────────────────────────────
+const collectionItemProtos = new WeakMap();
+function getItemProto(collectionProto) {
+    return collectionItemProtos.get(collectionProto);
+}
+// Collection factory that takes accessor config
+function collection(accessors) {
+    const itemProto = accessors.byIndex || accessors.byName || accessors.byId;
+    const proto = {
+        exists() {
+            try {
+                const result = this._delegate._jxa();
+                return result !== undefined && result !== null;
+            }
+            catch {
+                return false;
+            }
+        },
+        specifier() {
+            return { uri: this._delegate.uri() };
+        },
+        // resolve() returns specifiers for each item
+        resolve() {
+            const raw = this._delegate._jxa();
+            if (!Array.isArray(raw))
+                return raw;
+            return raw.map((_item, i) => {
+                const itemDelegate = this._delegate.byIndex(i);
+                return { uri: itemDelegate.uri() };
+            });
+        },
+    };
+    if (accessors.byIndex) {
+        proto.byIndex = function (n) {
+            return createRes(this._delegate.byIndex(n), itemProto);
+        };
+    }
+    if (accessors.byName) {
+        proto.byName = function (name) {
+            return createRes(this._delegate.byName(name), itemProto);
+        };
+    }
+    if (accessors.byId) {
+        proto.byId = function (id) {
+            return createRes(this._delegate.byId(id), itemProto);
+        };
+    }
+    collectionItemProtos.set(proto, itemProto);
+    return proto;
 }
 function withSet(proto) {
     return {
@@ -632,57 +668,7 @@ function withSet(proto) {
         },
     };
 }
-const collectionItemProtos = new WeakMap();
-function withByIndex(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            // resolve() returns specifiers for each item - just {uri: URL}
-            // We don't extract id/name here because in JXA that would require calling
-            // methods on each item, which is slow for large collections
-            resolve() {
-                const raw = this._delegate._jxa();
-                if (!Array.isArray(raw))
-                    return raw;
-                return raw.map((_item, i) => {
-                    const itemDelegate = this._delegate.byIndex(i);
-                    return { uri: itemDelegate.uri() };
-                });
-            },
-            byIndex(n) {
-                return createRes(this._delegate.byIndex(n), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
-function withByName(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            byName(name) {
-                return createRes(this._delegate.byName(name), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
-function withById(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            byId(id) {
-                return createRes(this._delegate.byId(id), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
 // Composer: adds move() with optional custom handler
-// Type parameter Item constrains what collections this can move to
 function withMove(itemProto, handler) {
     return function (proto) {
         const result = {
@@ -841,46 +827,6 @@ function namespaceNav(targetProto) {
 function getNamespaceNav(proto) {
     return namespaceNavMap.get(proto);
 }
-// Helper to get a property value, handling JXA specifiers (functions)
-function getPropValue(item, field) {
-    if (item && typeof item === 'object' && field in item) {
-        const val = item[field];
-        return typeof val === 'function' ? val() : val;
-    }
-    // JXA specifier: property access returns a function to call
-    if (typeof item === 'function' && typeof item[field] === 'function') {
-        return item[field]();
-    }
-    return undefined;
-}
-function applyQueryState(items, query) {
-    let results = items;
-    if (query.filter && Object.keys(query.filter).length > 0) {
-        results = results.filter((item) => {
-            for (const [field, pred] of Object.entries(query.filter)) {
-                const val = getPropValue(item, field);
-                if (!pred.operator.test(val, pred.value)) {
-                    return false;
-                }
-            }
-            return true;
-        });
-    }
-    if (query.sort) {
-        const { by, direction = 'asc' } = query.sort;
-        results = [...results].sort((a, b) => {
-            const aVal = getPropValue(a, by);
-            const bVal = getPropValue(b, by);
-            const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
-            return direction === 'desc' ? -cmp : cmp;
-        });
-    }
-    if (query.pagination) {
-        const { offset = 0, limit } = query.pagination;
-        results = limit !== undefined ? results.slice(offset, offset + limit) : results.slice(offset);
-    }
-    return results;
-}
 function withQuery(proto) {
     const itemProto = collectionItemProtos.get(proto);
     return {
@@ -930,6 +876,108 @@ function withQuery(proto) {
         },
     };
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// Proto Guards
+// ─────────────────────────────────────────────────────────────────────────────
+function hasByIndex(proto) {
+    return 'byIndex' in proto && typeof proto.byIndex === 'function';
+}
+function hasByName(proto) {
+    return 'byName' in proto && typeof proto.byName === 'function';
+}
+function hasById(proto) {
+    return 'byId' in proto && typeof proto.byId === 'function';
+}
+function isChildProto(value) {
+    return typeof value === 'object' && value !== null && 'resolve' in value && typeof value.resolve === 'function';
+}
+// src/framework/res.ts - Res Type & Proxy
+//
+// The proxy wrapper that makes protos usable.
+// ─────────────────────────────────────────────────────────────────────────────
+// Res Factory
+// ─────────────────────────────────────────────────────────────────────────────
+function createRes(delegate, proto) {
+    // For namespace protos, get the target proto for property lookup
+    const targetProto = getNamespaceNav(proto) || proto;
+    // Check if this proto is marked as lazy (specifierFor)
+    const isLazy = lazyProtos.has(proto);
+    const handler = {
+        get(t, prop, receiver) {
+            if (prop === '_delegate')
+                return t._delegate;
+            if (prop === '_isLazy')
+                return isLazy;
+            // First check the main proto for methods (resolve, exists, etc.)
+            if (prop in proto) {
+                const value = proto[prop];
+                if (typeof value === 'function') {
+                    return value.bind(receiver);
+                }
+            }
+            // Then check targetProto for properties (works for both namespaces and regular protos)
+            if (prop in targetProto) {
+                const value = targetProto[prop];
+                if (typeof value === 'function') {
+                    return value.bind(receiver);
+                }
+                if (typeof value === 'object' && value !== null) {
+                    // Check for namespace navigation first
+                    const innerNamespaceProto = getNamespaceNav(value);
+                    if (innerNamespaceProto) {
+                        return createRes(t._delegate.namespace(prop), value);
+                    }
+                    // Check for computed navigation
+                    const navInfo = getComputedNav(value);
+                    if (navInfo) {
+                        const targetDelegate = navInfo.navigate(t._delegate);
+                        return createRes(targetDelegate, navInfo.targetProto);
+                    }
+                    // Normal property navigation - use jxaName if defined, otherwise use the property name
+                    const jxaName = getJxaName(value);
+                    const schemaName = prop;
+                    if (jxaName) {
+                        // Navigate with JXA name but track schema name for URI
+                        return createRes(t._delegate.propWithAlias(jxaName, schemaName), value);
+                    }
+                    else {
+                        return createRes(t._delegate.prop(schemaName), value);
+                    }
+                }
+                return value;
+            }
+            return undefined;
+        },
+        has(t, prop) {
+            if (prop === '_delegate' || prop === '_isLazy')
+                return true;
+            return prop in proto || prop in targetProto;
+        },
+        ownKeys(t) {
+            // Combine keys from proto and targetProto, plus _delegate (but not _isLazy - it's internal)
+            const keys = new Set(['_delegate']);
+            for (const key of Object.keys(proto))
+                keys.add(key);
+            for (const key of Object.keys(targetProto))
+                keys.add(key);
+            return [...keys];
+        },
+        getOwnPropertyDescriptor(t, prop) {
+            // Make properties enumerable for Object.keys() to work
+            if (prop === '_delegate' || prop === '_isLazy' || prop in proto || prop in targetProto) {
+                return { enumerable: true, configurable: true };
+            }
+            return undefined;
+        }
+    };
+    return new Proxy({ _delegate: delegate }, handler);
+}
+// src/framework/uri.ts - URI Parsing & Resolution
+//
+// URI scheme handling and navigation.
+// ─────────────────────────────────────────────────────────────────────────────
+// URI Building
+// ─────────────────────────────────────────────────────────────────────────────
 function buildURIString(segments) {
     let uri = '';
     for (const seg of segments) {
@@ -985,17 +1033,8 @@ function buildQueryString(query) {
     return parts.join('&');
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// Composition utilities
+// URI Lexer
 // ─────────────────────────────────────────────────────────────────────────────
-function pipe(a, f) {
-    return f(a);
-}
-function pipe2(a, f, g) {
-    return g(f(a));
-}
-function pipe3(a, f, g, h) {
-    return h(g(f(a)));
-}
 function parseFilterOp(op) {
     switch (op) {
         case 'contains': return 'contains';
@@ -1142,7 +1181,7 @@ function registerScheme(scheme, createRoot, proto) {
     schemeRegistry[scheme] = { createRoot, proto };
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// URI Resolution
+// URI Resolution Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 function filtersToWhoseFilter(filters) {
     const result = {};
@@ -1179,21 +1218,9 @@ function applyQueryQualifier(delegate, proto, qualifier) {
     const queryableProto = withQuery(proto);
     return { delegate: newDelegate, proto: queryableProto };
 }
-function hasByIndex(proto) {
-    return 'byIndex' in proto && typeof proto.byIndex === 'function';
-}
-function hasByName(proto) {
-    return 'byName' in proto && typeof proto.byName === 'function';
-}
-function hasById(proto) {
-    return 'byId' in proto && typeof proto.byId === 'function';
-}
-function isChildProto(value) {
-    return typeof value === 'object' && value !== null && 'resolve' in value && typeof value.resolve === 'function';
-}
-function getItemProto(collectionProto) {
-    return collectionItemProtos.get(collectionProto);
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// URI Resolution
+// ─────────────────────────────────────────────────────────────────────────────
 function resolveURI(uri) {
     const lexResult = lexURI(uri);
     if (!lexResult.ok) {
@@ -1310,6 +1337,88 @@ function resolveURI(uri) {
         }
     }
     return { ok: true, value: createRes(delegate, proto) };
+}
+// src/framework/legacy.ts - Backwards Compatibility Shims
+//
+// Legacy composers and factories for backwards compatibility with existing schemas.
+// New code should use the unified collection() factory instead.
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy Base Collection (no accessors)
+// ─────────────────────────────────────────────────────────────────────────────
+// Base collection for use with legacy composers - returns raw array, no accessors
+const baseCollection = {
+    exists() {
+        try {
+            const result = this._delegate._jxa();
+            return result !== undefined && result !== null;
+        }
+        catch {
+            return false;
+        }
+    },
+    specifier() {
+        return { uri: this._delegate.uri() };
+    },
+    resolve() {
+        return this._delegate._jxa();
+    },
+};
+function withByIndex(itemProto) {
+    return function (proto) {
+        const result = {
+            ...proto,
+            resolve() {
+                const raw = this._delegate._jxa();
+                if (!Array.isArray(raw))
+                    return raw;
+                return raw.map((_item, i) => {
+                    const itemDelegate = this._delegate.byIndex(i);
+                    return { uri: itemDelegate.uri() };
+                });
+            },
+            byIndex(n) {
+                return createRes(this._delegate.byIndex(n), itemProto);
+            },
+        };
+        collectionItemProtos.set(result, itemProto);
+        return result;
+    };
+}
+function withByName(itemProto) {
+    return function (proto) {
+        const result = {
+            ...proto,
+            byName(name) {
+                return createRes(this._delegate.byName(name), itemProto);
+            },
+        };
+        collectionItemProtos.set(result, itemProto);
+        return result;
+    };
+}
+function withById(itemProto) {
+    return function (proto) {
+        const result = {
+            ...proto,
+            byId(id) {
+                return createRes(this._delegate.byId(id), itemProto);
+            },
+        };
+        collectionItemProtos.set(result, itemProto);
+        return result;
+    };
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Composition Utilities
+// ─────────────────────────────────────────────────────────────────────────────
+function pipe(a, f) {
+    return f(a);
+}
+function pipe2(a, f, g) {
+    return g(f(a));
+}
+function pipe3(a, f, g, h) {
+    return h(g(f(a)));
 }
 // scratch/jxa-backing.ts - JXA Delegate implementation
 //
@@ -1520,9 +1629,9 @@ function createJXADelegate(app, scheme = 'mail') {
 }
 // Export to globalThis for JXA environment detection
 globalThis.createJXADelegate = createJXADelegate;
-// scratch/mail.ts - Mail.app Schema
+// src/mail.ts - Mail.app Schema
 //
-// Uses framework.ts building blocks. No framework code here.
+// Uses framework/ building blocks. No framework code here.
 // ─────────────────────────────────────────────────────────────────────────────
 // Domain-specific mutation handlers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1671,17 +1780,23 @@ const MessageProto = pipe2(_MessageProtoBase, withMove(_MessageProtoBase, messag
 // ─────────────────────────────────────────────────────────────────────────────
 // Mailbox proto (recursive - interface required for self-reference)
 // ─────────────────────────────────────────────────────────────────────────────
-// Messages collection - inferred from composers, no manual type needed
-const messagesCollectionProto = pipe2(collection(), withByIndex(MessageProto), withById(MessageProto));
+// Messages collection - uses legacy composers from legacy.ts
+const messagesCollectionProto = pipe2(baseCollection, withByIndex(MessageProto), withById(MessageProto));
+// Lazy version for use in mailbox (returns specifier when parent is resolved)
+const lazyMessagesProto = specifierFor(messagesCollectionProto);
+// Mailboxes collection for account-level (eager, since we enumerate accounts)
+// Uses null as any - forward reference workaround for self-referential MailboxProto
+const mailboxesCollectionProto = pipe2(baseCollection, withByIndex(null), // Proto set after MailboxProto defined
+withByName(null));
+// Lazy version for nested mailboxes in a mailbox
+const lazyMailboxesProto = specifierFor(mailboxesCollectionProto);
 const MailboxProto = {
     ...baseObject,
     name: eagerScalar,
     unreadCount: eagerScalar,
-    messages: messagesCollectionProto,
-    mailboxes: null, // Set below due to self-reference
+    messages: lazyMessagesProto,
+    mailboxes: lazyMailboxesProto,
 };
-// Self-referential assignment
-MailboxProto.mailboxes = pipe2(collection(), withByIndex(MailboxProto), withByName(MailboxProto));
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2144,7 +2259,7 @@ const resourceTemplates = [
 globalThis.readResource = readResource;
 globalThis.listResources = listResources;
 globalThis.resourceTemplates = resourceTemplates;
-/// <reference path="framework.ts" />
+/// <reference path="framework/uri.ts" />
 // ============================================================================
 // Set Tool - Modify scalar values
 // ============================================================================
@@ -2352,7 +2467,11 @@ globalThis.registerMailTools = registerMailTools;
 /// <reference path="types/jxa.d.ts" />
 /// <reference path="types/mcp.d.ts" />
 /// <reference path="core/mcp-server.ts" />
-/// <reference path="framework.ts" />
+/// <reference path="framework/delegate.ts" />
+/// <reference path="framework/filter-query.ts" />
+/// <reference path="framework/schematic.ts" />
+/// <reference path="framework/res.ts" />
+/// <reference path="framework/uri.ts" />
 /// <reference path="jxa-delegate.ts" />
 /// <reference path="mail.ts" />
 /// <reference path="resources.ts" />

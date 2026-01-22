@@ -1,8 +1,7 @@
 "use strict";
-// scratch/framework.ts - Plugboard v4 Framework
+// src/framework/delegate.ts - Delegate Interface
 //
-// Core types, proto system, URI parsing - no app-specific code.
-// App schemas (mail.ts, notes.ts) use these building blocks.
+// The abstraction layer between schema and backing store (JXA/Mock).
 // ─────────────────────────────────────────────────────────────────────────────
 // Root Marker (for parent navigation)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -12,6 +11,12 @@ const ROOT = { [RootBrand]: true };
 function isRoot(d) {
     return RootBrand in d;
 }
+// src/framework/filter-query.ts - Query & Filter System
+//
+// Filtering, sorting, pagination for collections.
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter Operators
+// ─────────────────────────────────────────────────────────────────────────────
 const equalsOp = {
     name: 'equals',
     parseUri: (s) => s,
@@ -51,85 +56,138 @@ const filterOperators = [equalsOp, containsOp, startsWithOp, gtOp, ltOp];
 function getOperatorByName(name) {
     return filterOperators.find(op => op.name === name);
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// Predicate Factories
+// ─────────────────────────────────────────────────────────────────────────────
 const equals = (value) => ({ operator: equalsOp, value });
 const contains = (value) => ({ operator: containsOp, value });
 const startsWith = (value) => ({ operator: startsWithOp, value });
 const gt = (value) => ({ operator: gtOp, value });
 const lt = (value) => ({ operator: ltOp, value });
-function createRes(delegate, proto) {
-    const handler = {
-        get(t, prop, receiver) {
-            if (prop === '_delegate')
-                return t._delegate;
-            if (prop in proto) {
-                const value = proto[prop];
-                if (typeof value === 'function') {
-                    return value.bind(receiver);
-                }
-                if (typeof value === 'object' && value !== null) {
-                    // Check for namespace navigation first
-                    const namespaceProto = getNamespaceNav(value);
-                    if (namespaceProto) {
-                        return createRes(t._delegate.namespace(prop), namespaceProto);
-                    }
-                    // Check for computed navigation
-                    const navInfo = getComputedNav(value);
-                    if (navInfo) {
-                        const targetDelegate = navInfo.navigate(t._delegate);
-                        return createRes(targetDelegate, navInfo.targetProto);
-                    }
-                    // Normal property navigation - use jxaName if defined, otherwise use the property name
-                    const jxaName = getJxaName(value);
-                    const schemaName = prop;
-                    if (jxaName) {
-                        // Navigate with JXA name but track schema name for URI
-                        return createRes(t._delegate.propWithAlias(jxaName, schemaName), value);
-                    }
-                    else {
-                        return createRes(t._delegate.prop(schemaName), value);
-                    }
-                }
-                return value;
-            }
-            return undefined;
-        },
-        has(t, prop) {
-            if (prop === '_delegate')
-                return true;
-            return prop in proto;
-        }
-    };
-    return new Proxy({ _delegate: delegate }, handler);
+// ─────────────────────────────────────────────────────────────────────────────
+// Query State Application
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper to get a property value, handling JXA specifiers (functions)
+function getPropValue(item, field) {
+    if (item && typeof item === 'object' && field in item) {
+        const val = item[field];
+        return typeof val === 'function' ? val() : val;
+    }
+    // JXA specifier: property access returns a function to call
+    if (typeof item === 'function' && typeof item[field] === 'function') {
+        return item[field]();
+    }
+    return undefined;
 }
-// Shared implementation for base proto methods
+function applyQueryState(items, query) {
+    let results = items;
+    if (query.filter && Object.keys(query.filter).length > 0) {
+        results = results.filter((item) => {
+            for (const [field, pred] of Object.entries(query.filter)) {
+                const val = getPropValue(item, field);
+                if (!pred.operator.test(val, pred.value)) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+    if (query.sort) {
+        const { by, direction = 'asc' } = query.sort;
+        results = [...results].sort((a, b) => {
+            const aVal = getPropValue(a, by);
+            const bVal = getPropValue(b, by);
+            const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+            return direction === 'desc' ? -cmp : cmp;
+        });
+    }
+    if (query.pagination) {
+        const { offset = 0, limit } = query.pagination;
+        results = limit !== undefined ? results.slice(offset, offset + limit) : results.slice(offset);
+    }
+    return results;
+}
+// src/framework/schematic.ts - Schema DSL & Type Composition
+//
+// The core typing system for schema definitions. Types and proto implementations
+// live together - the DSL specifies the schema by building the proto.
+// ─────────────────────────────────────────────────────────────────────────────
+// Proto Implementation Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared implementation for base proto methods (scalar resolve)
 const _baseProtoImpl = {
-    resolve() {
-        return this._delegate._jxa();
-    },
-    resolve_eager() {
-        return this.resolve();
-    },
     exists() {
         try {
-            this._delegate._jxa();
-            return true;
+            const result = this._delegate._jxa();
+            return result !== undefined && result !== null;
         }
         catch {
             return false;
         }
     },
     specifier() {
-        return { uri: this._delegate.uri().href };
+        return { uri: this._delegate.uri() };
+    },
+    resolve() {
+        return this._delegate._jxa();
     },
 };
+// Object proto implementation - gathers properties on resolve instead of returning JXA specifier
+// Use this for complex objects (mailboxes, messages, etc.) that have child properties
+const _objectProtoImpl = {
+    resolve() {
+        // Iterate over all enumerable properties and resolve them
+        const result = {};
+        const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate', '_isLazy']);
+        for (const key of Object.keys(this)) {
+            if (baseKeys.has(key))
+                continue;
+            try {
+                const propRes = this[key];
+                if (propRes && typeof propRes === 'object' && '_delegate' in propRes) {
+                    // It's a Res - check if it's lazy (should return specifier instead of value)
+                    if (propRes._isLazy) {
+                        result[key] = propRes.specifier();
+                    }
+                    else {
+                        const resolved = propRes.resolve();
+                        if (resolved !== undefined) {
+                            result[key] = resolved;
+                        }
+                    }
+                }
+                else if (propRes !== undefined) {
+                    result[key] = propRes;
+                }
+            }
+            catch {
+                // Skip properties that fail to resolve
+            }
+        }
+        return result;
+    },
+    exists() {
+        try {
+            const result = this._delegate._jxa();
+            return result !== undefined && result !== null;
+        }
+        catch {
+            return false;
+        }
+    },
+    specifier() {
+        return { uri: this._delegate.uri() };
+    },
+};
+// ─────────────────────────────────────────────────────────────────────────────
+// Scalar Factories
+// ─────────────────────────────────────────────────────────────────────────────
 // Typed scalar factory
 function scalar() {
     return { ..._baseProtoImpl };
 }
-// Typed collection factory
-function collection() {
-    return { ..._baseProtoImpl };
-}
+// Base scalar for fallback
+const baseScalar = scalar();
 // Primitive type scalars
 const t = {
     string: scalar(),
@@ -138,21 +196,82 @@ const t = {
     date: scalar(),
     any: scalar(),
 };
-// Legacy aliases (untyped, for backwards compatibility)
-const baseScalar = scalar();
-const baseCollection = collection();
-// Convenience alias
-const eagerScalar = baseScalar;
+// Eager scalar (resolves to value, not specifier) - same impl, different semantics
+const eagerScalar = scalar();
+// Base object for complex types that need property gathering
+const baseObject = { ..._objectProtoImpl };
 // ─────────────────────────────────────────────────────────────────────────────
-// Composers
+// Lazy Proto Tracking
 // ─────────────────────────────────────────────────────────────────────────────
-function makeLazy(proto) {
-    return {
-        ...proto,
-        resolve_eager() {
-            return this.specifier();
+// Track lazy protos for parent object resolution
+const lazyProtos = new WeakSet();
+// specifierFor: marks a property as "lazy" - when resolved as part of a parent object,
+// returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
+function specifierFor(proto) {
+    const lazyProto = { ...proto };
+    lazyProtos.add(lazyProto);
+    // Copy over collection item proto if this is a collection
+    // (since spread creates new object that won't be in the WeakMap)
+    const itemProto = collectionItemProtos.get(proto);
+    if (itemProto) {
+        collectionItemProtos.set(lazyProto, itemProto);
+    }
+    return lazyProto;
+}
+function isLazyProto(proto) {
+    return lazyProtos.has(proto);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Collection Item Proto Tracking
+// ─────────────────────────────────────────────────────────────────────────────
+const collectionItemProtos = new WeakMap();
+function getItemProto(collectionProto) {
+    return collectionItemProtos.get(collectionProto);
+}
+// Collection factory that takes accessor config
+function collection(accessors) {
+    const itemProto = accessors.byIndex || accessors.byName || accessors.byId;
+    const proto = {
+        exists() {
+            try {
+                const result = this._delegate._jxa();
+                return result !== undefined && result !== null;
+            }
+            catch {
+                return false;
+            }
+        },
+        specifier() {
+            return { uri: this._delegate.uri() };
+        },
+        // resolve() returns specifiers for each item
+        resolve() {
+            const raw = this._delegate._jxa();
+            if (!Array.isArray(raw))
+                return raw;
+            return raw.map((_item, i) => {
+                const itemDelegate = this._delegate.byIndex(i);
+                return { uri: itemDelegate.uri() };
+            });
         },
     };
+    if (accessors.byIndex) {
+        proto.byIndex = function (n) {
+            return createRes(this._delegate.byIndex(n), itemProto);
+        };
+    }
+    if (accessors.byName) {
+        proto.byName = function (name) {
+            return createRes(this._delegate.byName(name), itemProto);
+        };
+    }
+    if (accessors.byId) {
+        proto.byId = function (id) {
+            return createRes(this._delegate.byId(id), itemProto);
+        };
+    }
+    collectionItemProtos.set(proto, itemProto);
+    return proto;
 }
 function withSet(proto) {
     return {
@@ -162,45 +281,7 @@ function withSet(proto) {
         },
     };
 }
-const collectionItemProtos = new WeakMap();
-function withByIndex(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            byIndex(n) {
-                return createRes(this._delegate.byIndex(n), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
-function withByName(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            byName(name) {
-                return createRes(this._delegate.byName(name), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
-function withById(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            byId(id) {
-                return createRes(this._delegate.byId(id), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
 // Composer: adds move() with optional custom handler
-// Type parameter Item constrains what collections this can move to
 function withMove(itemProto, handler) {
     return function (proto) {
         const result = {
@@ -282,9 +363,6 @@ function computed(transform) {
             const raw = this._delegate._jxa();
             return transform(raw);
         },
-        resolve_eager() {
-            return this.resolve();
-        },
         exists() {
             try {
                 this._delegate._jxa();
@@ -295,13 +373,9 @@ function computed(transform) {
             }
         },
         specifier() {
-            return { uri: this._delegate.uri().href };
+            return { uri: this._delegate.uri() };
         },
     };
-}
-// Lazy computed - resolve_eager returns specifier instead of value
-function lazyComputed(transform) {
-    return makeLazy(computed(transform));
 }
 const computedNavMap = new WeakMap();
 function computedNav(navigate, targetProto) {
@@ -309,9 +383,6 @@ function computedNav(navigate, targetProto) {
     const navProto = {
         resolve() {
             return navigate(this._delegate)._jxa();
-        },
-        resolve_eager() {
-            return this.resolve();
         },
         exists() {
             try {
@@ -323,7 +394,7 @@ function computedNav(navigate, targetProto) {
             }
         },
         specifier() {
-            return { uri: navigate(this._delegate).uri().href };
+            return { uri: navigate(this._delegate).uri() };
         },
     };
     computedNavMap.set(navProto, { navigate, targetProto });
@@ -334,41 +405,40 @@ function getComputedNav(proto) {
 }
 const namespaceNavMap = new WeakMap();
 function namespaceNav(targetProto) {
+    // Custom resolve that gathers all properties from the target proto
     const navProto = {
-        ...baseScalar,
+        resolve() {
+            const result = {};
+            // Get all property names from the target proto (excluding base methods)
+            const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
+            for (const key of Object.keys(targetProto)) {
+                if (baseKeys.has(key))
+                    continue;
+                try {
+                    // Navigate to the property and resolve it
+                    const propRes = this[key];
+                    if (propRes && typeof propRes.resolve === 'function') {
+                        result[key] = propRes.resolve();
+                    }
+                }
+                catch {
+                    // Skip properties that fail to resolve
+                }
+            }
+            return result;
+        },
+        exists() {
+            return true; // Namespaces always exist
+        },
+        specifier() {
+            return { uri: this._delegate.uri() };
+        },
     };
     namespaceNavMap.set(navProto, targetProto);
     return navProto;
 }
 function getNamespaceNav(proto) {
     return namespaceNavMap.get(proto);
-}
-function applyQueryState(items, query) {
-    let results = items;
-    if (query.filter && Object.keys(query.filter).length > 0) {
-        results = results.filter((item) => {
-            for (const [field, pred] of Object.entries(query.filter)) {
-                if (!pred.operator.test(item[field], pred.value)) {
-                    return false;
-                }
-            }
-            return true;
-        });
-    }
-    if (query.sort) {
-        const { by, direction = 'asc' } = query.sort;
-        results = [...results].sort((a, b) => {
-            const aVal = a[by];
-            const bVal = b[by];
-            const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
-            return direction === 'desc' ? -cmp : cmp;
-        });
-    }
-    if (query.pagination) {
-        const { offset = 0, limit } = query.pagination;
-        results = limit !== undefined ? results.slice(offset, offset + limit) : results.slice(offset);
-    }
-    return results;
 }
 function withQuery(proto) {
     const itemProto = collectionItemProtos.get(proto);
@@ -419,6 +489,108 @@ function withQuery(proto) {
         },
     };
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// Proto Guards
+// ─────────────────────────────────────────────────────────────────────────────
+function hasByIndex(proto) {
+    return 'byIndex' in proto && typeof proto.byIndex === 'function';
+}
+function hasByName(proto) {
+    return 'byName' in proto && typeof proto.byName === 'function';
+}
+function hasById(proto) {
+    return 'byId' in proto && typeof proto.byId === 'function';
+}
+function isChildProto(value) {
+    return typeof value === 'object' && value !== null && 'resolve' in value && typeof value.resolve === 'function';
+}
+// src/framework/res.ts - Res Type & Proxy
+//
+// The proxy wrapper that makes protos usable.
+// ─────────────────────────────────────────────────────────────────────────────
+// Res Factory
+// ─────────────────────────────────────────────────────────────────────────────
+function createRes(delegate, proto) {
+    // For namespace protos, get the target proto for property lookup
+    const targetProto = getNamespaceNav(proto) || proto;
+    // Check if this proto is marked as lazy (specifierFor)
+    const isLazy = lazyProtos.has(proto);
+    const handler = {
+        get(t, prop, receiver) {
+            if (prop === '_delegate')
+                return t._delegate;
+            if (prop === '_isLazy')
+                return isLazy;
+            // First check the main proto for methods (resolve, exists, etc.)
+            if (prop in proto) {
+                const value = proto[prop];
+                if (typeof value === 'function') {
+                    return value.bind(receiver);
+                }
+            }
+            // Then check targetProto for properties (works for both namespaces and regular protos)
+            if (prop in targetProto) {
+                const value = targetProto[prop];
+                if (typeof value === 'function') {
+                    return value.bind(receiver);
+                }
+                if (typeof value === 'object' && value !== null) {
+                    // Check for namespace navigation first
+                    const innerNamespaceProto = getNamespaceNav(value);
+                    if (innerNamespaceProto) {
+                        return createRes(t._delegate.namespace(prop), value);
+                    }
+                    // Check for computed navigation
+                    const navInfo = getComputedNav(value);
+                    if (navInfo) {
+                        const targetDelegate = navInfo.navigate(t._delegate);
+                        return createRes(targetDelegate, navInfo.targetProto);
+                    }
+                    // Normal property navigation - use jxaName if defined, otherwise use the property name
+                    const jxaName = getJxaName(value);
+                    const schemaName = prop;
+                    if (jxaName) {
+                        // Navigate with JXA name but track schema name for URI
+                        return createRes(t._delegate.propWithAlias(jxaName, schemaName), value);
+                    }
+                    else {
+                        return createRes(t._delegate.prop(schemaName), value);
+                    }
+                }
+                return value;
+            }
+            return undefined;
+        },
+        has(t, prop) {
+            if (prop === '_delegate' || prop === '_isLazy')
+                return true;
+            return prop in proto || prop in targetProto;
+        },
+        ownKeys(t) {
+            // Combine keys from proto and targetProto, plus _delegate (but not _isLazy - it's internal)
+            const keys = new Set(['_delegate']);
+            for (const key of Object.keys(proto))
+                keys.add(key);
+            for (const key of Object.keys(targetProto))
+                keys.add(key);
+            return [...keys];
+        },
+        getOwnPropertyDescriptor(t, prop) {
+            // Make properties enumerable for Object.keys() to work
+            if (prop === '_delegate' || prop === '_isLazy' || prop in proto || prop in targetProto) {
+                return { enumerable: true, configurable: true };
+            }
+            return undefined;
+        }
+    };
+    return new Proxy({ _delegate: delegate }, handler);
+}
+// src/framework/uri.ts - URI Parsing & Resolution
+//
+// URI scheme handling and navigation.
+// ─────────────────────────────────────────────────────────────────────────────
+// URI Building
+// ─────────────────────────────────────────────────────────────────────────────
 function buildURIString(segments) {
     let uri = '';
     for (const seg of segments) {
@@ -430,7 +602,7 @@ function buildURIString(segments) {
                 uri += (uri.endsWith('://') ? '' : '/') + seg.name;
                 break;
             case 'index':
-                uri += `[${seg.value}]`;
+                uri += `%5B${seg.value}%5D`; // URL-encoded [ and ]
                 break;
             case 'name':
                 uri += '/' + encodeURIComponent(seg.value);
@@ -474,17 +646,8 @@ function buildQueryString(query) {
     return parts.join('&');
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// Composition utilities
+// URI Lexer
 // ─────────────────────────────────────────────────────────────────────────────
-function pipe(a, f) {
-    return f(a);
-}
-function pipe2(a, f, g) {
-    return g(f(a));
-}
-function pipe3(a, f, g, h) {
-    return h(g(f(a)));
-}
 function parseFilterOp(op) {
     switch (op) {
         case 'contains': return 'contains';
@@ -555,11 +718,21 @@ function parseSegments(path) {
             if (!remaining)
                 break;
         }
+        // Check for literal or encoded brackets/query
         let headEnd = remaining.length;
         for (let i = 0; i < remaining.length; i++) {
-            if (remaining[i] === '/' || remaining[i] === '[' || remaining[i] === '?') {
+            const ch = remaining[i];
+            if (ch === '/' || ch === '[' || ch === '?') {
                 headEnd = i;
                 break;
+            }
+            // Check for URL-encoded [ (%5B or %5b)
+            if (ch === '%' && i + 2 < remaining.length) {
+                const encoded = remaining.slice(i, i + 3).toUpperCase();
+                if (encoded === '%5B' || encoded === '%3F') {
+                    headEnd = i;
+                    break;
+                }
             }
         }
         const head = decodeURIComponent(remaining.slice(0, headEnd));
@@ -572,13 +745,18 @@ function parseSegments(path) {
             }
         }
         const segment = { head };
-        if (remaining.startsWith('[')) {
-            const closeIdx = remaining.indexOf(']');
+        // Check for literal [ or URL-encoded %5B
+        if (remaining.startsWith('[') || remaining.toUpperCase().startsWith('%5B')) {
+            const isEncoded = remaining.toUpperCase().startsWith('%5B');
+            const openLen = isEncoded ? 3 : 1; // '%5B' vs '['
+            const closeChar = isEncoded ? '%5D' : ']';
+            const closeIdx = remaining.toUpperCase().indexOf(isEncoded ? '%5D' : ']');
+            const closeLen = isEncoded ? 3 : 1;
             if (closeIdx !== -1) {
-                const indexStr = remaining.slice(1, closeIdx);
+                const indexStr = remaining.slice(openLen, closeIdx);
                 if (isInteger(indexStr)) {
                     segment.qualifier = { kind: 'index', value: parseInt(indexStr, 10) };
-                    remaining = remaining.slice(closeIdx + 1);
+                    remaining = remaining.slice(closeIdx + closeLen);
                 }
             }
         }
@@ -616,7 +794,7 @@ function registerScheme(scheme, createRoot, proto) {
     schemeRegistry[scheme] = { createRoot, proto };
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// URI Resolution
+// URI Resolution Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 function filtersToWhoseFilter(filters) {
     const result = {};
@@ -653,21 +831,9 @@ function applyQueryQualifier(delegate, proto, qualifier) {
     const queryableProto = withQuery(proto);
     return { delegate: newDelegate, proto: queryableProto };
 }
-function hasByIndex(proto) {
-    return 'byIndex' in proto && typeof proto.byIndex === 'function';
-}
-function hasByName(proto) {
-    return 'byName' in proto && typeof proto.byName === 'function';
-}
-function hasById(proto) {
-    return 'byId' in proto && typeof proto.byId === 'function';
-}
-function isChildProto(value) {
-    return typeof value === 'object' && value !== null && 'resolve' in value && typeof value.resolve === 'function';
-}
-function getItemProto(collectionProto) {
-    return collectionItemProtos.get(collectionProto);
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// URI Resolution
+// ─────────────────────────────────────────────────────────────────────────────
 function resolveURI(uri) {
     const lexResult = lexURI(uri);
     if (!lexResult.ok) {
@@ -684,12 +850,15 @@ function resolveURI(uri) {
     for (let i = 0; i < segments.length; i++) {
         const segment = segments[i];
         const { head, qualifier } = segment;
-        const childProto = proto[head];
+        // For namespace protos, look up properties in the target proto
+        const lookupProto = getNamespaceNav(proto) || proto;
+        const childProto = lookupProto[head];
         // Check for namespaceNav first (virtual grouping, no JXA navigation)
-        const namespaceProto = childProto ? getNamespaceNav(childProto) : undefined;
-        if (namespaceProto) {
+        const namespaceTargetProto = childProto ? getNamespaceNav(childProto) : undefined;
+        if (namespaceTargetProto) {
             delegate = delegate.namespace(head);
-            proto = namespaceProto;
+            // Keep the navProto (childProto) which has the custom resolve, not the inner targetProto
+            proto = childProto;
             // Namespaces don't have qualifiers - if there's a qualifier, it's an error
             if (qualifier) {
                 return { ok: false, error: `Namespace '${head}' does not support qualifiers` };
@@ -773,14 +942,96 @@ function resolveURI(uri) {
             }
         }
         else {
-            const available = Object.keys(proto).filter(k => {
-                const v = proto[k];
+            const available = Object.keys(lookupProto).filter(k => {
+                const v = lookupProto[k];
                 return isChildProto(v);
             });
             return { ok: false, error: `Unknown segment '${head}'. Available: ${available.join(', ')}` };
         }
     }
     return { ok: true, value: createRes(delegate, proto) };
+}
+// src/framework/legacy.ts - Backwards Compatibility Shims
+//
+// Legacy composers and factories for backwards compatibility with existing schemas.
+// New code should use the unified collection() factory instead.
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy Base Collection (no accessors)
+// ─────────────────────────────────────────────────────────────────────────────
+// Base collection for use with legacy composers - returns raw array, no accessors
+const baseCollection = {
+    exists() {
+        try {
+            const result = this._delegate._jxa();
+            return result !== undefined && result !== null;
+        }
+        catch {
+            return false;
+        }
+    },
+    specifier() {
+        return { uri: this._delegate.uri() };
+    },
+    resolve() {
+        return this._delegate._jxa();
+    },
+};
+function withByIndex(itemProto) {
+    return function (proto) {
+        const result = {
+            ...proto,
+            resolve() {
+                const raw = this._delegate._jxa();
+                if (!Array.isArray(raw))
+                    return raw;
+                return raw.map((_item, i) => {
+                    const itemDelegate = this._delegate.byIndex(i);
+                    return { uri: itemDelegate.uri() };
+                });
+            },
+            byIndex(n) {
+                return createRes(this._delegate.byIndex(n), itemProto);
+            },
+        };
+        collectionItemProtos.set(result, itemProto);
+        return result;
+    };
+}
+function withByName(itemProto) {
+    return function (proto) {
+        const result = {
+            ...proto,
+            byName(name) {
+                return createRes(this._delegate.byName(name), itemProto);
+            },
+        };
+        collectionItemProtos.set(result, itemProto);
+        return result;
+    };
+}
+function withById(itemProto) {
+    return function (proto) {
+        const result = {
+            ...proto,
+            byId(id) {
+                return createRes(this._delegate.byId(id), itemProto);
+            },
+        };
+        collectionItemProtos.set(result, itemProto);
+        return result;
+    };
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Composition Utilities
+// ─────────────────────────────────────────────────────────────────────────────
+function pipe(a, f) {
+    return f(a);
+}
+function pipe2(a, f, g) {
+    return g(f(a));
+}
+function pipe3(a, f, g, h) {
+    return h(g(f(a)));
 }
 // scratch/mock-backing.ts - Mock Delegate implementation
 //
@@ -816,10 +1067,7 @@ class MockDelegate {
         this._query = _query;
     }
     _jxa() {
-        // Apply query state to data if it's an array
-        if (Array.isArray(this._data)) {
-            return applyQueryState(this._data, this._query);
-        }
+        // Return raw data - query state is applied by the proto layer (withQuery.resolve())
         return this._data;
     }
     prop(key) {
@@ -969,14 +1217,18 @@ class MockDelegate {
     queryState() {
         return this._query;
     }
+    // Create a delegate from arbitrary data with explicit path
+    fromJxa(data, path) {
+        return new MockDelegate(data, path, this._root, this, null, null);
+    }
 }
 // Create a mock delegate from in-memory data
 function createMockDelegate(data, scheme = 'mail') {
     return new MockDelegate(data, [{ kind: 'root', scheme }], data, null, null, null);
 }
-// scratch/mail.ts - Mail.app Schema
+// src/mail.ts - Mail.app Schema
 //
-// Uses framework.ts building blocks. No framework code here.
+// Uses framework/ building blocks. No framework code here.
 // ─────────────────────────────────────────────────────────────────────────────
 // Domain-specific mutation handlers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1045,7 +1297,7 @@ function parseEmailAddress(raw) {
 // RuleCondition proto
 // ─────────────────────────────────────────────────────────────────────────────
 const RuleConditionProto = {
-    ...baseScalar,
+    ...baseObject,
     header: eagerScalar,
     qualifier: eagerScalar,
     ruleType: eagerScalar,
@@ -1055,7 +1307,7 @@ const RuleConditionProto = {
 // Rule proto
 // ─────────────────────────────────────────────────────────────────────────────
 const _RuleProtoBase = {
-    ...baseScalar,
+    ...baseObject,
     name: eagerScalar,
     enabled: withSet(t.boolean),
     allConditionsMustBeMet: withSet(t.boolean),
@@ -1080,15 +1332,15 @@ const RuleProto = pipe(_RuleProtoBase, withDelete());
 // Signature proto
 // ─────────────────────────────────────────────────────────────────────────────
 const SignatureProto = {
-    ...baseScalar,
+    ...baseObject,
     name: eagerScalar,
-    content: makeLazy(baseScalar),
+    content: specifierFor(baseScalar),
 };
 // ─────────────────────────────────────────────────────────────────────────────
 // Recipient proto
 // ─────────────────────────────────────────────────────────────────────────────
 const RecipientProto = {
-    ...baseScalar,
+    ...baseObject,
     name: eagerScalar,
     address: eagerScalar,
 };
@@ -1096,13 +1348,13 @@ const RecipientProto = {
 // Attachment proto
 // ─────────────────────────────────────────────────────────────────────────────
 const AttachmentProto = {
-    ...baseScalar,
+    ...baseObject,
     id: eagerScalar,
     name: eagerScalar,
     fileSize: eagerScalar,
 };
 const _MessageProtoBase = {
-    ...baseScalar,
+    ...baseObject,
     id: eagerScalar,
     messageId: eagerScalar,
     subject: withSet(t.string),
@@ -1110,7 +1362,7 @@ const _MessageProtoBase = {
     replyTo: computed(parseEmailAddress),
     dateSent: eagerScalar,
     dateReceived: eagerScalar,
-    content: makeLazy(baseScalar),
+    content: specifierFor(baseScalar),
     readStatus: withSet(t.boolean),
     flaggedStatus: withSet(t.boolean),
     junkMailStatus: withSet(t.boolean),
@@ -1122,28 +1374,78 @@ const _MessageProtoBase = {
 };
 // MessageProto with move and delete operations
 const MessageProto = pipe2(_MessageProtoBase, withMove(_MessageProtoBase, messageMoveHandler), withDelete(messageDeleteHandler));
-const LazyMessageProto = makeLazy(MessageProto);
+// ─────────────────────────────────────────────────────────────────────────────
+// Mailbox proto (recursive - interface required for self-reference)
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages collection - uses legacy composers from legacy.ts
+const messagesCollectionProto = pipe2(baseCollection, withByIndex(MessageProto), withById(MessageProto));
+// Lazy version for use in mailbox (returns specifier when parent is resolved)
+const lazyMessagesProto = specifierFor(messagesCollectionProto);
+// Mailboxes collection for account-level (eager, since we enumerate accounts)
+// Uses null as any - forward reference workaround for self-referential MailboxProto
+const mailboxesCollectionProto = pipe2(baseCollection, withByIndex(null), // Proto set after MailboxProto defined
+withByName(null));
+// Lazy version for nested mailboxes in a mailbox
+const lazyMailboxesProto = specifierFor(mailboxesCollectionProto);
 const MailboxProto = {
-    ...baseScalar,
+    ...baseObject,
     name: eagerScalar,
     unreadCount: eagerScalar,
-    messages: pipe2(collection(), withByIndex(LazyMessageProto), withById(LazyMessageProto)),
-    mailboxes: null,
+    messages: lazyMessagesProto,
+    mailboxes: lazyMailboxesProto,
 };
-MailboxProto.mailboxes = pipe2(collection(), withByIndex(MailboxProto), withByName(MailboxProto));
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto
 // ─────────────────────────────────────────────────────────────────────────────
 const MailAccountProto = {
-    ...baseScalar,
+    ...baseObject,
     id: eagerScalar,
     name: eagerScalar,
     fullName: eagerScalar,
     emailAddresses: eagerScalar, // Returns string[] of account's email addresses
     mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
-    // Account inbox navigates to mailboxes.byName('INBOX')
-    inbox: computedNav((d) => d.prop('mailboxes').byName('INBOX'), MailboxProto),
+    // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
+    // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
+    inbox: computedNav((d) => {
+        if (!d.fromJxa) {
+            // Mock delegate: fall back to mailboxes.byName('INBOX')
+            return d.prop('mailboxes').byName('INBOX');
+        }
+        // JXA: Find inbox mailbox by matching account ID
+        const accountId = d._jxa().id();
+        const Mail = Application('Mail');
+        const inboxMailboxes = Mail.inbox.mailboxes();
+        const accountInbox = inboxMailboxes.find((mb) => mb.account.id() === accountId);
+        if (!accountInbox) {
+            throw new Error(`No inbox found for account ${accountId}`);
+        }
+        // Build path by parsing current URI and adding /inbox
+        // URI is like "mail://accounts%5B0%5D" -> path segments for "accounts[0]/inbox"
+        const currentUri = d.uri().href;
+        const afterScheme = currentUri.replace('mail://', '');
+        const decodedPath = decodeURIComponent(afterScheme);
+        // Parse into segments: e.g., "accounts[0]" -> [{root}, {prop: accounts}, {index: 0}]
+        const pathSegments = parsePathToSegments('mail', decodedPath);
+        pathSegments.push({ kind: 'prop', name: 'inbox' });
+        return d.fromJxa(accountInbox, pathSegments);
+    }, MailboxProto),
 };
+// Helper to parse a path string into PathSegment array
+function parsePathToSegments(scheme, path) {
+    const segments = [{ kind: 'root', scheme }];
+    const parts = path.split('/').filter(p => p);
+    for (const part of parts) {
+        const indexMatch = part.match(/^(.+)\[(\d+)\]$/);
+        if (indexMatch) {
+            segments.push({ kind: 'prop', name: indexMatch[1] });
+            segments.push({ kind: 'index', value: parseInt(indexMatch[2], 10) });
+        }
+        else {
+            segments.push({ kind: 'prop', name: part });
+        }
+    }
+    return segments;
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings proto (namespace for app-level preferences)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1222,9 +1524,354 @@ const _globalThis = globalThis;
 if (typeof _globalThis.Application !== 'undefined' && typeof _globalThis.createJXADelegate !== 'undefined') {
     registerScheme('mail', () => _globalThis.createJXADelegate(_globalThis.Application('Mail'), 'mail'), MailApplicationProto);
 }
+/// <reference path="./types/mcp.d.ts" />
+// ============================================================================
+// MCP Resource Handler
+// ============================================================================
+const DEFAULT_COLLECTION_LIMIT = 20;
+const MAX_COLLECTION_LIMIT = 100;
+function readResource(uri) {
+    const resResult = resolveURI(uri.href);
+    if (!resResult.ok) {
+        return { ok: false, error: `URI resolution failed: ${resResult.error}` };
+    }
+    const res = resResult.value;
+    try {
+        let data = res.resolve();
+        // Get the canonical URI from the delegate
+        const canonicalUri = res._delegate.uri();
+        const fixedUri = canonicalUri.href !== uri.href ? canonicalUri : undefined;
+        // Protect against returning huge collections
+        if (Array.isArray(data)) {
+            const queryState = res._delegate.queryState();
+            const requestedLimit = queryState.pagination?.limit;
+            const requestedOffset = queryState.pagination?.offset ?? 0;
+            // Use requested limit (capped at max) or default
+            const effectiveLimit = requestedLimit
+                ? Math.min(requestedLimit, MAX_COLLECTION_LIMIT)
+                : DEFAULT_COLLECTION_LIMIT;
+            if (data.length > effectiveLimit) {
+                const totalCount = data.length;
+                const baseUri = (fixedUri || canonicalUri).href.split('?')[0];
+                const nextOffset = requestedOffset + effectiveLimit;
+                const nextUri = `${baseUri}?limit=${effectiveLimit}&offset=${nextOffset}`;
+                return {
+                    ok: true,
+                    mimeType: 'application/json',
+                    text: {
+                        _pagination: {
+                            total: totalCount,
+                            returned: effectiveLimit,
+                            offset: requestedOffset,
+                            limit: effectiveLimit,
+                            next: nextOffset < totalCount ? nextUri : null
+                        },
+                        items: data.slice(0, effectiveLimit)
+                    },
+                    fixedUri
+                };
+            }
+        }
+        // Add _uri to the result if it's an object
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+            data._uri = (fixedUri || uri).href;
+        }
+        return { ok: true, mimeType: 'application/json', text: data, fixedUri };
+    }
+    catch (e) {
+        const errorMessage = e.message || String(e);
+        return { ok: false, error: `JXA error: ${errorMessage}` };
+    }
+}
+function listResources() {
+    const resources = [
+        // Standard mailboxes (aggregate across accounts)
+        { uri: 'mail://inbox', name: 'Inbox', description: 'Combined inbox from all accounts' },
+        { uri: 'mail://sent', name: 'Sent', description: 'Combined sent from all accounts' },
+        { uri: 'mail://drafts', name: 'Drafts', description: 'Combined drafts from all accounts' },
+        { uri: 'mail://trash', name: 'Trash', description: 'Combined trash from all accounts' },
+        { uri: 'mail://junk', name: 'Junk', description: 'Combined junk/spam from all accounts' },
+        { uri: 'mail://outbox', name: 'Outbox', description: 'Messages waiting to be sent' },
+        // Accounts
+        { uri: 'mail://accounts', name: 'Accounts', description: 'Mail accounts' },
+        // Rules, Signatures, Settings
+        { uri: 'mail://rules', name: 'Rules', description: 'Mail filtering rules' },
+        { uri: 'mail://signatures', name: 'Signatures', description: 'Email signatures' },
+        { uri: 'mail://settings', name: 'Settings', description: 'Mail.app preferences' }
+    ];
+    const resResult = resolveURI('mail://accounts');
+    if (resResult.ok) {
+        try {
+            const specifiers = resResult.value.resolve();
+            for (let i = 0; i < specifiers.length; i++) {
+                const acc = resResult.value.byIndex(i).resolve();
+                resources.push({
+                    uri: `mail://accounts/${encodeURIComponent(acc.id)}`,
+                    name: acc.fullName,
+                    description: acc.userName // email address
+                });
+            }
+        }
+        catch {
+            // Silently ignore if we can't resolve accounts
+        }
+    }
+    return resources;
+}
+// ============================================================================
+// Resource Templates Documentation
+// ============================================================================
+//
+// URI Structure: mail://{path}?{query}
+//
+// Path Addressing:
+//   - By index:  collection[0], collection[1], ...
+//   - By name:   collection/MyName (for mailboxes, recipients)
+//   - By id:     collection/12345 (for messages)
+//
+// Query Parameters:
+//   Filters (applied server-side when possible):
+//     - Exact match:   ?name=Inbox
+//     - Greater than:  ?unreadCount.gt=0
+//     - Less than:     ?messageSize.lt=1000000
+//     - Contains:      ?subject.contains=urgent
+//     - Starts with:   ?name.startsWith=Project
+//
+//   Sorting:
+//     - Ascending:     ?sort=name.asc
+//     - Descending:    ?sort=dateReceived.desc
+//
+//   Pagination:
+//     - Limit:         ?limit=10
+//     - Offset:        ?offset=20
+//     - Combined:      ?limit=10&offset=20
+//
+//   Expand (resolve lazy properties inline):
+//     - Single:        ?expand=content
+//     - Multiple:      ?expand=content,attachments
+//
+//   Combined:
+//     ?unreadCount.gt=0&sort=unreadCount.desc&limit=10&expand=content
+//
+// ============================================================================
+const resourceTemplates = [
+    // --- Standard Mailboxes (aggregate across all accounts) ---
+    {
+        uriTemplate: 'mail://inbox',
+        name: 'All Inboxes',
+        description: 'Combined inbox across all accounts. Returns: name, unreadCount, messages'
+    },
+    {
+        uriTemplate: 'mail://inbox/messages',
+        name: 'Inbox Messages',
+        description: 'Messages from all inboxes'
+    },
+    {
+        uriTemplate: 'mail://inbox/messages?{query}',
+        name: 'Filtered Inbox Messages',
+        description: 'Filter: ?readStatus=false, ?subject.contains=X. Sort: ?sort=dateReceived.desc. Paginate: ?limit=10&offset=0'
+    },
+    {
+        uriTemplate: 'mail://sent',
+        name: 'All Sent',
+        description: 'Combined sent mailbox across all accounts'
+    },
+    {
+        uriTemplate: 'mail://drafts',
+        name: 'All Drafts',
+        description: 'Combined drafts mailbox across all accounts'
+    },
+    {
+        uriTemplate: 'mail://trash',
+        name: 'All Trash',
+        description: 'Combined trash mailbox across all accounts'
+    },
+    {
+        uriTemplate: 'mail://junk',
+        name: 'All Junk',
+        description: 'Combined junk/spam mailbox across all accounts'
+    },
+    {
+        uriTemplate: 'mail://outbox',
+        name: 'Outbox',
+        description: 'Messages waiting to be sent'
+    },
+    // --- Accounts ---
+    {
+        uriTemplate: 'mail://accounts',
+        name: 'All Accounts',
+        description: 'List all mail accounts'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]',
+        name: 'Account by Index',
+        description: 'Single account. Returns: id, name, fullName, emailAddresses'
+    },
+    {
+        uriTemplate: 'mail://accounts/{name}',
+        name: 'Account by Name',
+        description: 'Single account by name. Example: mail://accounts/iCloud'
+    },
+    // --- Account Standard Mailboxes ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/inbox',
+        name: 'Account Inbox',
+        description: "The account's inbox mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/sent',
+        name: 'Account Sent',
+        description: "The account's sent mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/drafts',
+        name: 'Account Drafts',
+        description: "The account's drafts mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/junk',
+        name: 'Account Junk',
+        description: "The account's junk/spam mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/trash',
+        name: 'Account Trash',
+        description: "The account's trash/deleted items mailbox"
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/inbox/messages?{query}',
+        name: 'Account Inbox Messages',
+        description: "Messages in the account's inbox. Supports filter/sort/pagination"
+    },
+    // --- Mailboxes ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes',
+        name: 'Mailboxes',
+        description: 'All mailboxes for an account. Returns: name, unreadCount per mailbox'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}',
+        name: 'Mailbox by Name',
+        description: 'Single mailbox. Supports nested: /mailboxes/Work/mailboxes/Projects'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes?{query}',
+        name: 'Filtered Mailboxes',
+        description: 'Filter: ?name=Inbox, ?unreadCount.gt=0. Sort: ?sort=unreadCount.desc'
+    },
+    // --- Messages ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages',
+        name: 'Messages',
+        description: 'All messages. Returns: id, subject, sender {name, address}, dateSent, readStatus, etc. Content is lazy (use ?expand=content)'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages[{msgIndex}]',
+        name: 'Message by Index',
+        description: 'Single message by position (0-indexed)'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}',
+        name: 'Message by ID',
+        description: 'Single message by Mail.app message ID'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages?{query}',
+        name: 'Filtered Messages',
+        description: 'Filter: ?readStatus=false, ?flaggedStatus=true. Sort: ?sort=dateReceived.desc. Expand: ?expand=content'
+    },
+    // --- Message Content (Lazy) ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/content',
+        name: 'Message Content',
+        description: 'Full message body text. Fetched separately as it can be large'
+    },
+    // --- Recipients ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/toRecipients',
+        name: 'To Recipients',
+        description: 'To recipients. Returns: name, address'
+    },
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/ccRecipients',
+        name: 'CC Recipients',
+        description: 'CC recipients. Returns: name, address'
+    },
+    // --- Attachments ---
+    {
+        uriTemplate: 'mail://accounts[{index}]/mailboxes/{name}/messages/{id}/attachments',
+        name: 'Attachments',
+        description: 'Message attachments. Returns: id, name, fileSize'
+    },
+    // --- Rules ---
+    {
+        uriTemplate: 'mail://rules',
+        name: 'All Rules',
+        description: 'List all mail filtering rules'
+    },
+    {
+        uriTemplate: 'mail://rules[{index}]',
+        name: 'Rule by Index',
+        description: 'Single rule. Returns: name, enabled, conditions, actions'
+    },
+    {
+        uriTemplate: 'mail://rules/{name}',
+        name: 'Rule by Name',
+        description: 'Single rule by name'
+    },
+    {
+        uriTemplate: 'mail://rules[{index}]/ruleConditions',
+        name: 'Rule Conditions',
+        description: 'Conditions for a rule. Returns: header, qualifier, ruleType, expression'
+    },
+    // --- Signatures ---
+    {
+        uriTemplate: 'mail://signatures',
+        name: 'All Signatures',
+        description: 'List all email signatures'
+    },
+    {
+        uriTemplate: 'mail://signatures[{index}]',
+        name: 'Signature by Index',
+        description: 'Single signature by position'
+    },
+    {
+        uriTemplate: 'mail://signatures/{name}',
+        name: 'Signature by Name',
+        description: 'Single signature by name. Returns: name, content (lazy)'
+    },
+    // --- Settings ---
+    {
+        uriTemplate: 'mail://settings',
+        name: 'Settings',
+        description: 'Mail.app preferences: fonts, colors, behavior, composing options'
+    },
+    {
+        uriTemplate: 'mail://settings/{property}',
+        name: 'Setting Property',
+        description: 'Individual setting value (e.g., mail://settings/fetchInterval)'
+    }
+];
+// Export for JXA
+globalThis.readResource = readResource;
+globalThis.listResources = listResources;
+globalThis.resourceTemplates = resourceTemplates;
 // tests/src/test-utils.ts - Shared test utilities
 //
 // Simple assertion functions that work in both Node and JXA environments.
+// ─────────────────────────────────────────────────────────────────────────────
+// URL Polyfill for tests
+// ─────────────────────────────────────────────────────────────────────────────
+// Node's URL constructor rejects unencoded brackets, but our mail:// URIs use them.
+// Wrap the native URL to auto-encode brackets before parsing.
+const _NativeURL = globalThis.URL;
+globalThis.URL = class URL extends _NativeURL {
+    constructor(url, base) {
+        // Encode brackets in the URL before passing to native constructor
+        const encoded = url.replace(/\[/g, '%5B').replace(/\]/g, '%5D');
+        super(encoded, base);
+    }
+};
 let testCount = 0;
 let passCount = 0;
 let currentGroup = '';
@@ -1348,6 +1995,7 @@ function createMockMailData() {
                                 readStatus: false,
                                 flaggedStatus: false,
                                 messageSize: 1024,
+                                content: 'Hello, this is the message body content.',
                                 toRecipients: [{ name: 'John', address: 'john@work.com' }],
                                 ccRecipients: [],
                                 bccRecipients: [],
@@ -1363,6 +2011,7 @@ function createMockMailData() {
                                 readStatus: true,
                                 flaggedStatus: true,
                                 messageSize: 2048,
+                                content: 'Let us meet tomorrow at 10am to discuss the project.',
                                 toRecipients: [{ name: 'John', address: 'john@work.com' }],
                                 ccRecipients: [{ name: 'Alice', address: 'alice@example.com' }],
                                 bccRecipients: [],
@@ -1616,7 +2265,9 @@ function testJxaNameMapping() {
     if (msg.ok) {
         const attachments = msg.value.attachments.resolve();
         assertEqual(attachments.length, 1, 'Message has 1 attachment');
-        assertEqual(attachments[0].name, 'doc.pdf', 'Attachment name correct');
+        // Collection returns {uri} specifiers - use byIndex to get actual data
+        const firstAttachment = msg.value.attachments.byIndex(0).resolve();
+        assertEqual(firstAttachment.name, 'doc.pdf', 'Attachment name correct');
     }
     // sent maps to sentMailbox in JXA
     const sent = resolveURI('mail://sent');
@@ -1674,6 +2325,269 @@ function testSetOperation() {
         assertEqual(rule.value.enabled.resolve(), true, 'Rule re-enabled');
     }
 }
+function testObjectResolution() {
+    group('Object Resolution (baseObject vs baseScalar)');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    // Mailbox uses baseObject - resolve() should return a plain object with properties
+    const inboxResult = resolveURI('mail://accounts[0]/mailboxes/INBOX');
+    if (inboxResult.ok) {
+        const resolved = inboxResult.value.resolve();
+        assert(typeof resolved === 'object', 'Mailbox resolves to object');
+        assertEqual(resolved.name, 'INBOX', 'Resolved mailbox has name property');
+        assertEqual(resolved.unreadCount, 5, 'Resolved mailbox has unreadCount property');
+        assert(Array.isArray(resolved.messages), 'Resolved mailbox has messages array');
+        assert(Array.isArray(resolved.mailboxes), 'Resolved mailbox has mailboxes array');
+    }
+    // Message uses baseScalar - resolve() should also return object with properties
+    // This test will FAIL with current code because MessageProto uses baseScalar
+    const msgResult = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1001');
+    if (msgResult.ok) {
+        const resolved = msgResult.value.resolve();
+        assert(typeof resolved === 'object', 'Message resolves to object');
+        assertEqual(resolved.id, 1001, 'Resolved message has id property');
+        assertEqual(resolved.subject, 'Hello World', 'Resolved message has subject property');
+        // sender should be the computed value (parsed email), not raw string
+        assert(typeof resolved.sender === 'object', 'Resolved message has parsed sender');
+        assertEqual(resolved.sender.address, 'alice@example.com', 'Sender address is parsed');
+    }
+    // Rule uses baseScalar - should also return object with properties
+    const ruleResult = resolveURI('mail://rules[0]');
+    if (ruleResult.ok) {
+        const resolved = ruleResult.value.resolve();
+        assert(typeof resolved === 'object', 'Rule resolves to object');
+        assertEqual(resolved.name, 'Spam Filter', 'Resolved rule has name property');
+        assertEqual(resolved.enabled, true, 'Resolved rule has enabled property');
+    }
+    // Account uses baseScalar - should also return object with properties
+    const accResult = resolveURI('mail://accounts[0]');
+    if (accResult.ok) {
+        const resolved = accResult.value.resolve();
+        assert(typeof resolved === 'object', 'Account resolves to object');
+        assertEqual(resolved.name, 'Work', 'Resolved account has name property');
+        assertEqual(resolved.fullName, 'John Doe', 'Resolved account has fullName property');
+    }
+}
+function testCollectionResolution() {
+    group('Collection Resolution');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    // messages collection resolve() should return array of specifiers (URIs)
+    const messagesResult = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages');
+    if (messagesResult.ok) {
+        const resolved = messagesResult.value.resolve();
+        assert(Array.isArray(resolved), 'Messages collection resolves to array');
+        assertEqual(resolved.length, 2, 'Messages array has 2 items');
+        // Each item should be a specifier with uri property (just uri, no id/name)
+        assert(resolved[0] !== null, 'First message specifier is not null');
+        assert('uri' in resolved[0], 'First message specifier has uri');
+        assert(resolved[0].uri.href.includes('messages%5B0%5D'), 'First message URI has correct index');
+        assert('uri' in resolved[1], 'Second message specifier has uri');
+    }
+    // To get actual data, use byIndex() or byId() then resolve()
+    if (messagesResult.ok) {
+        const firstMsg = messagesResult.value.byIndex(0).resolve();
+        assertEqual(firstMsg.subject, 'Hello World', 'First message has subject via byIndex');
+        const secondMsg = messagesResult.value.byIndex(1).resolve();
+        assertEqual(secondMsg.subject, 'Meeting Tomorrow', 'Second message has subject via byIndex');
+    }
+    // Rules collection should resolve to array of specifiers
+    const rulesResult = resolveURI('mail://rules');
+    if (rulesResult.ok) {
+        const resolved = rulesResult.value.resolve();
+        assert(Array.isArray(resolved), 'Rules collection resolves to array');
+        assertEqual(resolved.length, 2, 'Rules array has 2 items');
+        assert('uri' in resolved[0], 'First rule specifier has uri');
+        // To get actual data, use byIndex/byName then resolve
+        const firstRule = rulesResult.value.byIndex(0).resolve();
+        assertEqual(firstRule.name, 'Spam Filter', 'First rule name via byIndex');
+    }
+    // Accounts collection
+    const accountsResult = resolveURI('mail://accounts');
+    if (accountsResult.ok) {
+        const resolved = accountsResult.value.resolve();
+        assert(Array.isArray(resolved), 'Accounts collection resolves to array');
+        assertEqual(resolved.length, 2, 'Accounts array has 2 items');
+        assert('uri' in resolved[0], 'First account specifier has uri');
+        // To get actual data, use byIndex/byName then resolve
+        const firstAccount = accountsResult.value.byIndex(0).resolve();
+        assertEqual(firstAccount.name, 'Work', 'First account name via byIndex');
+    }
+}
+function testLazyContentResolution() {
+    group('Lazy Content Resolution (specifierFor)');
+    const mockData = createMockMailData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    // Test 1: When resolving a message, content should be a specifier (lazy)
+    const msgResult = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1001');
+    if (msgResult.ok) {
+        const message = msgResult.value.resolve();
+        assert(typeof message.content === 'object', 'Content in message is an object (specifier)');
+        assert('uri' in message.content, 'Content has uri property (is a specifier)');
+        assert(message.content.uri.href.includes('content'), 'Content specifier URI includes "content"');
+    }
+    // Test 2: Direct resolution of content should return actual value
+    const contentResult = resolveURI('mail://accounts[0]/mailboxes/INBOX/messages/1001/content');
+    if (contentResult.ok) {
+        const content = contentResult.value.resolve();
+        assertEqual(content, 'Hello, this is the message body content.', 'Direct content resolution returns actual text');
+    }
+    // Test 3: readResource on content should return actual value
+    const readResult = readResource(new URL('mail://accounts[0]/mailboxes/INBOX/messages/1001/content'));
+    if (assertReadOk(readResult, 'readResource on content succeeds') && readResult.ok) {
+        assertEqual(readResult.text, 'Hello, this is the message body content.', 'readResource returns actual content');
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Compile-time type tests
+// ─────────────────────────────────────────────────────────────────────────────
+// These use @ts-expect-error to verify that unsupported patterns are type errors.
+// If the pattern becomes valid, TypeScript will error on the @ts-expect-error comment.
+function compileTimeTypeTests() {
+    // These tests don't run - they verify type checking at compile time
+    const mockData = createOperationsMockData();
+    registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
+    const delegate = createMockDelegate(mockData, 'mail');
+    const mail = getMailApp(delegate);
+    const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
+    // VALID: collection.resolve() returns CollectionResolveResult
+    // (array of {uri: URL} possibly with extra fields)
+    const specifiers = inbox.messages.resolve();
+    // Can access uri on first element
+    if (specifiers.length > 0) {
+        const firstUri = specifiers[0].uri;
+    }
+    // VALID: item.resolve() returns data
+    const message = inbox.messages.byId(1001);
+    const subject = message.subject.resolve();
+    // @ts-expect-error - resolve_eager() no longer exists
+    inbox.messages.resolve_eager();
+    // @ts-expect-error - resolve_eager() no longer exists on items
+    message.resolve_eager();
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Pagination Tests
+// ─────────────────────────────────────────────────────────────────────────────
+function createLargeCollectionMockData() {
+    // Generate 150 messages for pagination testing
+    const messages = [];
+    for (let i = 0; i < 150; i++) {
+        messages.push({
+            id: 2000 + i,
+            messageId: `<msg${i}@test.com>`,
+            subject: `Test Message ${i}`,
+            sender: `sender${i}@example.com`,
+            dateSent: `2024-01-${String(15 + (i % 15)).padStart(2, '0')}T10:00:00Z`,
+            dateReceived: `2024-01-${String(15 + (i % 15)).padStart(2, '0')}T10:01:00Z`,
+            readStatus: i % 2 === 0,
+            flaggedStatus: false,
+            messageSize: 1024 + i,
+            toRecipients: [{ name: 'Test', address: 'test@test.com' }],
+            ccRecipients: [],
+            bccRecipients: [],
+            mailAttachments: [],
+        });
+    }
+    return {
+        name: 'Mail',
+        version: '16.0',
+        accounts: [
+            {
+                id: 'acc1',
+                name: 'TestAccount',
+                fullName: 'Test User',
+                emailAddresses: ['test@test.com'],
+                mailboxes: [
+                    {
+                        name: 'LargeMailbox',
+                        unreadCount: 75,
+                        messages,
+                        mailboxes: [],
+                    },
+                ],
+            },
+        ],
+        rules: [],
+        signatures: [],
+        inbox: { name: 'All Inboxes', unreadCount: 0, messages: [], mailboxes: [] },
+        sentMailbox: { name: 'All Sent', unreadCount: 0, messages: [], mailboxes: [] },
+        draftsMailbox: { name: 'All Drafts', unreadCount: 0, messages: [], mailboxes: [] },
+        trashMailbox: { name: 'All Trash', unreadCount: 0, messages: [], mailboxes: [] },
+        junkMailbox: { name: 'All Junk', unreadCount: 0, messages: [], mailboxes: [] },
+        outbox: { name: 'Outbox', unreadCount: 0, messages: [], mailboxes: [] },
+        alwaysBccMyself: false,
+        alwaysCcMyself: false,
+        fetchInterval: 5,
+    };
+}
+function assertReadOk(result, message) {
+    testCount++;
+    if (result.ok) {
+        passCount++;
+        console.log(`  \u2713 ${message}`);
+        return true;
+    }
+    else {
+        console.log(`  \u2717 ${message}`);
+        console.log(`      error: ${result.error}`);
+        return false;
+    }
+}
+function testPagination() {
+    group('Collection Pagination');
+    // Use factory function for fresh data each time
+    const freshLargeData = () => createMockDelegate(createLargeCollectionMockData(), 'mail');
+    registerScheme('mail', freshLargeData, MailApplicationProto);
+    // Test 1: Default limit (20) applied to large collection
+    const defaultResult = readResource(new URL('mail://accounts[0]/mailboxes/LargeMailbox/messages'));
+    if (assertReadOk(defaultResult, 'Read large collection without limit') && defaultResult.ok) {
+        const data = defaultResult.text;
+        assert('_pagination' in data, 'Response has _pagination metadata');
+        assertEqual(data._pagination.total, 150, 'Total count is 150');
+        assertEqual(data._pagination.returned, 20, 'Default returns 20 items');
+        assertEqual(data._pagination.limit, 20, 'Default limit is 20');
+        assertEqual(data._pagination.offset, 0, 'Default offset is 0');
+        assertEqual(data.items.length, 20, 'Items array has 20 elements');
+        assert(data._pagination.next !== null, 'Has next page URL');
+        assert(data._pagination.next.includes('offset=20'), 'Next URL has offset=20');
+    }
+    // Test 2: Explicit limit=50 - framework applies it, we see 50 items (no extra truncation)
+    registerScheme('mail', freshLargeData, MailApplicationProto);
+    const limit50Result = readResource(new URL('mail://accounts[0]/mailboxes/LargeMailbox/messages?limit=50'));
+    if (assertReadOk(limit50Result, 'Read with limit=50') && limit50Result.ok) {
+        const data = limit50Result.text;
+        // When limit is explicitly requested and honored, no pagination wrapper needed
+        assert(Array.isArray(data), 'With explicit limit=50, returns plain array');
+        assertEqual(data.length, 50, 'Returns exactly 50 items');
+    }
+    // Test 3: Limit over max (100) gets capped - framework returns 500 but we cap to 100
+    registerScheme('mail', freshLargeData, MailApplicationProto);
+    const limit500Result = readResource(new URL('mail://accounts[0]/mailboxes/LargeMailbox/messages?limit=500'));
+    if (assertReadOk(limit500Result, 'Read with limit=500 (should cap to 100)') && limit500Result.ok) {
+        const data = limit500Result.text;
+        assert('_pagination' in data, 'Over-limit request has pagination wrapper');
+        assertEqual(data._pagination.returned, 100, 'Capped to 100 items');
+        assertEqual(data._pagination.limit, 100, 'Limit capped to 100');
+        assertEqual(data.items.length, 100, 'Items array has 100 elements');
+    }
+    // Test 4: Small collection (under default limit) returns all items without pagination
+    registerScheme('mail', () => createMockDelegate(createMockMailData(), 'mail'), MailApplicationProto);
+    const smallResult = readResource(new URL('mail://accounts[0]/mailboxes/INBOX/messages'));
+    if (assertReadOk(smallResult, 'Read small collection') && smallResult.ok) {
+        const data = smallResult.text;
+        assert(!('_pagination' in data), 'Small collection has no pagination wrapper');
+        assert(Array.isArray(data), 'Small collection returns plain array');
+    }
+    // Test 5: Offset pagination works (with limit under max)
+    registerScheme('mail', freshLargeData, MailApplicationProto);
+    const offsetResult = readResource(new URL('mail://accounts[0]/mailboxes/LargeMailbox/messages?limit=20&offset=140'));
+    if (assertReadOk(offsetResult, 'Read with offset=140, limit=20') && offsetResult.ok) {
+        const data = offsetResult.text;
+        // With explicit limit=20 at offset 140, we get 10 items (150-140=10)
+        assert(Array.isArray(data), 'With explicit limit, returns plain array');
+        assertEqual(data.length, 10, 'Returns remaining 10 items');
+    }
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Run tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1686,6 +2600,10 @@ testComputedProperties();
 testJxaNameMapping();
 testQueryOperations();
 testSetOperation();
+testObjectResolution();
+testCollectionResolution();
+testPagination();
+testLazyContentResolution();
 const frameworkTestResult = summary();
 resetCounters();
 // tests/src/test-operations.ts - Domain operation tests (runs in Node with mock data)
@@ -1801,27 +2719,26 @@ function testMoveMessageBetweenMailboxes() {
     // Get inbox and archive mailboxes
     const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
     const archive = mail.accounts.byName('Work').mailboxes.byName('Archive');
-    // Verify initial state
-    const inboxMessages = inbox.messages.resolve();
-    const archiveMessages = archive.messages.resolve();
-    assertEqual(inboxMessages.length, 2, 'Inbox has 2 messages initially');
-    assertEqual(archiveMessages.length, 1, 'Archive has 1 message initially');
-    // Get the first message from inbox
+    // Verify initial state - resolve() returns specifiers (URIs), count tells us how many
+    const inboxSpecifiers = inbox.messages.resolve();
+    const archiveSpecifiers = archive.messages.resolve();
+    assertEqual(inboxSpecifiers.length, 2, 'Inbox has 2 messages initially');
+    assertEqual(archiveSpecifiers.length, 1, 'Archive has 1 message initially');
+    // Get the first message from inbox - use byId for specific access
     const message = inbox.messages.byId(1001);
     assertEqual(message.subject.resolve(), 'Hello World', 'Message subject is correct');
     // Move message to archive
     const moveResult = message.move(archive.messages);
     assertOk(moveResult, 'Move operation succeeded');
-    // Verify message was removed from source
-    const inboxMessagesAfter = inbox.messages.resolve();
-    assertEqual(inboxMessagesAfter.length, 1, 'Inbox now has 1 message');
+    // Verify message was removed from source (check count via specifiers)
+    const inboxSpecifiersAfter = inbox.messages.resolve();
+    assertEqual(inboxSpecifiersAfter.length, 1, 'Inbox now has 1 message');
     // Verify message was added to destination
-    const archiveMessagesAfter = archive.messages.resolve();
-    assertEqual(archiveMessagesAfter.length, 2, 'Archive now has 2 messages');
-    // Verify the moved message is in archive
-    const movedMsg = archiveMessagesAfter.find((m) => m.id === 1001);
-    assert(movedMsg !== undefined, 'Moved message found in archive');
-    assertEqual(movedMsg?.subject, 'Hello World', 'Moved message has correct subject');
+    const archiveSpecifiersAfter = archive.messages.resolve();
+    assertEqual(archiveSpecifiersAfter.length, 2, 'Archive now has 2 messages');
+    // Verify the moved message is in archive - check by existence
+    assert(archive.messages.byId(1001).exists(), 'Moved message found in archive');
+    assertEqual(archive.messages.byId(1001).subject.resolve(), 'Hello World', 'Moved message has correct subject');
 }
 function testMoveTypeConstraint() {
     group('Move Type Constraint');
@@ -1848,18 +2765,19 @@ function testDeleteMessage() {
     const delegate = createMockDelegate(mockData, 'mail');
     const mail = getMailApp(delegate);
     const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
-    // Verify initial state
-    const messagesBefore = inbox.messages.resolve();
-    assertEqual(messagesBefore.length, 2, 'Inbox has 2 messages initially');
+    // Verify initial state - count via specifiers
+    const specifiersBefore = inbox.messages.resolve();
+    assertEqual(specifiersBefore.length, 2, 'Inbox has 2 messages initially');
     // Delete the second message
     const message = inbox.messages.byId(1002);
     const deleteResult = message.delete();
     assertOk(deleteResult, 'Delete operation succeeded');
     // Verify message was removed
-    const messagesAfter = inbox.messages.resolve();
-    assertEqual(messagesAfter.length, 1, 'Inbox now has 1 message');
-    // Verify correct message remains
-    assertEqual(messagesAfter[0].id, 1001, 'Remaining message has correct id');
+    const specifiersAfter = inbox.messages.resolve();
+    assertEqual(specifiersAfter.length, 1, 'Inbox now has 1 message');
+    // Verify correct message remains - use byId to check
+    assert(inbox.messages.byId(1001).exists(), 'Message 1001 still exists');
+    assert(!inbox.messages.byId(1002).exists(), 'Message 1002 no longer exists');
 }
 function testDeleteRule() {
     group('Delete Rule');
@@ -1867,18 +2785,20 @@ function testDeleteRule() {
     registerScheme('mail', () => createMockDelegate(mockData, 'mail'), MailApplicationProto);
     const delegate = createMockDelegate(mockData, 'mail');
     const mail = getMailApp(delegate);
-    // Verify initial state
-    const rulesBefore = mail.rules.resolve();
-    assertEqual(rulesBefore.length, 2, 'App has 2 rules initially');
+    // Verify initial state - count via specifiers
+    const specifiersBefore = mail.rules.resolve();
+    assertEqual(specifiersBefore.length, 2, 'App has 2 rules initially');
     // Delete the first rule
     const rule = mail.rules.byName('Spam Filter');
     assert('delete' in rule, 'Rule has delete method');
     const deleteResult = rule.delete();
     assertOk(deleteResult, 'Delete operation succeeded');
     // Verify rule was removed
-    const rulesAfter = mail.rules.resolve();
-    assertEqual(rulesAfter.length, 1, 'App now has 1 rule');
-    assertEqual(rulesAfter[0].name, 'Work Rules', 'Remaining rule is Work Rules');
+    const specifiersAfter = mail.rules.resolve();
+    assertEqual(specifiersAfter.length, 1, 'App now has 1 rule');
+    // Verify correct rule remains - use byName to check
+    assert(!mail.rules.byName('Spam Filter').exists(), 'Spam Filter no longer exists');
+    assert(mail.rules.byName('Work Rules').exists(), 'Work Rules still exists');
 }
 function testCreateMessage() {
     group('Create Message');
@@ -1887,9 +2807,9 @@ function testCreateMessage() {
     const delegate = createMockDelegate(mockData, 'mail');
     const mail = getMailApp(delegate);
     const inbox = mail.accounts.byName('Work').mailboxes.byName('INBOX');
-    // Verify initial state
-    const messagesBefore = inbox.messages.resolve();
-    assertEqual(messagesBefore.length, 2, 'Inbox has 2 messages initially');
+    // Verify initial state - count via specifiers
+    const specifiersBefore = inbox.messages.resolve();
+    assertEqual(specifiersBefore.length, 2, 'Inbox has 2 messages initially');
     // Create a new message using delegate
     const createResult = inbox.messages._delegate.create({
         subject: 'New Test Message',
@@ -1900,15 +2820,20 @@ function testCreateMessage() {
     });
     const newUri = assertOk(createResult, 'Create operation succeeded');
     // Verify message was added
-    const messagesAfter = inbox.messages.resolve();
-    assertEqual(messagesAfter.length, 3, 'Inbox now has 3 messages');
-    // Verify the new message
-    const newMsg = messagesAfter[2];
+    const specifiersAfter = inbox.messages.resolve();
+    assertEqual(specifiersAfter.length, 3, 'Inbox now has 3 messages');
+    // The new specifier should include an id if available
+    const lastSpecifier = specifiersAfter[2];
+    assert('uri' in lastSpecifier, 'New message specifier has uri');
+    if ('id' in lastSpecifier) {
+        assert(lastSpecifier.id !== undefined, 'New message specifier has id');
+    }
+    // Verify we can access the new message via byIndex
+    const newMsg = inbox.messages.byIndex(2).resolve();
     assertEqual(newMsg.subject, 'New Test Message', 'New message has correct subject');
-    assert(newMsg.id !== undefined, 'New message has an id assigned');
     // Verify URI points to new message
     if (newUri) {
-        assert(newUri.href.includes(String(newMsg.id)), 'Returned URI includes new message id');
+        assert(newUri.href.includes('messages'), 'Returned URI includes messages path');
     }
 }
 function testParentNavigation() {

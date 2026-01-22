@@ -16,7 +16,12 @@
   "files": [
     "src/types/jxa.d.ts",
     "src/jxa-polyfill.ts",
-    "src/framework.ts",
+    "src/framework/delegate.ts",
+    "src/framework/filter-query.ts",
+    "src/framework/schematic.ts",
+    "src/framework/res.ts",
+    "src/framework/uri.ts",
+    "src/framework/legacy.ts",
     "src/jxa-delegate.ts",
     "src/mail.ts",
     "tests/src/test-utils.ts",

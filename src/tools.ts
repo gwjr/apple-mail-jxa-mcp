@@ -1,4 +1,4 @@
-/// <reference path="framework.ts" />
+/// <reference path="framework/uri.ts" />
 
 // ============================================================================
 // MCP Tools for Mail.app
