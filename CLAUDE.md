@@ -4,6 +4,15 @@
 
 Allow: mcp__apple-mail__*
 
+## TypeScript Configuration
+
+This project uses bundled TypeScript (all files concatenated into one output). There are two main configs:
+
+- **`tsconfig.json`** - LSP/editor config with `include` patterns so language servers can see all files
+- **`tsconfig.build.json`** - Actual build config with explicit `files` list for correct concatenation order
+
+The build uses `npm run build` which invokes `tsc -p tsconfig.build.json`.
+
 ## Testing
 
 Two test suites run against mock data (no Mail.app required):

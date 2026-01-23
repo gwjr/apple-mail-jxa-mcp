@@ -167,6 +167,15 @@ npm run build         # Build dist/mail.js
 npm start             # Build and run server
 ```
 
+### TypeScript Configuration
+
+This project uses bundled TypeScript (all files concatenated into one output via `outFile`):
+
+- **`tsconfig.json`** - LSP/editor config with `include` patterns (for IDE support)
+- **`tsconfig.build.json`** - Build config with explicit `files` list for correct concatenation order
+
+The build uses `tsconfig.build.json`; the root `tsconfig.json` exists so language servers can resolve cross-file references.
+
 ## Testing
 
 Tests run against mock data (no Mail.app required):
