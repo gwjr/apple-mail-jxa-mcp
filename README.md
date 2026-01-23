@@ -13,79 +13,86 @@ This server runs as a single JXA process with proper NSRunLoop blocking - no Nod
 
 ## Features
 
-### Tools (18)
+### Tools (4)
 
-| Tool | Description | Annotations |
-|------|-------------|-------------|
-| `list_messages` | List messages in a mailbox | readOnly |
-| `get_message` | Get full message details by URL | readOnly |
-| `compose_email` | Create draft email for user review | non-destructive |
-| `mark_read` | Mark a message as read | idempotent |
-| `mark_unread` | Mark a message as unread | idempotent |
-| `toggle_flag` | Toggle flagged status | non-idempotent |
-| `move_message` | Move message to another mailbox | destructive |
-| `delete_message` | Delete a message (moves to Trash) | destructive |
-| `get_selection` | Get currently selected messages in Mail.app | readOnly |
-| `get_windows` | Get info about open Mail windows | readOnly |
-| `list_attachments` | List attachments of a message | readOnly |
-| `save_attachment` | Save an attachment to disk | openWorld |
-| `create_rule` | Create a new mail rule | non-idempotent |
-| `update_rule` | Update an existing rule | idempotent |
-| `delete_rule` | Delete a mail rule | destructive |
-| `create_signature` | Create a new signature | non-idempotent |
-| `update_signature` | Update an existing signature | idempotent |
-| `delete_signature` | Delete a signature | destructive |
+Generic tools that operate on any `mail://` URI:
 
-All tools include MCP annotations indicating their behavior (read-only, idempotent, destructive, etc.) for better client integration.
+| Tool | Description |
+|------|-------------|
+| `set` | Set a scalar property value (e.g., `mail://rules[0]/enabled`) |
+| `make` | Create a new object in a collection (e.g., new rule, signature) |
+| `move` | Move an object to a different collection (e.g., message to mailbox) |
+| `delete` | Delete an object (messages move to trash, mailbox deletion blocked) |
 
 ### Resources
 
-- **App Properties** (`mail://properties`) - Mail.app version, frontmost status, etc.
-- **Rules** (`mail://rules`) - All mail filtering rules
-- **Signatures** (`mail://signatures`) - All email signatures
-- **Unified Mailboxes** (`unified://inbox`, `unified://sent`, etc.) - Cross-account mailboxes
-- **Accounts** (`mailaccount://...`) - Hierarchical account/mailbox browsing
-- **Mailbox Messages** (`mailbox://Account/Path?limit=N&offset=N&unread=true`) - Browse messages
+Browse Mail.app data via `mail://` URIs:
 
-#### Browsing Messages via Resources
+| Resource | Description |
+|----------|-------------|
+| `mail://inbox` | Combined inbox from all accounts |
+| `mail://sent` | Combined sent from all accounts |
+| `mail://drafts` | Combined drafts from all accounts |
+| `mail://trash` | Combined trash from all accounts |
+| `mail://junk` | Combined junk/spam from all accounts |
+| `mail://outbox` | Messages waiting to be sent |
+| `mail://accounts` | Mail accounts |
+| `mail://rules` | Mail filtering rules |
+| `mail://signatures` | Email signatures |
+| `mail://settings` | Mail.app preferences |
 
-The recommended way to work with messages is through resource browsing:
+### URI Addressing
+
+Navigate the schema using path segments:
 
 ```
-mailbox://Account/INBOX                    # Mailbox info and children
-mailbox://Account/INBOX?limit=20           # First 20 messages
-mailbox://Account/INBOX?limit=20&offset=20 # Next 20 messages (pagination)
-mailbox://Account/INBOX?unread=true        # Unread messages only
+mail://accounts[0]                    # First account (by index)
+mail://accounts/iCloud                # Account by name
+mail://accounts[0]/mailboxes/INBOX    # Mailbox by name
+mail://accounts[0]/inbox/messages[0]  # First message (by index)
+mail://inbox/messages/12345           # Message by ID
+mail://rules/My%20Rule                # Rule by name (URL-encoded)
 ```
 
-Each message in the listing includes a stable `message://` URL that can be used with tools like `get_message`, `mark_read`, etc.
+### Query Parameters
 
-#### Message URL Lookup
+Filter, sort, and paginate collections:
 
-The `message://` URLs returned from resources use the RFC 2822 Message-ID for stability. Message lookup is best-effort: it checks the cache and inbox quickly, but may return null if the message has moved to an unusual location. For reliable access, browse via `mailbox://` resources first.
+```
+# Filters
+?readStatus=false                # Exact match
+?unreadCount.gt=0               # Greater than
+?messageSize.lt=1000000         # Less than
+?subject.contains=urgent        # Contains substring
+?name.startsWith=Project        # Starts with
+
+# Sorting
+?sort=name.asc                  # Ascending
+?sort=dateReceived.desc         # Descending
+
+# Pagination
+?limit=10&offset=20             # Page through results
+
+# Expand lazy properties
+?expand=content                 # Include message body
+?expand=content,attachments     # Multiple expansions
+
+# Combined
+?readStatus=false&sort=dateReceived.desc&limit=10
+```
 
 ## Installation
 
-### Claude Desktop (auto-rebuild on connect)
+### Build
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "apple-mail": {
-      "command": "make",
-      "args": ["-C", "/path/to/apple-mail-jxa-mcp", "-s", "run"]
-    }
-  }
-}
+```bash
+npm install
+npm run build
 ```
 
-This automatically rebuilds from source if any files changed, then runs the server.
+### Claude Desktop
 
-### Claude Desktop (pre-built)
-
-If you prefer not to require `make`:
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
@@ -98,8 +105,6 @@ If you prefer not to require `make`:
 }
 ```
 
-Run `make` once to generate `dist/mail.js`.
-
 ### Claude Code
 
 Add to your project's `.mcp.json`:
@@ -108,8 +113,8 @@ Add to your project's `.mcp.json`:
 {
   "mcpServers": {
     "apple-mail": {
-      "command": "make",
-      "args": ["-C", "/path/to/apple-mail-jxa-mcp", "-s", "run"]
+      "command": "osascript",
+      "args": ["-l", "JavaScript", "/path/to/apple-mail-jxa-mcp/dist/mail.js"]
     }
   }
 }
@@ -125,34 +130,72 @@ Add to your project's `.mcp.json`:
 
 ```
 src/
-  framework.js      # MCP protocol handler, NSRunLoop I/O
-  cache.js          # SQLite message location cache
-  facades.js        # Mailbox/Message wrapper objects
-  mail.js           # Mail.app singleton interface
-  resources.js      # MCP resource handlers
-  tools-messages.js # Message operation tools
-  tools-crud.js     # Attachment/rule/signature tools
-  main.js           # Entry point
+  framework/
+    delegate.ts       # Backend abstraction interface
+    schematic.ts      # Proto builders (collection, lazy, computed, etc.)
+    specifier.ts      # Navigation proxy connecting protos to delegates
+    uri.ts            # URI parsing and resolution
+    filter-query.ts   # Query parameter handling
+  core/
+    mcp-server.ts     # MCP protocol handler
+  types/
+    jxa.d.ts          # JXA type definitions
+    mcp.d.ts          # MCP type definitions
+  jxa-delegate.ts     # JXA backend implementation
+  jxa-polyfill.ts     # URL polyfill for JXA environment
+  mock-delegate.ts    # Mock backend for testing
+  mail.ts             # Mail.app schema definition
+  resources.ts        # MCP resource handlers
+  tools.ts            # MCP tool handlers
+  main.ts             # Entry point
+
+tests/
+  src/
+    test-framework.ts     # Core framework tests
+    test-framework-jxa.ts # JXA environment tests
+    test-operations.ts    # Mutation operation tests
+    test-utils.ts         # Assertion helpers
 
 dist/
-  mail.js           # Concatenated output (built by make)
-
-Makefile            # Build system
+  mail.js             # Built output (TypeScript compiled + bundled)
 ```
-
-Source files are concatenated with 400-line padding for debuggable line numbers:
-- Error at line 1847 → file index 4 (1847÷400), line 247 in that file (1847%400)
-- Run `make check` to see the mapping
 
 ## Building
 
 ```bash
-make          # Build dist/mail.js
-make run      # Build and run
-make clean    # Remove dist/
-make check    # Show line number mapping
-make reset    # Kill running server (for testing)
+npm run build         # Build dist/mail.js
+npm start             # Build and run server
 ```
+
+## Testing
+
+Tests run against mock data (no Mail.app required):
+
+```bash
+npm test              # Run all tests (Node + JXA)
+npm run test:node     # Framework tests in Node.js
+npm run test:jxa      # JXA environment tests via osascript
+npm run test:integration  # MCP server integration tests
+```
+
+## Architecture
+
+```
+Claude <-> stdio <-> JXA MCP Server <-> Application('Mail')
+                     (single process)
+```
+
+The framework uses a layered architecture:
+
+1. **Proto definitions** (`mail.ts`) - Schema describing Mail.app structure using composable builders
+2. **Specifier proxy** - Navigation layer that interprets proto definitions
+3. **Delegate interface** - Backend abstraction (JXA for production, Mock for testing)
+4. **URI resolution** - Parse `mail://` URIs into navigation paths
+
+Key patterns:
+- **Proto builders**: `collection()`, `lazy()`, `computed()`, `withSet()`, `withAlias()`
+- **Swappable backends**: Same schema works with JXA or mock data
+- **URI-driven API**: All operations use consistent `mail://` addressing
 
 ## Usage Examples
 
@@ -163,34 +206,6 @@ Once configured, you can ask Claude things like:
 - "Move that email to my Archive folder"
 - "Create a rule to mark emails from [sender] as read"
 - "What signatures do I have configured?"
-
-## Testing
-
-Run the test suite (requires Node.js):
-
-```bash
-node test-mail.js
-```
-
-The test suite validates:
-- MCP protocol compliance
-- Tool and resource listings
-- Resource reading (properties, rules, signatures, unified mailboxes)
-- CRUD operations for rules and signatures (creates and cleans up test data)
-
-## Architecture
-
-```
-Claude <-> stdio <-> JXA MCP Server <-> Application('Mail')
-                     (single process)
-```
-
-Key implementation details:
-- NSRunLoop blocking for efficient I/O (0% CPU while idle)
-- NSFileHandle notifications for stdin
-- Native JSON.parse/stringify (no serialization layer)
-- Direct JXA automation of Mail.app
-- SQLite cache for fast message lookups
 
 ## License
 
