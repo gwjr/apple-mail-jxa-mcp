@@ -512,25 +512,21 @@ function withCreate<Item extends Proto>(itemProto: Item, handler?: CreateHandler
 // JXA Name Mapping
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Store jxaName mapping (proto -> jxaName)
-const jxaNameMap = new WeakMap<object, string>();
-
 type JxaNamedProto<P> = P & { readonly [JxaNameBrand]: string };
 
 function withJxaName<P extends object>(proto: P, jxaName: string): JxaNamedProto<P> {
-  // Create a new object that inherits from proto
-  const named = Object.assign(Object.create(null), proto) as JxaNamedProto<P>;
-  jxaNameMap.set(named, jxaName);
+  // Create a new object with navigationStrategy that uses the jxaName
+  const named = {
+    ...proto,
+    navigationStrategy: ((delegate: Delegate, schemaKey: string) =>
+      delegate.propWithAlias(jxaName, schemaKey)) as NavigationStrategy,
+  } as unknown as JxaNamedProto<P>;
   // Also copy over the item proto if this is a collection
   const itemProto = collectionItemProtos.get(proto);
   if (itemProto) {
     collectionItemProtos.set(named, itemProto);
   }
   return named;
-}
-
-function getJxaName(proto: object): string | undefined {
-  return jxaNameMap.get(proto);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -380,24 +380,18 @@ function withCreate(itemProto, handler) {
         };
     };
 }
-// ─────────────────────────────────────────────────────────────────────────────
-// JXA Name Mapping
-// ─────────────────────────────────────────────────────────────────────────────
-// Store jxaName mapping (proto -> jxaName)
-const jxaNameMap = new WeakMap();
 function withJxaName(proto, jxaName) {
-    // Create a new object that inherits from proto
-    const named = Object.assign(Object.create(null), proto);
-    jxaNameMap.set(named, jxaName);
+    // Create a new object with navigationStrategy that uses the jxaName
+    const named = {
+        ...proto,
+        navigationStrategy: ((delegate, schemaKey) => delegate.propWithAlias(jxaName, schemaKey)),
+    };
     // Also copy over the item proto if this is a collection
     const itemProto = collectionItemProtos.get(proto);
     if (itemProto) {
         collectionItemProtos.set(named, itemProto);
     }
     return named;
-}
-function getJxaName(proto) {
-    return jxaNameMap.get(proto);
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Computed Properties
@@ -587,28 +581,11 @@ function createSpecifier(delegate, proto) {
                 if (typeof value === 'function') {
                     return value.bind(receiver);
                 }
-                if (typeof value === 'object' && value !== null) {
-                    // Check for namespace navigation - use navigationStrategy
-                    const innerNamespaceProto = getNamespaceNav(value);
-                    if (innerNamespaceProto) {
-                        return createSpecifier(t._delegate.namespace(prop), value);
-                    }
-                    // Check for computed navigation - use _computedNav data
-                    const navInfo = getComputedNav(value);
-                    if (navInfo) {
-                        const targetDelegate = navInfo.navigate(t._delegate);
-                        return createSpecifier(targetDelegate, value);
-                    }
-                    // Normal property navigation - use jxaName if defined, otherwise use the property name
-                    const jxaName = getJxaName(value);
-                    const schemaName = prop;
-                    if (jxaName) {
-                        // Navigate with JXA name but track schema name for URI
-                        return createSpecifier(t._delegate.propWithAlias(jxaName, schemaName), value);
-                    }
-                    else {
-                        return createSpecifier(t._delegate.prop(schemaName), value);
-                    }
+                // Navigate to child proto using navigationStrategy (or default)
+                if (typeof value === 'object' && value !== null && 'resolutionStrategy' in value) {
+                    const nav = value.navigationStrategy || defaultNavigation;
+                    const childDelegate = nav(t._delegate, prop, value);
+                    return createSpecifier(childDelegate, value);
                 }
                 return value;
             }
@@ -922,6 +899,7 @@ function resolveURI(uri) {
         const lookupProto = getNamespaceNav(proto) || proto;
         const childProto = lookupProto[head];
         // Check for namespaceNav first (virtual grouping, no JXA navigation)
+        // Namespaces need special handling: no qualifiers allowed, keep the navProto
         const namespaceTargetProto = childProto ? getNamespaceNav(childProto) : undefined;
         if (namespaceTargetProto) {
             delegate = delegate.namespace(head);
@@ -933,12 +911,13 @@ function resolveURI(uri) {
             }
             continue;
         }
-        // Check for computedNav
-        const navInfo = childProto ? getComputedNav(childProto) : undefined;
-        if (navInfo) {
-            // Apply the computed navigation
-            delegate = navInfo.navigate(delegate);
-            proto = navInfo.targetProto;
+        // Check for computedNav - need target proto for further resolution
+        const computedNavInfo = childProto ? getComputedNav(childProto) : undefined;
+        if (computedNavInfo) {
+            // Use navigationStrategy for delegate navigation
+            delegate = childProto.navigationStrategy(delegate, head, childProto);
+            // But use the target proto for further resolution
+            proto = computedNavInfo.targetProto;
             // Handle qualifiers on the target if any
             if (qualifier) {
                 const itemProto = getItemProto(proto);
@@ -964,9 +943,9 @@ function resolveURI(uri) {
             }
         }
         else if (childProto !== undefined && isChildProto(childProto)) {
-            // Normal property navigation - use jxaName if available
-            const jxaName = getJxaName(childProto) || head;
-            delegate = delegate.prop(jxaName);
+            // Normal property navigation - use navigationStrategy or default
+            const nav = childProto.navigationStrategy || defaultNavigation;
+            delegate = nav(delegate, head, childProto);
             proto = childProto;
             if (qualifier) {
                 const itemProto = getItemProto(proto);

@@ -390,6 +390,7 @@ function resolveURI(uri: string): Result<Res<any>> {
     const childProto = lookupProto[head];
 
     // Check for namespaceNav first (virtual grouping, no JXA navigation)
+    // Namespaces need special handling: no qualifiers allowed, keep the navProto
     const namespaceTargetProto = childProto ? getNamespaceNav(childProto) : undefined;
     if (namespaceTargetProto) {
       delegate = delegate.namespace(head);
@@ -402,12 +403,13 @@ function resolveURI(uri: string): Result<Res<any>> {
       continue;
     }
 
-    // Check for computedNav
-    const navInfo = childProto ? getComputedNav(childProto) : undefined;
-    if (navInfo) {
-      // Apply the computed navigation
-      delegate = navInfo.navigate(delegate);
-      proto = navInfo.targetProto;
+    // Check for computedNav - need target proto for further resolution
+    const computedNavInfo = childProto ? getComputedNav(childProto) : undefined;
+    if (computedNavInfo) {
+      // Use navigationStrategy for delegate navigation
+      delegate = childProto.navigationStrategy(delegate, head, childProto);
+      // But use the target proto for further resolution
+      proto = computedNavInfo.targetProto;
 
       // Handle qualifiers on the target if any
       if (qualifier) {
@@ -432,9 +434,9 @@ function resolveURI(uri: string): Result<Res<any>> {
         }
       }
     } else if (childProto !== undefined && isChildProto(childProto)) {
-      // Normal property navigation - use jxaName if available
-      const jxaName = getJxaName(childProto) || head;
-      delegate = delegate.prop(jxaName);
+      // Normal property navigation - use navigationStrategy or default
+      const nav = childProto.navigationStrategy || defaultNavigation;
+      delegate = nav(delegate, head, childProto);
       proto = childProto;
 
       if (qualifier) {

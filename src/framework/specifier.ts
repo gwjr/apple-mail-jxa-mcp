@@ -67,27 +67,11 @@ function createSpecifier<P extends object>(delegate: Delegate, proto: P): Specif
         if (typeof value === 'function') {
           return value.bind(receiver);
         }
-        if (typeof value === 'object' && value !== null) {
-          // Check for namespace navigation - use navigationStrategy
-          const innerNamespaceProto = getNamespaceNav(value);
-          if (innerNamespaceProto) {
-            return createSpecifier(t._delegate.namespace(prop as string), value);
-          }
-          // Check for computed navigation - use _computedNav data
-          const navInfo = getComputedNav(value);
-          if (navInfo) {
-            const targetDelegate = navInfo.navigate(t._delegate);
-            return createSpecifier(targetDelegate, value);
-          }
-          // Normal property navigation - use jxaName if defined, otherwise use the property name
-          const jxaName = getJxaName(value);
-          const schemaName = prop as string;
-          if (jxaName) {
-            // Navigate with JXA name but track schema name for URI
-            return createSpecifier(t._delegate.propWithAlias(jxaName, schemaName), value);
-          } else {
-            return createSpecifier(t._delegate.prop(schemaName), value);
-          }
+        // Navigate to child proto using navigationStrategy (or default)
+        if (typeof value === 'object' && value !== null && 'resolutionStrategy' in value) {
+          const nav = value.navigationStrategy || defaultNavigation;
+          const childDelegate = nav(t._delegate, prop as string, value);
+          return createSpecifier(childDelegate, value);
         }
         return value;
       }
