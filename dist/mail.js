@@ -1237,6 +1237,29 @@ function sortToSortSpec(sort) {
 function applyQueryQualifier(delegate, proto, qualifier) {
     let newDelegate = delegate;
     if (qualifier.filters.length > 0) {
+        // Validate filter fields against the item proto
+        const itemProto = proto._itemProto;
+        if (itemProto) {
+            const validFields = Object.keys(itemProto).filter(k => !isBaseKey(k));
+            for (const filter of qualifier.filters) {
+                if (!validFields.includes(filter.field)) {
+                    // Special case for 'whose' - provide helpful guidance
+                    if (filter.field === 'whose') {
+                        return {
+                            ok: false,
+                            error: `Invalid filter syntax: 'whose=${filter.value}'. ` +
+                                `Use the format '?field.operator=value' instead. ` +
+                                `For example: '?subject.contains=ACR'. ` +
+                                `Valid fields: ${validFields.join(', ')}`
+                        };
+                    }
+                    return {
+                        ok: false,
+                        error: `Unknown filter field '${filter.field}'. Valid fields: ${validFields.join(', ')}`
+                    };
+                }
+            }
+        }
         const whoseFilter = filtersToWhoseFilter(qualifier.filters);
         newDelegate = newDelegate.withFilter(whoseFilter);
     }
@@ -1254,7 +1277,7 @@ function applyQueryQualifier(delegate, proto, qualifier) {
         newDelegate = newDelegate.withExpand(qualifier.expand);
     }
     const queryableProto = withQuery(proto);
-    return { delegate: newDelegate, proto: queryableProto };
+    return { ok: true, value: { delegate: newDelegate, proto: queryableProto } };
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // URI Resolution
@@ -1317,8 +1340,10 @@ function resolveURI(uri) {
                 }
                 else if (qualifier.kind === 'query') {
                     const applied = applyQueryQualifier(delegate, proto, qualifier);
-                    delegate = applied.delegate;
-                    proto = applied.proto;
+                    if (!applied.ok)
+                        return applied;
+                    delegate = applied.value.delegate;
+                    proto = applied.value.proto;
                 }
             }
         }
@@ -1345,8 +1370,10 @@ function resolveURI(uri) {
                 }
                 else if (qualifier.kind === 'query') {
                     const applied = applyQueryQualifier(delegate, proto, qualifier);
-                    delegate = applied.delegate;
-                    proto = applied.proto;
+                    if (!applied.ok)
+                        return applied;
+                    delegate = applied.value.delegate;
+                    proto = applied.value.proto;
                 }
             }
         }

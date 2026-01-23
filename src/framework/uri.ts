@@ -331,10 +331,34 @@ function applyQueryQualifier(
   delegate: Delegate,
   proto: any,
   qualifier: QueryQualifier
-): { delegate: Delegate; proto: any } {
+): Result<{ delegate: Delegate; proto: any }> {
   let newDelegate = delegate;
 
   if (qualifier.filters.length > 0) {
+    // Validate filter fields against the item proto
+    const itemProto = (proto as any)._itemProto;
+    if (itemProto) {
+      const validFields = Object.keys(itemProto).filter(k => !isBaseKey(k));
+      for (const filter of qualifier.filters) {
+        if (!validFields.includes(filter.field)) {
+          // Special case for 'whose' - provide helpful guidance
+          if (filter.field === 'whose') {
+            return {
+              ok: false,
+              error: `Invalid filter syntax: 'whose=${filter.value}'. ` +
+                `Use the format '?field.operator=value' instead. ` +
+                `For example: '?subject.contains=ACR'. ` +
+                `Valid fields: ${validFields.join(', ')}`
+            };
+          }
+          return {
+            ok: false,
+            error: `Unknown filter field '${filter.field}'. Valid fields: ${validFields.join(', ')}`
+          };
+        }
+      }
+    }
+
     const whoseFilter = filtersToWhoseFilter(qualifier.filters);
     newDelegate = newDelegate.withFilter(whoseFilter);
   }
@@ -357,7 +381,7 @@ function applyQueryQualifier(
 
   const queryableProto = withQuery(proto);
 
-  return { delegate: newDelegate, proto: queryableProto };
+  return { ok: true, value: { delegate: newDelegate, proto: queryableProto } };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -429,8 +453,9 @@ function resolveURI(uri: string): Result<Res<any>> {
           proto = itemProto || baseScalar;
         } else if (qualifier.kind === 'query') {
           const applied = applyQueryQualifier(delegate, proto, qualifier);
-          delegate = applied.delegate;
-          proto = applied.proto;
+          if (!applied.ok) return applied;
+          delegate = applied.value.delegate;
+          proto = applied.value.proto;
         }
       }
     } else if (childProto !== undefined && isChildProto(childProto)) {
@@ -456,8 +481,9 @@ function resolveURI(uri: string): Result<Res<any>> {
           proto = itemProto || baseScalar;
         } else if (qualifier.kind === 'query') {
           const applied = applyQueryQualifier(delegate, proto, qualifier);
-          delegate = applied.delegate;
-          proto = applied.proto;
+          if (!applied.ok) return applied;
+          delegate = applied.value.delegate;
+          proto = applied.value.proto;
         }
       }
     } else if (hasByName(proto) || hasById(proto)) {
@@ -472,7 +498,7 @@ function resolveURI(uri: string): Result<Res<any>> {
       }
 
       if (qualifier && qualifier.kind === 'index') {
-        const subProto = (proto as any)[head];
+        const subProto = proto[head];
         if (subProto && isChildProto(subProto) && hasByIndex(subProto)) {
           delegate = delegate.prop(head).byIndex(qualifier.value);
           proto = (subProto as any)._itemProto || baseScalar;

@@ -267,6 +267,22 @@ function testURIResolution() {
   // Invalid path
   const invalid = resolveURI('mail://nonexistent');
   assertError(invalid, 'Reject unknown path');
+
+  // Invalid filter field - special case for 'whose'
+  const whoseFilter = resolveURI('mail://inbox/messages?whose=subject contains ACR');
+  assertError(whoseFilter, 'Reject whose as filter field');
+  if (!whoseFilter.ok) {
+    assert(whoseFilter.error.includes('Invalid filter syntax'), 'Error mentions invalid syntax');
+    assert(whoseFilter.error.includes('subject.contains'), 'Error suggests correct format');
+  }
+
+  // Invalid filter field - unknown field
+  const unknownField = resolveURI('mail://inbox/messages?foobar=test');
+  assertError(unknownField, 'Reject unknown filter field');
+  if (!unknownField.ok) {
+    assert(unknownField.error.includes("Unknown filter field 'foobar'"), 'Error mentions unknown field');
+    assert(unknownField.error.includes('Valid fields:'), 'Error lists valid fields');
+  }
 }
 
 function testResProxy() {

@@ -9,7 +9,10 @@
     "test": "npm run test:node && npm run test:jxa",
     "test:node": "tsc -p tsconfig.test-node.json && node tests/framework.test.js",
     "test:jxa": "tsc -p tsconfig.test-jxa.json && osascript -l JavaScript tests/framework.jxa.test.js",
-    "test:mcp": "npm run build && node tests/mcp-server.js"
+    "test:mcp": "npm run build && node tests/mcp-server.js",
+    "test:integration": "npm run build && npm run test:resources && npm run test:tools",
+    "test:resources": "node tests/resource-read.test.js",
+    "test:tools": "node tests/tools.test.js"
   },
   "devDependencies": {
     "typescript": "^5.3.0"
