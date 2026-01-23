@@ -203,7 +203,7 @@ const MailboxProto: MailboxProtoType = {
 };
 
 // Now fix up the self-reference in MailboxesProto
-collectionItemProtos.set(MailboxesProto, MailboxProto);
+(MailboxesProto as any)._itemProto = MailboxProto;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto

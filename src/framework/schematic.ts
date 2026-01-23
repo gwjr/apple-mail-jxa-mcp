@@ -32,11 +32,7 @@ declare const ScalarBrand: unique symbol;
 declare const CollectionBrand: unique symbol;
 declare const ComputedBrand: unique symbol;
 declare const LazyBrand: unique symbol;
-declare const EagerBrand: unique symbol;
 declare const SettableBrand: unique symbol;
-declare const ByIndexBrand: unique symbol;
-declare const ByNameBrand: unique symbol;
-declare const ByIdBrand: unique symbol;
 declare const JxaNameBrand: unique symbol;
 declare const MoveableBrand: unique symbol;
 declare const DeleteableBrand: unique symbol;
@@ -48,16 +44,24 @@ declare const ComputedNavBrand: unique symbol;
 // Resolution & Navigation Strategies
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Shape of a Specifier proxy for strategy parameter typing
+interface SpecifierShape {
+  _delegate: Delegate;
+  resolve?(): unknown;
+  [key: string | symbol]: unknown;
+}
+
 // Resolution strategy: how to get the value when resolve() is called directly
 // Returns unknown because return type varies by proto kind:
 // - Scalar: T (the primitive value)
 // - Collection: CollectionResolveResult (array of URIs)
 // - Object: { [key]: resolved child value }
-type ResolutionStrategy = (delegate: Delegate, proto: any, res: any) => unknown;
+// Note: proto is 'any' because strategy implementations need dynamic property access
+type ResolutionStrategy = (delegate: Delegate, proto: any, res: SpecifierShape) => unknown;
 
 // How to resolve when my parent is resolving me as one of its properties.
 // By default, same as resolutionStrategy (eager). Lazy protos override to return Specifier.
-type ResolveFromParentStrategy = (delegate: Delegate, proto: any, res: any) => unknown;
+type ResolveFromParentStrategy = (delegate: Delegate, proto: any, res: SpecifierShape) => unknown;
 
 // Navigation strategy: how to navigate to a child property
 // Returns the delegate for the child, or undefined for no navigation (namespace)
@@ -319,15 +323,6 @@ const baseObject: BaseProtoType<{ [key: string]: MCPReturnableValue }> = {
 } as BaseProtoType<{ [key: string]: MCPReturnableValue }>;
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Collection Item Proto Tracking
-// ─────────────────────────────────────────────────────────────────────────────
-
-const collectionItemProtos = new WeakMap<object, object>();
-
-function getItemProto(collectionProto: object): object | undefined {
-  return collectionItemProtos.get(collectionProto);
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Lazy Composer
@@ -342,9 +337,9 @@ function lazy<P extends BaseProtoType<MCPReturnableValue>>(proto: P): P & { read
   } as unknown as P & { readonly [LazyBrand]: true };
 
   // Copy over collection item proto if this is a collection
-  const itemProto = collectionItemProtos.get(proto);
+  const itemProto = (proto as any)._itemProto;
   if (itemProto) {
-    collectionItemProtos.set(lazyProto, itemProto);
+    (lazyProto as any)._itemProto = itemProto;
   }
   return lazyProto;
 }
@@ -407,7 +402,7 @@ function collection<Item extends Proto<any>, const K extends readonly Accessor[]
     };
   }
 
-  collectionItemProtos.set(proto, itemProto);
+  proto._itemProto = itemProto;
   return proto as BaseCollection<Item> & AccessorsFor<K, Item>;
 }
 
@@ -522,9 +517,9 @@ function withJxaName<P extends object>(proto: P, jxaName: string): JxaNamedProto
       delegate.propWithAlias(jxaName, schemaKey)) as NavigationStrategy,
   } as unknown as JxaNamedProto<P>;
   // Also copy over the item proto if this is a collection
-  const itemProto = collectionItemProtos.get(proto);
+  const itemProto = (proto as any)._itemProto;
   if (itemProto) {
-    collectionItemProtos.set(named, itemProto);
+    (named as any)._itemProto = itemProto;
   }
   return named;
 }
@@ -587,9 +582,9 @@ function computedNav<P extends BaseProtoType<MCPReturnableValue>>(
   } as unknown as ComputedNavProto<P>;
 
   // Copy collection item proto if target is a collection
-  const itemProto = collectionItemProtos.get(targetProto);
+  const itemProto = (targetProto as any)._itemProto;
   if (itemProto) {
-    collectionItemProtos.set(navProto, itemProto);
+    (navProto as any)._itemProto = itemProto;
   }
 
   return navProto;
@@ -651,7 +646,7 @@ function getNamespaceNav(proto: object): object | undefined {
 // Query Composer
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface QueryableProto<T> extends BaseProtoType<MCPReturnableValue> {
+interface QueryableProto<T extends MCPReturnableValue> extends BaseProtoType<MCPReturnableValue> {
   whose(filter: WhoseFilter): Specifier<QueryableProto<T> & BaseProtoType<MCPReturnableValue>>;
   sortBy(spec: SortSpec<T>): Specifier<QueryableProto<T> & BaseProtoType<MCPReturnableValue>>;
   paginate(spec: PaginationSpec): Specifier<QueryableProto<T> & BaseProtoType<MCPReturnableValue>>;
@@ -659,7 +654,7 @@ interface QueryableProto<T> extends BaseProtoType<MCPReturnableValue> {
 }
 
 function withQuery<P extends BaseProtoType<MCPReturnableValue>>(proto: P): P & QueryableProto<any> {
-  const itemProto = collectionItemProtos.get(proto);
+  const itemProto = (proto as any)._itemProto;
 
   const queryStrategy: ResolutionStrategy = (delegate) => {
     const raw = delegate._jxa();
@@ -719,7 +714,7 @@ function withQuery<P extends BaseProtoType<MCPReturnableValue>>(proto: P): P & Q
 
   // Copy collection item proto
   if (itemProto) {
-    collectionItemProtos.set(queryProto, itemProto);
+    (queryProto as any)._itemProto = itemProto;
   }
 
   return queryProto;

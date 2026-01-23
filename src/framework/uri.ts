@@ -413,7 +413,7 @@ function resolveURI(uri: string): Result<Res<any>> {
 
       // Handle qualifiers on the target if any
       if (qualifier) {
-        const itemProto = getItemProto(proto);
+        const itemProto = (proto as any)._itemProto;
 
         if (qualifier.kind === 'index') {
           if (!hasByIndex(proto)) {
@@ -440,7 +440,7 @@ function resolveURI(uri: string): Result<Res<any>> {
       proto = childProto;
 
       if (qualifier) {
-        const itemProto = getItemProto(proto);
+        const itemProto = (proto as any)._itemProto;
 
         if (qualifier.kind === 'index') {
           if (!hasByIndex(proto)) {
@@ -461,7 +461,7 @@ function resolveURI(uri: string): Result<Res<any>> {
         }
       }
     } else if (hasByName(proto) || hasById(proto)) {
-      const itemProto = getItemProto(proto);
+      const itemProto = (proto as any)._itemProto;
 
       if (hasByName(proto)) {
         delegate = delegate.byName(head);
@@ -472,10 +472,10 @@ function resolveURI(uri: string): Result<Res<any>> {
       }
 
       if (qualifier && qualifier.kind === 'index') {
-        const subProto = proto[head];
+        const subProto = (proto as any)[head];
         if (subProto && isChildProto(subProto) && hasByIndex(subProto)) {
           delegate = delegate.prop(head).byIndex(qualifier.value);
-          proto = getItemProto(subProto) || baseScalar;
+          proto = (subProto as any)._itemProto || baseScalar;
         }
       }
     } else {

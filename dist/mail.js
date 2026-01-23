@@ -648,13 +648,6 @@ const baseObject = {
     exists: existsImpl,
 };
 // ─────────────────────────────────────────────────────────────────────────────
-// Collection Item Proto Tracking
-// ─────────────────────────────────────────────────────────────────────────────
-const collectionItemProtos = new WeakMap();
-function getItemProto(collectionProto) {
-    return collectionItemProtos.get(collectionProto);
-}
-// ─────────────────────────────────────────────────────────────────────────────
 // Lazy Composer
 // ─────────────────────────────────────────────────────────────────────────────
 // lazy: marks a property as "lazy" - when resolved as part of a parent object,
@@ -665,9 +658,9 @@ function lazy(proto) {
         resolveFromParent: LazyResolutionFromParentStrategy,
     };
     // Copy over collection item proto if this is a collection
-    const itemProto = collectionItemProtos.get(proto);
+    const itemProto = proto._itemProto;
     if (itemProto) {
-        collectionItemProtos.set(lazyProto, itemProto);
+        lazyProto._itemProto = itemProto;
     }
     return lazyProto;
 }
@@ -702,7 +695,7 @@ function collection(itemProto, by) {
             return createSpecifier(this._delegate.byId(id), itemProto);
         };
     }
-    collectionItemProtos.set(proto, itemProto);
+    proto._itemProto = itemProto;
     return proto;
 }
 // withSet works on scalar protos - adds a set() method for the scalar's value type
@@ -774,9 +767,9 @@ function withJxaName(proto, jxaName) {
         navigationStrategy: ((delegate, schemaKey) => delegate.propWithAlias(jxaName, schemaKey)),
     };
     // Also copy over the item proto if this is a collection
-    const itemProto = collectionItemProtos.get(proto);
+    const itemProto = proto._itemProto;
     if (itemProto) {
-        collectionItemProtos.set(named, itemProto);
+        named._itemProto = itemProto;
     }
     return named;
 }
@@ -819,9 +812,9 @@ function computedNav(navigate, targetProto) {
         },
     };
     // Copy collection item proto if target is a collection
-    const itemProto = collectionItemProtos.get(targetProto);
+    const itemProto = targetProto._itemProto;
     if (itemProto) {
-        collectionItemProtos.set(navProto, itemProto);
+        navProto._itemProto = itemProto;
     }
     return navProto;
 }
@@ -863,7 +856,7 @@ function getNamespaceNav(proto) {
     return proto._namespaceTarget;
 }
 function withQuery(proto) {
-    const itemProto = collectionItemProtos.get(proto);
+    const itemProto = proto._itemProto;
     const queryStrategy = (delegate) => {
         const raw = delegate._jxa();
         if (!Array.isArray(raw)) {
@@ -916,7 +909,7 @@ function withQuery(proto) {
     };
     // Copy collection item proto
     if (itemProto) {
-        collectionItemProtos.set(queryProto, itemProto);
+        queryProto._itemProto = itemProto;
     }
     return queryProto;
 }
@@ -1307,7 +1300,7 @@ function resolveURI(uri) {
             proto = computedNavInfo.targetProto;
             // Handle qualifiers on the target if any
             if (qualifier) {
-                const itemProto = getItemProto(proto);
+                const itemProto = proto._itemProto;
                 if (qualifier.kind === 'index') {
                     if (!hasByIndex(proto)) {
                         return { ok: false, error: `computedNav target '${head}' does not support index addressing` };
@@ -1335,7 +1328,7 @@ function resolveURI(uri) {
             delegate = nav(delegate, head, childProto);
             proto = childProto;
             if (qualifier) {
-                const itemProto = getItemProto(proto);
+                const itemProto = proto._itemProto;
                 if (qualifier.kind === 'index') {
                     if (!hasByIndex(proto)) {
                         return { ok: false, error: `Collection '${head}' does not support index addressing` };
@@ -1358,7 +1351,7 @@ function resolveURI(uri) {
             }
         }
         else if (hasByName(proto) || hasById(proto)) {
-            const itemProto = getItemProto(proto);
+            const itemProto = proto._itemProto;
             if (hasByName(proto)) {
                 delegate = delegate.byName(head);
                 proto = itemProto || baseScalar;
@@ -1371,7 +1364,7 @@ function resolveURI(uri) {
                 const subProto = proto[head];
                 if (subProto && isChildProto(subProto) && hasByIndex(subProto)) {
                     delegate = delegate.prop(head).byIndex(qualifier.value);
-                    proto = getItemProto(subProto) || baseScalar;
+                    proto = subProto._itemProto || baseScalar;
                 }
             }
         }
@@ -1767,7 +1760,7 @@ const MailboxProto = {
     mailboxes: lazy(MailboxesProto),
 };
 // Now fix up the self-reference in MailboxesProto
-collectionItemProtos.set(MailboxesProto, MailboxProto);
+MailboxesProto._itemProto = MailboxProto;
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto
 // ─────────────────────────────────────────────────────────────────────────────
