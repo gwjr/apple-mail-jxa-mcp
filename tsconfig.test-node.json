@@ -19,7 +19,7 @@
     "src/framework/delegate.ts",
     "src/framework/filter-query.ts",
     "src/framework/schematic.ts",
-    "src/framework/res.ts",
+    "src/framework/specifier.ts",
     "src/framework/uri.ts",
     "src/framework/legacy.ts",
     "src/mock-delegate.ts",

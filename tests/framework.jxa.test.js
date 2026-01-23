@@ -192,73 +192,75 @@ function applyQueryState(items, query) {
 // The core typing system for schema definitions. Types and proto implementations
 // live together - the DSL specifies the schema by building the proto.
 // ─────────────────────────────────────────────────────────────────────────────
-// Proto Implementation Helpers
+// Strategy Constants
 // ─────────────────────────────────────────────────────────────────────────────
-// Shared implementation for base proto methods (scalar resolve)
-const _baseProtoImpl = {
-    exists() {
-        try {
-            const result = this._delegate._jxa();
-            return result !== undefined && result !== null;
-        }
-        catch {
-            return false;
-        }
-    },
-    specifier() {
-        return { uri: this._delegate.uri() };
-    },
-    resolve() {
-        return this._delegate._jxa();
-    },
-};
-// Object proto implementation - gathers properties on resolve instead of returning JXA specifier
-// Use this for complex objects (mailboxes, messages, etc.) that have child properties
-const _objectProtoImpl = {
-    resolve() {
-        // Iterate over all enumerable properties and resolve them
-        const result = {};
-        const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate', '_isLazy']);
-        for (const key of Object.keys(this)) {
-            if (baseKeys.has(key))
-                continue;
+// Base keys to skip during object property enumeration
+const BASE_KEYS = new Set(['resolve', 'exists', 'uri', '_delegate', 'resolutionStrategy', 'resolveFromParent', 'navigationStrategy']);
+function isBaseKey(key) {
+    return BASE_KEYS.has(key);
+}
+// Scalar strategy: just call _jxa() and return the raw value
+const scalarStrategy = (delegate) => delegate._jxa();
+// Object strategy: gather properties recursively
+const objectStrategy = (_delegate, proto, res) => {
+    const result = {};
+    // Get the target proto for property lookup (handles namespace case)
+    const targetProto = proto._namespaceTarget || proto;
+    for (const key of Object.keys(targetProto)) {
+        if (isBaseKey(key))
+            continue;
+        const childProto = targetProto[key];
+        if (childProto && typeof childProto === 'object' && 'resolutionStrategy' in childProto) {
             try {
-                const propRes = this[key];
-                if (propRes && typeof propRes === 'object' && '_delegate' in propRes) {
-                    // It's a Res - check if it's lazy (should return specifier instead of value)
-                    if (propRes._isLazy) {
-                        result[key] = propRes.specifier();
+                // Access the child through the Res proxy to get proper navigation
+                const childRes = res[key];
+                if (childRes && typeof childRes === 'object' && '_delegate' in childRes) {
+                    // Use resolveFromParent if defined, otherwise fall back to resolutionStrategy
+                    const resolveFromParent = childProto.resolveFromParent || childProto.resolutionStrategy;
+                    const childValue = resolveFromParent(childRes._delegate, childProto, childRes);
+                    if (childValue !== undefined) {
+                        result[key] = childValue;
                     }
-                    else {
-                        const resolved = propRes.resolve();
-                        if (resolved !== undefined) {
-                            result[key] = resolved;
-                        }
-                    }
-                }
-                else if (propRes !== undefined) {
-                    result[key] = propRes;
                 }
             }
             catch {
                 // Skip properties that fail to resolve
             }
         }
-        return result;
-    },
-    exists() {
-        try {
-            const result = this._delegate._jxa();
-            return result !== undefined && result !== null;
-        }
-        catch {
-            return false;
-        }
-    },
-    specifier() {
-        return { uri: this._delegate.uri() };
-    },
+    }
+    return result;
 };
+// Collection strategy: return array of URIs for each item
+const collectionStrategy = (delegate) => {
+    const raw = delegate._jxa();
+    if (!Array.isArray(raw)) {
+        throw new TypeError(`Collection expected array, got ${typeof raw}`);
+    }
+    return raw.map((_item, i) => {
+        const itemDelegate = delegate.byIndex(i);
+        return { uri: itemDelegate.uri() };
+    });
+};
+// Lazy resolution strategy: return Specifier instead of resolving eagerly
+const LazyResolutionFromParentStrategy = (delegate, proto) => {
+    return createSpecifier(delegate, proto);
+};
+// Default navigation: navigate by property name
+const defaultNavigation = (delegate, key) => delegate.prop(key);
+// Namespace navigation: add URI segment but don't navigate JXA
+const namespaceNavigation = (delegate, key) => delegate.namespace(key);
+// ─────────────────────────────────────────────────────────────────────────────
+// Common exists() implementation
+// ─────────────────────────────────────────────────────────────────────────────
+function existsImpl() {
+    try {
+        const result = this._delegate._jxa();
+        return result !== undefined && result !== null;
+    }
+    catch {
+        return false;
+    }
+}
 // Primitive validators
 const isString = (v) => {
     if (typeof v !== 'string')
@@ -307,27 +309,26 @@ function optional(validator) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Typed scalar factory with runtime validation
 function scalar(validate) {
-    return {
-        exists() {
-            try {
-                const result = this._delegate._jxa();
-                return result !== undefined && result !== null;
-            }
-            catch {
-                return false;
-            }
-        },
-        specifier() {
-            return { uri: this._delegate.uri() };
-        },
-        resolve() {
-            const raw = this._delegate._jxa();
-            return validate(raw);
-        },
+    const validatingStrategy = (delegate) => {
+        const raw = delegate._jxa();
+        return validate(raw);
     };
+    return {
+        resolutionStrategy: validatingStrategy,
+        exists: existsImpl,
+        resolve() {
+            return validatingStrategy(this._delegate, null, null);
+        },
+    }; // Type assertion adds Proto brand
 }
 // Passthrough scalar - no validation, for untyped content
-const passthrough = scalar(isAny);
+const passthrough = {
+    resolutionStrategy: scalarStrategy,
+    exists: existsImpl,
+    resolve() {
+        return this._delegate._jxa();
+    },
+};
 // Primitive type scalars with runtime validation
 const t = {
     string: scalar(isString),
@@ -338,28 +339,13 @@ const t = {
     any: passthrough,
 };
 // Base object for complex types that need property gathering
-const baseObject = { ..._objectProtoImpl };
-// ─────────────────────────────────────────────────────────────────────────────
-// Lazy Proto Tracking
-// ─────────────────────────────────────────────────────────────────────────────
-// Track lazy protos for parent object resolution
-const lazyProtos = new WeakSet();
-// lazy: marks a property as "lazy" - when resolved as part of a parent object,
-// returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
-function lazy(proto) {
-    const lazyProto = { ...proto };
-    lazyProtos.add(lazyProto);
-    // Copy over collection item proto if this is a collection
-    // (since spread creates new object that won't be in the WeakMap)
-    const itemProto = collectionItemProtos.get(proto);
-    if (itemProto) {
-        collectionItemProtos.set(lazyProto, itemProto);
-    }
-    return lazyProto;
-}
-function isLazyProto(proto) {
-    return lazyProtos.has(proto);
-}
+const baseObject = {
+    resolutionStrategy: objectStrategy,
+    exists: existsImpl,
+    resolve() {
+        return objectStrategy(this._delegate, baseObject, this);
+    },
+};
 // ─────────────────────────────────────────────────────────────────────────────
 // Collection Item Proto Tracking
 // ─────────────────────────────────────────────────────────────────────────────
@@ -367,52 +353,62 @@ const collectionItemProtos = new WeakMap();
 function getItemProto(collectionProto) {
     return collectionItemProtos.get(collectionProto);
 }
-// Collection factory that takes accessor config
-function collection(accessors) {
-    const itemProto = accessors.byIndex || accessors.byName || accessors.byId;
+// ─────────────────────────────────────────────────────────────────────────────
+// Lazy Composer
+// ─────────────────────────────────────────────────────────────────────────────
+// lazy: marks a property as "lazy" - when resolved as part of a parent object,
+// returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
+function lazy(proto) {
+    const lazyProto = {
+        ...proto,
+        resolveFromParent: LazyResolutionFromParentStrategy,
+    };
+    // Copy over collection item proto if this is a collection
+    const itemProto = collectionItemProtos.get(proto);
+    if (itemProto) {
+        collectionItemProtos.set(lazyProto, itemProto);
+    }
+    return lazyProto;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Collection Factory
+// ─────────────────────────────────────────────────────────────────────────────
+// Accessor kinds that a collection can support
+var Accessor;
+(function (Accessor) {
+    Accessor[Accessor["Index"] = 0] = "Index";
+    Accessor[Accessor["Name"] = 1] = "Name";
+    Accessor[Accessor["Id"] = 2] = "Id";
+})(Accessor || (Accessor = {}));
+// Collection factory - accessors determined by the 'by' tuple
+function collection(itemProto, by) {
     const proto = {
-        exists() {
-            try {
-                const result = this._delegate._jxa();
-                return result !== undefined && result !== null;
-            }
-            catch {
-                return false;
-            }
-        },
-        specifier() {
-            return { uri: this._delegate.uri() };
-        },
-        // resolve() returns specifiers for each item
+        resolutionStrategy: collectionStrategy,
+        exists: existsImpl,
+        // resolve() returns URIs for each item
         resolve() {
-            const raw = this._delegate._jxa();
-            if (!Array.isArray(raw)) {
-                throw new TypeError(`Collection expected array, got ${typeof raw}`);
-            }
-            return raw.map((_item, i) => {
-                const itemDelegate = this._delegate.byIndex(i);
-                return { uri: itemDelegate.uri() };
-            });
+            return collectionStrategy(this._delegate, proto, this);
         },
     };
-    if (accessors.byIndex) {
+    if (by.includes(Accessor.Index)) {
         proto.byIndex = function (n) {
-            return createRes(this._delegate.byIndex(n), itemProto);
+            return createSpecifier(this._delegate.byIndex(n), itemProto);
         };
     }
-    if (accessors.byName) {
+    if (by.includes(Accessor.Name)) {
         proto.byName = function (name) {
-            return createRes(this._delegate.byName(name), itemProto);
+            return createSpecifier(this._delegate.byName(name), itemProto);
         };
     }
-    if (accessors.byId) {
+    if (by.includes(Accessor.Id)) {
         proto.byId = function (id) {
-            return createRes(this._delegate.byId(id), itemProto);
+            return createSpecifier(this._delegate.byId(id), itemProto);
         };
     }
     collectionItemProtos.set(proto, itemProto);
     return proto;
 }
+// withSet works on scalar protos - adds a set() method for the scalar's value type
 function withSet(proto) {
     return {
         ...proto,
@@ -498,31 +494,35 @@ function getJxaName(proto) {
 // ─────────────────────────────────────────────────────────────────────────────
 // A computed property transforms the raw value from the delegate
 function computed(transform) {
+    const computedStrategy = (delegate) => {
+        const raw = delegate._jxa();
+        return transform(raw);
+    };
     return {
+        resolutionStrategy: computedStrategy,
+        exists: existsImpl,
         resolve() {
             const raw = this._delegate._jxa();
             return transform(raw);
         },
-        exists() {
-            try {
-                this._delegate._jxa();
-                return true;
-            }
-            catch {
-                return false;
-            }
-        },
-        specifier() {
-            return { uri: this._delegate.uri() };
-        },
-    };
+    }; // Type assertion adds Proto brand
 }
-const computedNavMap = new WeakMap();
 function computedNav(navigate, targetProto) {
-    // Create a proto that has the base methods (resolve, exists, specifier) using the navigated delegate
+    // Create a strategy that navigates first, then uses target's strategy
+    const navStrategy = (delegate, proto, res) => {
+        const targetDelegate = navigate(delegate);
+        return targetProto.resolutionStrategy(targetDelegate, targetProto, res);
+    };
+    // Create a navigation strategy that applies the custom navigation
+    const navNavigation = (delegate) => navigate(delegate);
     const navProto = {
+        ...targetProto,
+        resolutionStrategy: navStrategy,
+        navigationStrategy: navNavigation,
+        _computedNav: { navigate, targetProto }, // Store for URI resolution
         resolve() {
-            return navigate(this._delegate)._jxa();
+            const targetDelegate = navigate(this._delegate);
+            return targetProto.resolutionStrategy(targetDelegate, targetProto, this);
         },
         exists() {
             try {
@@ -533,138 +533,151 @@ function computedNav(navigate, targetProto) {
                 return false;
             }
         },
-        specifier() {
-            return { uri: navigate(this._delegate).uri() };
-        },
     };
-    computedNavMap.set(navProto, { navigate, targetProto });
+    // Copy collection item proto if target is a collection
+    const itemProto = collectionItemProtos.get(targetProto);
+    if (itemProto) {
+        collectionItemProtos.set(navProto, itemProto);
+    }
     return navProto;
 }
 function getComputedNav(proto) {
-    return computedNavMap.get(proto);
+    return proto._computedNav;
 }
-const namespaceNavMap = new WeakMap();
 function namespaceNav(targetProto) {
-    // Custom resolve that gathers all properties from the target proto
-    const navProto = {
-        resolve() {
-            const result = {};
-            // Get all property names from the target proto (excluding base methods)
-            const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
-            for (const key of Object.keys(targetProto)) {
-                if (baseKeys.has(key))
-                    continue;
-                try {
-                    // Navigate to the property and resolve it
-                    const propRes = this[key];
-                    if (propRes && typeof propRes.resolve === 'function') {
-                        result[key] = propRes.resolve();
-                    }
-                }
-                catch {
-                    // Skip properties that fail to resolve
+    // Custom strategy that gathers all properties from the target proto
+    const namespaceStrategy = (delegate, proto, res) => {
+        const result = {};
+        // Get all property names from the target proto (excluding base methods)
+        for (const key of Object.keys(targetProto)) {
+            if (isBaseKey(key))
+                continue;
+            try {
+                // Navigate to the property and resolve it
+                const propRes = res[key];
+                if (propRes && typeof propRes.resolve === 'function') {
+                    result[key] = propRes.resolve();
                 }
             }
-            return result;
+            catch {
+                // Skip properties that fail to resolve
+            }
+        }
+        return result;
+    };
+    const navProto = {
+        resolutionStrategy: namespaceStrategy,
+        navigationStrategy: namespaceNavigation,
+        _namespaceTarget: targetProto, // Store for property lookup
+        resolve() {
+            return namespaceStrategy(this._delegate, navProto, this);
         },
         exists() {
             return true; // Namespaces always exist
         },
-        specifier() {
-            return { uri: this._delegate.uri() };
-        },
     };
-    namespaceNavMap.set(navProto, targetProto);
     return navProto;
 }
 function getNamespaceNav(proto) {
-    return namespaceNavMap.get(proto);
+    return proto._namespaceTarget;
 }
 function withQuery(proto) {
     const itemProto = collectionItemProtos.get(proto);
-    return {
-        ...proto,
-        resolve() {
-            const raw = this._delegate._jxa();
-            if (!Array.isArray(raw)) {
-                throw new TypeError(`Query expected array, got ${typeof raw}`);
-            }
-            const query = this._delegate.queryState();
-            let results = applyQueryState(raw, query);
-            if (query.expand && query.expand.length > 0 && itemProto) {
-                results = results.map((item, idx) => {
-                    const expanded = { ...item };
-                    for (const field of query.expand) {
-                        const fieldProto = itemProto[field];
-                        if (fieldProto && typeof fieldProto === 'object' && 'resolve' in fieldProto) {
-                            try {
-                                if (field in item && typeof item[field] === 'function') {
-                                    expanded[field] = item[field]();
-                                }
-                                else if (field in item) {
-                                    expanded[field] = item[field];
-                                }
+    const queryStrategy = (delegate) => {
+        const raw = delegate._jxa();
+        if (!Array.isArray(raw)) {
+            throw new TypeError(`Query expected array, got ${typeof raw}`);
+        }
+        const query = delegate.queryState();
+        let results = applyQueryState(raw, query);
+        if (query.expand && query.expand.length > 0 && itemProto) {
+            results = results.map((item, idx) => {
+                const expanded = { ...item };
+                for (const field of query.expand) {
+                    const fieldProto = itemProto[field];
+                    if (fieldProto && typeof fieldProto === 'object' && 'resolve' in fieldProto) {
+                        try {
+                            if (field in item && typeof item[field] === 'function') {
+                                expanded[field] = item[field]();
                             }
-                            catch {
+                            else if (field in item) {
+                                expanded[field] = item[field];
                             }
                         }
+                        catch {
+                        }
                     }
-                    return expanded;
-                });
-            }
-            return results;
+                }
+                return expanded;
+            });
+        }
+        return results;
+    };
+    const queryProto = {
+        ...proto,
+        resolutionStrategy: queryStrategy,
+        resolve() {
+            return queryStrategy(this._delegate, queryProto, this);
         },
         whose(filter) {
             const newDelegate = this._delegate.withFilter(filter);
-            return createRes(newDelegate, withQuery(proto));
+            return createSpecifier(newDelegate, withQuery(proto));
         },
         sortBy(spec) {
             const newDelegate = this._delegate.withSort(spec);
-            return createRes(newDelegate, withQuery(proto));
+            return createSpecifier(newDelegate, withQuery(proto));
         },
         paginate(spec) {
             const newDelegate = this._delegate.withPagination(spec);
-            return createRes(newDelegate, withQuery(proto));
+            return createSpecifier(newDelegate, withQuery(proto));
         },
         expand(fields) {
             const newDelegate = this._delegate.withExpand(fields);
-            return createRes(newDelegate, withQuery(proto));
+            return createSpecifier(newDelegate, withQuery(proto));
         },
     };
+    // Copy collection item proto
+    if (itemProto) {
+        collectionItemProtos.set(queryProto, itemProto);
+    }
+    return queryProto;
 }
-// ─────────────────────────────────────────────────────────────────────────────
-// Proto Guards
-// ─────────────────────────────────────────────────────────────────────────────
-function hasByIndex(proto) {
-    return 'byIndex' in proto && typeof proto.byIndex === 'function';
-}
-function hasByName(proto) {
-    return 'byName' in proto && typeof proto.byName === 'function';
-}
-function hasById(proto) {
-    return 'byId' in proto && typeof proto.byId === 'function';
-}
-function isChildProto(value) {
-    return typeof value === 'object' && value !== null && 'resolve' in value && typeof value.resolve === 'function';
-}
-// src/framework/res.ts - Res Type & Proxy
+// src/framework/specifier.ts - Specifier Type & Proxy
 //
-// The proxy wrapper that makes protos usable.
+// The proxy wrapper that makes protos usable. Specifier is the unified type
+// for all navigable references - both lazy references from collection accessors
+// and fully-resolved proxy objects.
 // ─────────────────────────────────────────────────────────────────────────────
-// Res Factory
+// Specifier Factory
 // ─────────────────────────────────────────────────────────────────────────────
-function createRes(delegate, proto) {
+function createSpecifier(delegate, proto) {
     // For namespace protos, get the target proto for property lookup
     const targetProto = getNamespaceNav(proto) || proto;
-    // Check if this proto is marked as lazy
-    const isLazy = lazyProtos.has(proto);
     const handler = {
         get(t, prop, receiver) {
             if (prop === '_delegate')
                 return t._delegate;
-            if (prop === '_isLazy')
-                return isLazy;
-            // First check the main proto for methods (resolve, exists, etc.)
+            if (prop === 'uri')
+                return t._delegate.uri();
+            // Intercept toJSON for MCP serialization
+            if (prop === 'toJSON') {
+                return () => ({ uri: t._delegate.uri().href });
+            }
+            // Intercept resolve to use the proto's resolutionStrategy
+            if (prop === 'resolve') {
+                return () => {
+                    if ('resolutionStrategy' in proto && typeof proto.resolutionStrategy === 'function') {
+                        return proto.resolutionStrategy(t._delegate, proto, receiver);
+                    }
+                    // Fallback to proto's resolve method
+                    const resolveMethod = proto.resolve;
+                    if (typeof resolveMethod === 'function') {
+                        return resolveMethod.call(receiver);
+                    }
+                    throw new Error('Proto has no resolutionStrategy or resolve method');
+                };
+            }
+            // First check the main proto for methods (exists, etc.)
             if (prop in proto) {
                 const value = proto[prop];
                 if (typeof value === 'function') {
@@ -678,26 +691,26 @@ function createRes(delegate, proto) {
                     return value.bind(receiver);
                 }
                 if (typeof value === 'object' && value !== null) {
-                    // Check for namespace navigation first
+                    // Check for namespace navigation - use navigationStrategy
                     const innerNamespaceProto = getNamespaceNav(value);
                     if (innerNamespaceProto) {
-                        return createRes(t._delegate.namespace(prop), value);
+                        return createSpecifier(t._delegate.namespace(prop), value);
                     }
-                    // Check for computed navigation
+                    // Check for computed navigation - use _computedNav data
                     const navInfo = getComputedNav(value);
                     if (navInfo) {
                         const targetDelegate = navInfo.navigate(t._delegate);
-                        return createRes(targetDelegate, navInfo.targetProto);
+                        return createSpecifier(targetDelegate, value);
                     }
                     // Normal property navigation - use jxaName if defined, otherwise use the property name
                     const jxaName = getJxaName(value);
                     const schemaName = prop;
                     if (jxaName) {
                         // Navigate with JXA name but track schema name for URI
-                        return createRes(t._delegate.propWithAlias(jxaName, schemaName), value);
+                        return createSpecifier(t._delegate.propWithAlias(jxaName, schemaName), value);
                     }
                     else {
-                        return createRes(t._delegate.prop(schemaName), value);
+                        return createSpecifier(t._delegate.prop(schemaName), value);
                     }
                 }
                 return value;
@@ -705,13 +718,13 @@ function createRes(delegate, proto) {
             return undefined;
         },
         has(t, prop) {
-            if (prop === '_delegate' || prop === '_isLazy')
+            if (prop === '_delegate' || prop === 'uri' || prop === 'toJSON')
                 return true;
             return prop in proto || prop in targetProto;
         },
         ownKeys(t) {
-            // Combine keys from proto and targetProto, plus _delegate (but not _isLazy - it's internal)
-            const keys = new Set(['_delegate']);
+            // Combine keys from proto and targetProto, plus _delegate, uri, and toJSON
+            const keys = new Set(['_delegate', 'uri', 'toJSON']);
             for (const key of Object.keys(proto))
                 keys.add(key);
             for (const key of Object.keys(targetProto))
@@ -720,7 +733,7 @@ function createRes(delegate, proto) {
         },
         getOwnPropertyDescriptor(t, prop) {
             // Make properties enumerable for Object.keys() to work
-            if (prop === '_delegate' || prop === '_isLazy' || prop in proto || prop in targetProto) {
+            if (prop === '_delegate' || prop === 'uri' || prop === 'toJSON' || prop in proto || prop in targetProto) {
                 return { enumerable: true, configurable: true };
             }
             return undefined;
@@ -787,6 +800,21 @@ function buildQueryString(query) {
         parts.push(`expand=${query.expand.join(',')}`);
     }
     return parts.join('&');
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Proto Guards (for runtime schema navigation during URI resolution)
+// ─────────────────────────────────────────────────────────────────────────────
+function hasByIndex(proto) {
+    return 'byIndex' in proto && typeof proto.byIndex === 'function';
+}
+function hasByName(proto) {
+    return 'byName' in proto && typeof proto.byName === 'function';
+}
+function hasById(proto) {
+    return 'byId' in proto && typeof proto.byId === 'function';
+}
+function isChildProto(value) {
+    return typeof value === 'object' && value !== null && 'resolve' in value && typeof value.resolve === 'function';
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // URI Lexer
@@ -1092,104 +1120,16 @@ function resolveURI(uri) {
             return { ok: false, error: `Unknown segment '${head}'. Available: ${available.join(', ')}` };
         }
     }
-    return { ok: true, value: createRes(delegate, proto) };
+    return { ok: true, value: createSpecifier(delegate, proto) };
 }
 // src/framework/legacy.ts - Backwards Compatibility Shims
 //
-// Legacy composers and factories for backwards compatibility with existing schemas.
-// New code should use the unified collection() factory instead.
+// Legacy items kept for URI resolution fallback and type aliases.
 // ─────────────────────────────────────────────────────────────────────────────
-// Legacy Scalar Aliases
+// Legacy Scalar Alias
 // ─────────────────────────────────────────────────────────────────────────────
-// Base scalar for fallback (alias for passthrough)
+// Base scalar for fallback in URI resolution (alias for passthrough)
 const baseScalar = passthrough;
-// Eager scalar (alias for passthrough - historical compatibility)
-const eagerScalar = passthrough;
-// Legacy alias for lazy()
-const specifierFor = lazy;
-// ─────────────────────────────────────────────────────────────────────────────
-// Legacy Base Collection (no accessors)
-// ─────────────────────────────────────────────────────────────────────────────
-// Base collection for use with legacy composers - returns raw array, no accessors
-const baseCollection = {
-    exists() {
-        try {
-            const result = this._delegate._jxa();
-            return result !== undefined && result !== null;
-        }
-        catch {
-            return false;
-        }
-    },
-    specifier() {
-        return { uri: this._delegate.uri() };
-    },
-    resolve() {
-        const raw = this._delegate._jxa();
-        if (!Array.isArray(raw)) {
-            throw new TypeError(`Collection expected array, got ${typeof raw}`);
-        }
-        return raw;
-    },
-};
-function withByIndex(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            resolve() {
-                const raw = this._delegate._jxa();
-                if (!Array.isArray(raw)) {
-                    throw new TypeError(`Collection expected array, got ${typeof raw}`);
-                }
-                return raw.map((_item, i) => {
-                    const itemDelegate = this._delegate.byIndex(i);
-                    return { uri: itemDelegate.uri() };
-                });
-            },
-            byIndex(n) {
-                return createRes(this._delegate.byIndex(n), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
-function withByName(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            byName(name) {
-                return createRes(this._delegate.byName(name), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
-function withById(itemProto) {
-    return function (proto) {
-        const result = {
-            ...proto,
-            byId(id) {
-                return createRes(this._delegate.byId(id), itemProto);
-            },
-        };
-        collectionItemProtos.set(result, itemProto);
-        return result;
-    };
-}
-// ─────────────────────────────────────────────────────────────────────────────
-// Composition Utilities
-// ─────────────────────────────────────────────────────────────────────────────
-function pipe(a, f) {
-    return f(a);
-}
-function pipe2(a, f, g) {
-    return g(f(a));
-}
-function pipe3(a, f, g, h) {
-    return h(g(f(a)));
-}
 // scratch/jxa-backing.ts - JXA Delegate implementation
 //
 // This file is only included in JXA builds (osascript -l JavaScript)
@@ -1479,7 +1419,7 @@ const RuleConditionProto = {
 // ─────────────────────────────────────────────────────────────────────────────
 // Rule proto
 // ─────────────────────────────────────────────────────────────────────────────
-const _RuleProtoBase = {
+const RuleProto = withDelete()({
     ...baseObject,
     name: t.string,
     enabled: withSet(t.boolean),
@@ -1497,10 +1437,8 @@ const _RuleProtoBase = {
     // copyMessage/moveMessage return the destination mailbox name (or null)
     copyMessage: computed(extractMailboxName),
     moveMessage: computed(extractMailboxName),
-    ruleConditions: pipe(baseCollection, withByIndex(RuleConditionProto)),
-};
-// RuleProto with delete operation (uses default JXA delete)
-const RuleProto = pipe(_RuleProtoBase, withDelete());
+    ruleConditions: collection(RuleConditionProto, [Accessor.Index]),
+});
 // ─────────────────────────────────────────────────────────────────────────────
 // Signature proto
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1526,6 +1464,9 @@ const AttachmentProto = {
     name: t.string,
     fileSize: t.number,
 };
+// ─────────────────────────────────────────────────────────────────────────────
+// Message proto
+// ─────────────────────────────────────────────────────────────────────────────
 const _MessageProtoBase = {
     ...baseObject,
     id: t.number,
@@ -1540,33 +1481,30 @@ const _MessageProtoBase = {
     flaggedStatus: withSet(t.boolean),
     junkMailStatus: withSet(t.boolean),
     messageSize: t.number,
-    toRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
-    ccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
-    bccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
-    attachments: withJxaName(pipe3(baseCollection, withByIndex(AttachmentProto), withByName(AttachmentProto), withById(AttachmentProto)), 'mailAttachments'),
+    toRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
+    ccRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
+    bccRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
+    attachments: withJxaName(collection(AttachmentProto, [Accessor.Index, Accessor.Name, Accessor.Id]), 'mailAttachments'),
 };
 // MessageProto with move and delete operations
-const MessageProto = pipe2(_MessageProtoBase, withMove(_MessageProtoBase, messageMoveHandler), withDelete(messageDeleteHandler));
+const MessageProto = withDelete(messageDeleteHandler)(withMove(_MessageProtoBase, messageMoveHandler)(_MessageProtoBase));
 // ─────────────────────────────────────────────────────────────────────────────
 // Mailbox proto (recursive - interface required for self-reference)
 // ─────────────────────────────────────────────────────────────────────────────
-// Messages collection - uses legacy composers from legacy.ts
-const messagesCollectionProto = pipe2(baseCollection, withByIndex(MessageProto), withById(MessageProto));
-// Lazy version for use in mailbox (returns specifier when parent is resolved)
-const lazyMessagesProto = lazy(messagesCollectionProto);
-// Mailboxes collection for account-level (eager, since we enumerate accounts)
-// Uses null as any - forward reference workaround for self-referential MailboxProto
-const mailboxesCollectionProto = pipe2(baseCollection, withByIndex(null), // Proto set after MailboxProto defined
-withByName(null));
-// Lazy version for nested mailboxes in a mailbox
-const lazyMailboxesProto = lazy(mailboxesCollectionProto);
+// Messages collection proto (used in MailboxProto and for type reference)
+const MessagesProto = collection(MessageProto, [Accessor.Index, Accessor.Id]);
+// Mailbox is self-referential (contains mailboxes), so needs forward declaration
+// We define the collection proto separately to allow the self-reference
+const MailboxesProto = collection(null, [Accessor.Index, Accessor.Name]);
 const MailboxProto = {
     ...baseObject,
     name: t.string,
     unreadCount: t.number,
-    messages: lazyMessagesProto,
-    mailboxes: lazyMailboxesProto,
+    messages: lazy(MessagesProto),
+    mailboxes: lazy(MailboxesProto),
 };
+// Now fix up the self-reference in MailboxesProto
+collectionItemProtos.set(MailboxesProto, MailboxProto);
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1576,7 +1514,7 @@ const MailAccountProto = {
     name: t.string,
     fullName: t.string,
     emailAddresses: t.stringArray,
-    mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
+    mailboxes: collection(MailboxProto, [Accessor.Index, Accessor.Name]),
     // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
     // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
     inbox: computedNav((d) => {
@@ -1668,9 +1606,9 @@ const MailApplicationProto = {
     ...passthrough,
     name: t.string,
     version: t.string,
-    accounts: pipe3(baseCollection, withByIndex(MailAccountProto), withByName(MailAccountProto), withById(MailAccountProto)),
-    rules: pipe2(baseCollection, withByIndex(RuleProto), withByName(RuleProto)),
-    signatures: pipe2(baseCollection, withByIndex(SignatureProto), withByName(SignatureProto)),
+    accounts: collection(MailAccountProto, [Accessor.Index, Accessor.Name, Accessor.Id]),
+    rules: collection(RuleProto, [Accessor.Index, Accessor.Name]),
+    signatures: collection(SignatureProto, [Accessor.Index, Accessor.Name]),
     // Standard mailboxes - simple property access with jxaName mapping
     inbox: MailboxProto,
     drafts: withJxaName(MailboxProto, 'draftsMailbox'),
@@ -1685,7 +1623,7 @@ const MailApplicationProto = {
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 function getMailApp(delegate) {
-    return createRes(delegate, MailApplicationProto);
+    return createSpecifier(delegate, MailApplicationProto);
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Scheme Registration
@@ -2224,16 +2162,11 @@ function testLazyCollections() {
         console.log('  - Skipping: could not resolve inbox');
         return;
     }
-    // Check if messages property is lazy
+    // Check that lazy properties are Res objects (laziness tested via resolve behavior below)
     const messagesRes = inbox.value.messages;
     assert('_delegate' in messagesRes, 'messages is a Res');
-    console.log(`  messages._isLazy: ${messagesRes._isLazy}`);
-    assert(messagesRes._isLazy === true, 'messages should be lazy');
-    // Check if mailboxes property is lazy
     const mailboxesRes = inbox.value.mailboxes;
     assert('_delegate' in mailboxesRes, 'mailboxes is a Res');
-    console.log(`  mailboxes._isLazy: ${mailboxesRes._isLazy}`);
-    assert(mailboxesRes._isLazy === true, 'mailboxes should be lazy');
     // Test that resolving inbox returns specifiers, not full data
     const resolved = inbox.value.resolve();
     console.log(`  resolved.messages type: ${typeof resolved.messages}`);

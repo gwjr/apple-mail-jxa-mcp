@@ -485,5 +485,5 @@ function resolveURI(uri: string): Result<Res<any>> {
     }
   }
 
-  return { ok: true, value: createRes(delegate, proto) };
+  return { ok: true, value: createSpecifier(delegate, proto) };
 }

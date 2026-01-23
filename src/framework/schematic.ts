@@ -102,13 +102,9 @@ const collectionStrategy: ResolutionStrategy = (delegate) => {
   });
 };
 
-// Lazy resolve-from-parent: return Specifier instead of resolving
-const lazyResolveFromParent: ResolveFromParentStrategy = (delegate, proto) => {
-  return {
-    uri: delegate.uri(),
-    resolve: () => createRes(delegate, proto),
-    toJSON: () => ({ uri: delegate.uri().href }),
-  };
+// Lazy resolution strategy: return Specifier instead of resolving eagerly
+const LazyResolutionFromParentStrategy: ResolveFromParentStrategy = (delegate, proto) => {
+  return createSpecifier(delegate, proto);
 };
 
 // Default navigation: navigate by property name
@@ -121,15 +117,8 @@ const namespaceNavigation: NavigationStrategy = (delegate, key) => delegate.name
 // Specifier Type
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Specifier - typed reference to a JXA object specifier
-// P = the proto (must be a JXA-world type marked with ProtoBrand)
-// Returned by collection accessors (byIndex, byName, byId)
-// toJSON() returns just the URI for MCP serialization
-type Specifier<P extends Proto> = {
-  uri: URL;
-  resolve(): Res<P>;
-  toJSON(): { uri: string };
-};
+// Specifier type is now defined in specifier.ts and re-exported via legacy.ts as Res<P>
+// The Specifier<P> type is the unified navigable reference type for all JXA objects.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Type-level utilities
@@ -315,7 +304,7 @@ function getItemProto(collectionProto: object): object | undefined {
 function lazy<P extends BaseProtoType<any>>(proto: P): P & { readonly [LazyBrand]: true } {
   const lazyProto = {
     ...proto,
-    resolveFromParent: lazyResolveFromParent,
+    resolveFromParent: LazyResolutionFromParentStrategy,
   } as unknown as P & { readonly [LazyBrand]: true };
 
   // Copy over collection item proto if this is a collection
@@ -372,34 +361,19 @@ function collection<Item extends Proto, const K extends readonly Accessor[]>(
 
   if (by.includes(Accessor.Index)) {
     proto.byIndex = function(this: { _delegate: Delegate }, n: number): Specifier<Item> {
-      const itemDelegate = this._delegate.byIndex(n);
-      return {
-        uri: itemDelegate.uri(),
-        resolve: () => createRes(itemDelegate, itemProto),
-        toJSON: () => ({ uri: itemDelegate.uri().href }),
-      };
+      return createSpecifier(this._delegate.byIndex(n), itemProto);
     };
   }
 
   if (by.includes(Accessor.Name)) {
     proto.byName = function(this: { _delegate: Delegate }, name: string): Specifier<Item> {
-      const itemDelegate = this._delegate.byName(name);
-      return {
-        uri: itemDelegate.uri(),
-        resolve: () => createRes(itemDelegate, itemProto),
-        toJSON: () => ({ uri: itemDelegate.uri().href }),
-      };
+      return createSpecifier(this._delegate.byName(name), itemProto);
     };
   }
 
   if (by.includes(Accessor.Id)) {
     proto.byId = function(this: { _delegate: Delegate }, id: string | number): Specifier<Item> {
-      const itemDelegate = this._delegate.byId(id);
-      return {
-        uri: itemDelegate.uri(),
-        resolve: () => createRes(itemDelegate, itemProto),
-        toJSON: () => ({ uri: itemDelegate.uri().href }),
-      };
+      return createSpecifier(this._delegate.byId(id), itemProto);
     };
   }
 
@@ -712,22 +686,22 @@ function withQuery<P extends BaseProtoType<any>>(proto: P): P & QueryableProto<a
 
     whose(this: { _delegate: Delegate }, filter: WhoseFilter) {
       const newDelegate = this._delegate.withFilter(filter);
-      return createRes(newDelegate, withQuery(proto));
+      return createSpecifier(newDelegate, withQuery(proto));
     },
 
     sortBy(this: { _delegate: Delegate }, spec: SortSpec<any>) {
       const newDelegate = this._delegate.withSort(spec);
-      return createRes(newDelegate, withQuery(proto));
+      return createSpecifier(newDelegate, withQuery(proto));
     },
 
     paginate(this: { _delegate: Delegate }, spec: PaginationSpec) {
       const newDelegate = this._delegate.withPagination(spec);
-      return createRes(newDelegate, withQuery(proto));
+      return createSpecifier(newDelegate, withQuery(proto));
     },
 
     expand(this: { _delegate: Delegate }, fields: string[]) {
       const newDelegate = this._delegate.withExpand(fields);
-      return createRes(newDelegate, withQuery(proto));
+      return createSpecifier(newDelegate, withQuery(proto));
     },
   } as P & QueryableProto<any>;
 

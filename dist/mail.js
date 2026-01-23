@@ -548,13 +548,9 @@ const collectionStrategy = (delegate) => {
         return { uri: itemDelegate.uri() };
     });
 };
-// Lazy resolve-from-parent: return Specifier instead of resolving
-const lazyResolveFromParent = (delegate, proto) => {
-    return {
-        uri: delegate.uri(),
-        resolve: () => createRes(delegate, proto),
-        toJSON: () => ({ uri: delegate.uri().href }),
-    };
+// Lazy resolution strategy: return Specifier instead of resolving eagerly
+const LazyResolutionFromParentStrategy = (delegate, proto) => {
+    return createSpecifier(delegate, proto);
 };
 // Default navigation: navigate by property name
 const defaultNavigation = (delegate, key) => delegate.prop(key);
@@ -672,7 +668,7 @@ function getItemProto(collectionProto) {
 function lazy(proto) {
     const lazyProto = {
         ...proto,
-        resolveFromParent: lazyResolveFromParent,
+        resolveFromParent: LazyResolutionFromParentStrategy,
     };
     // Copy over collection item proto if this is a collection
     const itemProto = collectionItemProtos.get(proto);
@@ -703,32 +699,17 @@ function collection(itemProto, by) {
     };
     if (by.includes(Accessor.Index)) {
         proto.byIndex = function (n) {
-            const itemDelegate = this._delegate.byIndex(n);
-            return {
-                uri: itemDelegate.uri(),
-                resolve: () => createRes(itemDelegate, itemProto),
-                toJSON: () => ({ uri: itemDelegate.uri().href }),
-            };
+            return createSpecifier(this._delegate.byIndex(n), itemProto);
         };
     }
     if (by.includes(Accessor.Name)) {
         proto.byName = function (name) {
-            const itemDelegate = this._delegate.byName(name);
-            return {
-                uri: itemDelegate.uri(),
-                resolve: () => createRes(itemDelegate, itemProto),
-                toJSON: () => ({ uri: itemDelegate.uri().href }),
-            };
+            return createSpecifier(this._delegate.byName(name), itemProto);
         };
     }
     if (by.includes(Accessor.Id)) {
         proto.byId = function (id) {
-            const itemDelegate = this._delegate.byId(id);
-            return {
-                uri: itemDelegate.uri(),
-                resolve: () => createRes(itemDelegate, itemProto),
-                toJSON: () => ({ uri: itemDelegate.uri().href }),
-            };
+            return createSpecifier(this._delegate.byId(id), itemProto);
         };
     }
     collectionItemProtos.set(proto, itemProto);
@@ -947,19 +928,19 @@ function withQuery(proto) {
         },
         whose(filter) {
             const newDelegate = this._delegate.withFilter(filter);
-            return createRes(newDelegate, withQuery(proto));
+            return createSpecifier(newDelegate, withQuery(proto));
         },
         sortBy(spec) {
             const newDelegate = this._delegate.withSort(spec);
-            return createRes(newDelegate, withQuery(proto));
+            return createSpecifier(newDelegate, withQuery(proto));
         },
         paginate(spec) {
             const newDelegate = this._delegate.withPagination(spec);
-            return createRes(newDelegate, withQuery(proto));
+            return createSpecifier(newDelegate, withQuery(proto));
         },
         expand(fields) {
             const newDelegate = this._delegate.withExpand(fields);
-            return createRes(newDelegate, withQuery(proto));
+            return createSpecifier(newDelegate, withQuery(proto));
         },
     };
     // Copy collection item proto
@@ -968,13 +949,15 @@ function withQuery(proto) {
     }
     return queryProto;
 }
-// src/framework/res.ts - Res Type & Proxy
+// src/framework/specifier.ts - Specifier Type & Proxy
 //
-// The proxy wrapper that makes protos usable.
+// The proxy wrapper that makes protos usable. Specifier is the unified type
+// for all navigable references - both lazy references from collection accessors
+// and fully-resolved proxy objects.
 // ─────────────────────────────────────────────────────────────────────────────
-// Res Factory
+// Specifier Factory
 // ─────────────────────────────────────────────────────────────────────────────
-function createRes(delegate, proto) {
+function createSpecifier(delegate, proto) {
     // For namespace protos, get the target proto for property lookup
     const targetProto = getNamespaceNav(proto) || proto;
     const handler = {
@@ -983,6 +966,10 @@ function createRes(delegate, proto) {
                 return t._delegate;
             if (prop === 'uri')
                 return t._delegate.uri();
+            // Intercept toJSON for MCP serialization
+            if (prop === 'toJSON') {
+                return () => ({ uri: t._delegate.uri().href });
+            }
             // Intercept resolve to use the proto's resolutionStrategy
             if (prop === 'resolve') {
                 return () => {
@@ -1014,23 +1001,23 @@ function createRes(delegate, proto) {
                     // Check for namespace navigation - use navigationStrategy
                     const innerNamespaceProto = getNamespaceNav(value);
                     if (innerNamespaceProto) {
-                        return createRes(t._delegate.namespace(prop), value);
+                        return createSpecifier(t._delegate.namespace(prop), value);
                     }
                     // Check for computed navigation - use _computedNav data
                     const navInfo = getComputedNav(value);
                     if (navInfo) {
                         const targetDelegate = navInfo.navigate(t._delegate);
-                        return createRes(targetDelegate, value);
+                        return createSpecifier(targetDelegate, value);
                     }
                     // Normal property navigation - use jxaName if defined, otherwise use the property name
                     const jxaName = getJxaName(value);
                     const schemaName = prop;
                     if (jxaName) {
                         // Navigate with JXA name but track schema name for URI
-                        return createRes(t._delegate.propWithAlias(jxaName, schemaName), value);
+                        return createSpecifier(t._delegate.propWithAlias(jxaName, schemaName), value);
                     }
                     else {
-                        return createRes(t._delegate.prop(schemaName), value);
+                        return createSpecifier(t._delegate.prop(schemaName), value);
                     }
                 }
                 return value;
@@ -1038,13 +1025,13 @@ function createRes(delegate, proto) {
             return undefined;
         },
         has(t, prop) {
-            if (prop === '_delegate' || prop === 'uri')
+            if (prop === '_delegate' || prop === 'uri' || prop === 'toJSON')
                 return true;
             return prop in proto || prop in targetProto;
         },
         ownKeys(t) {
-            // Combine keys from proto and targetProto, plus _delegate and uri
-            const keys = new Set(['_delegate', 'uri']);
+            // Combine keys from proto and targetProto, plus _delegate, uri, and toJSON
+            const keys = new Set(['_delegate', 'uri', 'toJSON']);
             for (const key of Object.keys(proto))
                 keys.add(key);
             for (const key of Object.keys(targetProto))
@@ -1053,7 +1040,7 @@ function createRes(delegate, proto) {
         },
         getOwnPropertyDescriptor(t, prop) {
             // Make properties enumerable for Object.keys() to work
-            if (prop === '_delegate' || prop === 'uri' || prop in proto || prop in targetProto) {
+            if (prop === '_delegate' || prop === 'uri' || prop === 'toJSON' || prop in proto || prop in targetProto) {
                 return { enumerable: true, configurable: true };
             }
             return undefined;
@@ -1440,11 +1427,11 @@ function resolveURI(uri) {
             return { ok: false, error: `Unknown segment '${head}'. Available: ${available.join(', ')}` };
         }
     }
-    return { ok: true, value: createRes(delegate, proto) };
+    return { ok: true, value: createSpecifier(delegate, proto) };
 }
 // src/framework/legacy.ts - Backwards Compatibility Shims
 //
-// Legacy items kept for URI resolution fallback.
+// Legacy items kept for URI resolution fallback and type aliases.
 // ─────────────────────────────────────────────────────────────────────────────
 // Legacy Scalar Alias
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1943,7 +1930,7 @@ const MailApplicationProto = {
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 function getMailApp(delegate) {
-    return createRes(delegate, MailApplicationProto);
+    return createSpecifier(delegate, MailApplicationProto);
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Scheme Registration
@@ -2499,7 +2486,7 @@ globalThis.registerMailTools = registerMailTools;
 /// <reference path="framework/delegate.ts" />
 /// <reference path="framework/filter-query.ts" />
 /// <reference path="framework/schematic.ts" />
-/// <reference path="framework/res.ts" />
+/// <reference path="framework/specifier.ts" />
 /// <reference path="framework/uri.ts" />
 /// <reference path="jxa-delegate.ts" />
 /// <reference path="mail.ts" />

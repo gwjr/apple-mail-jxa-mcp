@@ -329,8 +329,8 @@ const MailApplicationProto = {
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-function getMailApp(delegate: Delegate): Res<typeof MailApplicationProto> {
-  return createRes(delegate, MailApplicationProto);
+function getMailApp(delegate: Delegate): Specifier<typeof MailApplicationProto> {
+  return createSpecifier(delegate, MailApplicationProto);
 }
 
 // Type aliases - use typeof to derive types from proto objects
