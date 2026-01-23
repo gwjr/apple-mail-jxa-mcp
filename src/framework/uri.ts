@@ -103,6 +103,26 @@ type ParsedURI = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Proto Guards (for runtime schema navigation during URI resolution)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function hasByIndex(proto: object): proto is { byIndex: (n: number) => unknown } {
+  return 'byIndex' in proto && typeof (proto as any).byIndex === 'function';
+}
+
+function hasByName(proto: object): proto is { byName: (name: string) => unknown } {
+  return 'byName' in proto && typeof (proto as any).byName === 'function';
+}
+
+function hasById(proto: object): proto is { byId: (id: string | number) => unknown } {
+  return 'byId' in proto && typeof (proto as any).byId === 'function';
+}
+
+function isChildProto(value: unknown): value is BaseProtoType<any> {
+  return typeof value === 'object' && value !== null && 'resolve' in value && typeof (value as any).resolve === 'function';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // URI Lexer
 // ─────────────────────────────────────────────────────────────────────────────
 

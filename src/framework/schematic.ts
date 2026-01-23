@@ -7,6 +7,11 @@
 // Brands (compile-time only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Proto brand - marks types that exist in the JXA object graph
+// Used to constrain Specifier<P> to only accept JXA-world types
+declare const ProtoBrand: unique symbol;
+type Proto = { readonly [ProtoBrand]: void };
+
 declare const ScalarBrand: unique symbol;
 declare const CollectionBrand: unique symbol;
 declare const LazyBrand: unique symbol;
@@ -19,29 +24,124 @@ declare const JxaNameBrand: unique symbol;
 declare const MoveableBrand: unique symbol;
 declare const DeleteableBrand: unique symbol;
 declare const CreateableBrand: unique symbol;
+declare const NamespaceBrand: unique symbol;
+declare const ComputedNavBrand: unique symbol;
 
-// Mark schema types
-//declare const SchematicBrand: unique symbol;
-//interface Schematic { [SchematicBrand]: void; }
+// ─────────────────────────────────────────────────────────────────────────────
+// Resolution & Navigation Strategies
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Resolution strategy: how to get the value when resolve() is called directly
+// Returns unknown because return type varies by proto kind:
+// - Scalar: T (the primitive value)
+// - Collection: CollectionResolveResult (array of URIs)
+// - Object: { [key]: resolved child value }
+type ResolutionStrategy = (delegate: Delegate, proto: any, res: any) => unknown;
+
+// How to resolve when my parent is resolving me as one of its properties.
+// By default, same as resolutionStrategy (eager). Lazy protos override to return Specifier.
+type ResolveFromParentStrategy = (delegate: Delegate, proto: any, res: any) => unknown;
+
+// Navigation strategy: how to navigate to a child property
+// Returns the delegate for the child, or undefined for no navigation (namespace)
+type NavigationStrategy = (delegate: Delegate, key: string, childProto: any) => Delegate;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Strategy Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Base keys to skip during object property enumeration
+const BASE_KEYS = new Set(['resolve', 'exists', 'uri', '_delegate', 'resolutionStrategy', 'resolveFromParent', 'navigationStrategy']);
+
+function isBaseKey(key: string): boolean {
+  return BASE_KEYS.has(key);
+}
+
+// Scalar strategy: just call _jxa() and return the raw value
+const scalarStrategy: ResolutionStrategy = (delegate) => delegate._jxa();
+
+// Object strategy: gather properties recursively
+const objectStrategy: ResolutionStrategy = (_delegate, proto, res) => {
+  const result: Record<string, any> = {};
+
+  // Get the target proto for property lookup (handles namespace case)
+  const targetProto = proto._namespaceTarget || proto;
+
+  for (const key of Object.keys(targetProto)) {
+    if (isBaseKey(key)) continue;
+    const childProto = targetProto[key];
+    if (childProto && typeof childProto === 'object' && 'resolutionStrategy' in childProto) {
+      try {
+        // Access the child through the Res proxy to get proper navigation
+        const childRes = res[key];
+        if (childRes && typeof childRes === 'object' && '_delegate' in childRes) {
+          // Use resolveFromParent if defined, otherwise fall back to resolutionStrategy
+          const resolveFromParent = childProto.resolveFromParent || childProto.resolutionStrategy;
+          const childValue = resolveFromParent(childRes._delegate, childProto, childRes);
+          if (childValue !== undefined) {
+            result[key] = childValue;
+          }
+        }
+      } catch {
+        // Skip properties that fail to resolve
+      }
+    }
+  }
+  return result;
+};
+
+// Collection strategy: return array of URIs for each item
+const collectionStrategy: ResolutionStrategy = (delegate) => {
+  const raw = delegate._jxa();
+  if (!Array.isArray(raw)) {
+    throw new TypeError(`Collection expected array, got ${typeof raw}`);
+  }
+  return raw.map((_item: unknown, i: number) => {
+    const itemDelegate = delegate.byIndex(i);
+    return { uri: itemDelegate.uri() };
+  });
+};
+
+// Lazy resolve-from-parent: return Specifier instead of resolving
+const lazyResolveFromParent: ResolveFromParentStrategy = (delegate, proto) => {
+  return {
+    uri: delegate.uri(),
+    resolve: () => createRes(delegate, proto),
+    toJSON: () => ({ uri: delegate.uri().href }),
+  };
+};
+
+// Default navigation: navigate by property name
+const defaultNavigation: NavigationStrategy = (delegate, key) => delegate.prop(key);
+
+// Namespace navigation: add URI segment but don't navigate JXA
+const namespaceNavigation: NavigationStrategy = (delegate, key) => delegate.namespace(key);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Specifier Type
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Specifier - typed reference to a JXA object specifier
+// P = the proto (must be a JXA-world type marked with ProtoBrand)
+// Returned by collection accessors (byIndex, byName, byId)
+// toJSON() returns just the URI for MCP serialization
+type Specifier<P extends Proto> = {
+  uri: URL;
+  resolve(): Res<P>;
+  toJSON(): { uri: string };
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Type-level utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
-type Specifier = { uri: URL };
-
-// Collection resolve returns array of specifiers - either bare {uri} or enriched with extra fields
+// Collection resolve returns array of URIs (possibly enriched with extra fields)
 type CollectionResolveResult = { uri: URL }[] | { uri: URL; [key: string]: any }[];
 
 type Lazy<T> = T & { readonly [LazyBrand]: true };
 
 type ScalarType<T> = { readonly [ScalarBrand]: T };
-//type EagerScalarType<T> = ScalarType<T> & { readonly [EagerBrand]: true };
-//type LazyScalarType<T> = ScalarType<T> & { readonly [LazyBrand]: true };
-
 type CollectionType<Item> = { readonly [CollectionBrand]: Item };
-//type EagerCollectionType<Item> = CollectionType<Item> & { readonly [EagerBrand]: true };
-//type LazyCollectionType<Item> = CollectionType<Item> & { readonly [LazyBrand]: true };
 
 type ExtractScalar<T> = T extends { readonly [ScalarBrand]: infer S } ? S : never;
 type ExtractItem<T> = T extends { readonly [CollectionBrand]: infer I } ? I : never;
@@ -52,10 +152,12 @@ type IsLazy<T> = T extends { readonly [LazyBrand]: true } ? true : false;
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Base proto interface - common methods for all protos
-interface BaseProtoType<T = any> {
+// Includes Proto brand to mark as JXA-world type
+interface BaseProtoType<T> extends Proto {
   exists(): boolean;
-  specifier(): Specifier;
   resolve(): T;
+  resolutionStrategy: ResolutionStrategy;
+  navigationStrategy?: NavigationStrategy;
 }
 
 // Scalar proto: has ScalarBrand for discrimination
@@ -63,81 +165,38 @@ type ScalarProto<T> = BaseProtoType<T> & {
    readonly [ScalarBrand]: T;
 };
 
-// Accessor types for collections
-type IndexAccessor<Item = any> = { byIndex(n: number): Res<Item> };
-type NameAccessor<Item = any> = { byName(name: string): Res<Item> };
-type IdAccessor<Item = any> = { byId(id: string | number): Res<Item> };
+// Accessor interfaces for collections - return Specifier for deferred resolution
+// Item = the proto of elements in the collection (what accessors yield)
+interface IndexAccessor<Item extends Proto> {
+  byIndex(n: number): Specifier<Item>;
+}
+
+interface NameAccessor<Item extends Proto> {
+  byName(name: string): Specifier<Item>;
+}
+
+interface IdAccessor<Item extends Proto> {
+  byId(id: string | number): Specifier<Item>;
+}
 
 // Collection proto with at least one accessor
-type CollectionProto<T = any> = BaseProtoType<CollectionResolveResult> & {
-  readonly [CollectionBrand]: T;
-} & (IndexAccessor<T> | NameAccessor<T> | IdAccessor<T>);
+// Item = the element proto (what you get when you access by index/name/id)
+type CollectionProto<Item extends Proto> = BaseProtoType<CollectionResolveResult> & {
+  readonly [CollectionBrand]: Item;
+} & (IndexAccessor<Item> | NameAccessor<Item> | IdAccessor<Item>);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Proto Implementation Helpers
+// Common exists() implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Shared implementation for base proto methods (scalar resolve)
-const _baseProtoImpl = {
-  exists(this: { _delegate: Delegate }): boolean {
-    try {
-      const result = this._delegate._jxa();
-      return result !== undefined && result !== null;
-    } catch {
-      return false;
-    }
-  },
-  specifier(this: { _delegate: Delegate }): Specifier {
-    return { uri: this._delegate.uri() };
-  },
-  resolve(this: { _delegate: Delegate }): any {
-    return this._delegate._jxa();
-  },
-};
-
-// Object proto implementation - gathers properties on resolve instead of returning JXA specifier
-// Use this for complex objects (mailboxes, messages, etc.) that have child properties
-const _objectProtoImpl = {
-  resolve(this: Res<any>): any {
-    // Iterate over all enumerable properties and resolve them
-    const result: Record<string, any> = {};
-    const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate', '_isLazy']);
-
-    for (const key of Object.keys(this)) {
-      if (baseKeys.has(key)) continue;
-      try {
-        const propRes = (this as any)[key];
-        if (propRes && typeof propRes === 'object' && '_delegate' in propRes) {
-          // It's a Res - check if it's lazy (should return specifier instead of value)
-          if (propRes._isLazy) {
-            result[key] = propRes.specifier();
-          } else {
-            const resolved = propRes.resolve();
-            if (resolved !== undefined) {
-              result[key] = resolved;
-            }
-          }
-        } else if (propRes !== undefined) {
-          result[key] = propRes;
-        }
-      } catch {
-        // Skip properties that fail to resolve
-      }
-    }
-    return result;
-  },
-  exists(this: { _delegate: Delegate }): boolean {
-    try {
-      const result = this._delegate._jxa();
-      return result !== undefined && result !== null;
-    } catch {
-      return false;
-    }
-  },
-  specifier(this: { _delegate: Delegate }): Specifier {
-    return { uri: this._delegate.uri() };
-  },
-};
+function existsImpl(this: { _delegate: Delegate }): boolean {
+  try {
+    const result = this._delegate._jxa();
+    return result !== undefined && result !== null;
+  } catch {
+    return false;
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Validators
@@ -194,27 +253,28 @@ function optional<T>(validator: Validator<T>): Validator<T | null> {
 
 // Typed scalar factory with runtime validation
 function scalar<T>(validate: Validator<T>): ScalarProto<T> {
+  const validatingStrategy: ResolutionStrategy = (delegate) => {
+    const raw = delegate._jxa();
+    return validate(raw);
+  };
+
   return {
-    exists(this: { _delegate: Delegate }): boolean {
-      try {
-        const result = this._delegate._jxa();
-        return result !== undefined && result !== null;
-      } catch {
-        return false;
-      }
-    },
-    specifier(this: { _delegate: Delegate }): Specifier {
-      return { uri: this._delegate.uri() };
-    },
+    resolutionStrategy: validatingStrategy,
+    exists: existsImpl,
     resolve(this: { _delegate: Delegate }): T {
-      const raw = this._delegate._jxa();
-      return validate(raw);
+      return validatingStrategy(this._delegate, null, null) as T;
     },
-  } as ScalarProto<T>;
+  } as ScalarProto<T>;  // Type assertion adds Proto brand
 }
 
 // Passthrough scalar - no validation, for untyped content
-const passthrough = scalar(isAny);
+const passthrough: ScalarProto<unknown> = {
+  resolutionStrategy: scalarStrategy,
+  exists: existsImpl,
+  resolve(this: { _delegate: Delegate }): unknown {
+    return this._delegate._jxa();
+  },
+} as ScalarProto<unknown>;
 
 // Primitive type scalars with runtime validation
 const t = {
@@ -227,33 +287,14 @@ const t = {
 };
 
 // Base object for complex types that need property gathering
-const baseObject: BaseProtoType<any> = { ..._objectProtoImpl };
+const baseObject: BaseProtoType<any> = {
+  resolutionStrategy: objectStrategy,
+  exists: existsImpl,
+  resolve(this: Res<any>): any {
+    return objectStrategy(this._delegate, baseObject, this);
+  },
+} as BaseProtoType<any>;
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Lazy Proto Tracking
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Track lazy protos for parent object resolution
-const lazyProtos = new WeakSet<object>();
-
-// lazy: marks a property as "lazy" - when resolved as part of a parent object,
-// returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
-function lazy<P extends BaseProtoType<any>>(proto: P): P & { readonly [LazyBrand]: true } {
-  const lazyProto = { ...proto } as P & { readonly [LazyBrand]: true };
-  lazyProtos.add(lazyProto);
-  // Copy over collection item proto if this is a collection
-  // (since spread creates new object that won't be in the WeakMap)
-  const itemProto = collectionItemProtos.get(proto);
-  if (itemProto) {
-    collectionItemProtos.set(lazyProto, itemProto);
-  }
-  return lazyProto;
-}
-
-function isLazyProto(proto: object): boolean {
-  return lazyProtos.has(proto);
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Collection Item Proto Tracking
@@ -266,77 +307,104 @@ function getItemProto(collectionProto: object): object | undefined {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Collection Factory with Accessor Config
+// Lazy Composer
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Accessor configuration for collection factory
-type CollectionAccessors<Item> = {
-  byIndex?: Item;
-  byName?: Item;
-  byId?: Item;
+// lazy: marks a property as "lazy" - when resolved as part of a parent object,
+// returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
+function lazy<P extends BaseProtoType<any>>(proto: P): P & { readonly [LazyBrand]: true } {
+  const lazyProto = {
+    ...proto,
+    resolveFromParent: lazyResolveFromParent,
+  } as unknown as P & { readonly [LazyBrand]: true };
+
+  // Copy over collection item proto if this is a collection
+  const itemProto = collectionItemProtos.get(proto);
+  if (itemProto) {
+    collectionItemProtos.set(lazyProto, itemProto);
+  }
+  return lazyProto;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Collection Factory
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Accessor kinds that a collection can support
+enum Accessor {
+  Index,
+  Name,
+  Id
+}
+
+// Map accessor kind to the corresponding interface
+type AccessorFor<K, Item extends Proto> =
+  K extends Accessor.Index ? IndexAccessor<Item> :
+  K extends Accessor.Name ? NameAccessor<Item> :
+  K extends Accessor.Id ? IdAccessor<Item> :
+  never;
+
+// Build intersection of accessors from a tuple of kinds
+type AccessorsFor<Ks extends readonly Accessor[], Item extends Proto> =
+  Ks extends readonly [infer First, ...infer Rest]
+    ? AccessorFor<First, Item> & (Rest extends readonly Accessor[] ? AccessorsFor<Rest, Item> : {})
+    : {};
+
+// Base collection type (without accessors)
+type BaseCollection<Item extends Proto> = BaseProtoType<CollectionResolveResult> & {
+  readonly [CollectionBrand]: Item;
 };
 
-// Build collection result type based on which accessors are provided
-type CollectionWithAccessors<Item, A extends CollectionAccessors<Item>> =
-  BaseProtoType<CollectionResolveResult> &
-  { readonly [CollectionBrand]: Item } &
-  (A extends { byIndex: any } ? IndexAccessor<Item> : {}) &
-  (A extends { byName: any } ? NameAccessor<Item> : {}) &
-  (A extends { byId: any } ? IdAccessor<Item> : {});
-
-// Collection factory that takes accessor config
-function collection<Item extends object, A extends CollectionAccessors<Item>>(
-  accessors: A & (
-    { byIndex: Item } | { byName: Item } | { byId: Item }
-  )
-): CollectionWithAccessors<Item, A> {
-  const itemProto = accessors.byIndex || accessors.byName || accessors.byId;
+// Collection factory - accessors determined by the 'by' tuple
+function collection<Item extends Proto, const K extends readonly Accessor[]>(
+  itemProto: Item,
+  by: K
+): BaseCollection<Item> & AccessorsFor<K, Item> {
 
   const proto: any = {
-    exists(this: { _delegate: Delegate }): boolean {
-      try {
-        const result = this._delegate._jxa();
-        return result !== undefined && result !== null;
-      } catch {
-        return false;
-      }
-    },
-    specifier(this: { _delegate: Delegate }): Specifier {
-      return { uri: this._delegate.uri() };
-    },
-    // resolve() returns specifiers for each item
+    resolutionStrategy: collectionStrategy,
+    exists: existsImpl,
+    // resolve() returns URIs for each item
     resolve(this: { _delegate: Delegate }): CollectionResolveResult {
-      const raw = this._delegate._jxa();
-      if (!Array.isArray(raw)) {
-        throw new TypeError(`Collection expected array, got ${typeof raw}`);
-      }
-      return raw.map((_item: unknown, i: number) => {
-        const itemDelegate = this._delegate.byIndex(i);
-        return { uri: itemDelegate.uri() };
-      });
+      return collectionStrategy(this._delegate, proto, this) as CollectionResolveResult;
     },
   };
 
-  if (accessors.byIndex) {
-    proto.byIndex = function(this: { _delegate: Delegate }, n: number): Res<Item> {
-      return createRes(this._delegate.byIndex(n), itemProto!);
+  if (by.includes(Accessor.Index)) {
+    proto.byIndex = function(this: { _delegate: Delegate }, n: number): Specifier<Item> {
+      const itemDelegate = this._delegate.byIndex(n);
+      return {
+        uri: itemDelegate.uri(),
+        resolve: () => createRes(itemDelegate, itemProto),
+        toJSON: () => ({ uri: itemDelegate.uri().href }),
+      };
     };
   }
 
-  if (accessors.byName) {
-    proto.byName = function(this: { _delegate: Delegate }, name: string): Res<Item> {
-      return createRes(this._delegate.byName(name), itemProto!);
+  if (by.includes(Accessor.Name)) {
+    proto.byName = function(this: { _delegate: Delegate }, name: string): Specifier<Item> {
+      const itemDelegate = this._delegate.byName(name);
+      return {
+        uri: itemDelegate.uri(),
+        resolve: () => createRes(itemDelegate, itemProto),
+        toJSON: () => ({ uri: itemDelegate.uri().href }),
+      };
     };
   }
 
-  if (accessors.byId) {
-    proto.byId = function(this: { _delegate: Delegate }, id: string | number): Res<Item> {
-      return createRes(this._delegate.byId(id), itemProto!);
+  if (by.includes(Accessor.Id)) {
+    proto.byId = function(this: { _delegate: Delegate }, id: string | number): Specifier<Item> {
+      const itemDelegate = this._delegate.byId(id);
+      return {
+        uri: itemDelegate.uri(),
+        resolve: () => createRes(itemDelegate, itemProto),
+        toJSON: () => ({ uri: itemDelegate.uri().href }),
+      };
     };
   }
 
-  collectionItemProtos.set(proto, itemProto!);
-  return proto as CollectionWithAccessors<Item, A>;
+  collectionItemProtos.set(proto, itemProto);
+  return proto as BaseCollection<Item> & AccessorsFor<K, Item>;
 }
 
 
@@ -348,16 +416,14 @@ interface SettableProto<T> {
   set(value: T): void;
 }
 
-// Extract the type from a proto - works with ScalarProto<T> via the brand
-type ExtractProtoType<P> = P extends { readonly [ScalarBrand]: infer T } ? T : any;
-
-function withSet<P extends BaseProtoType<any>>(proto: P): P & SettableProto<ExtractProtoType<P>> & { readonly [SettableBrand]: true } {
+// withSet works on scalar protos - adds a set() method for the scalar's value type
+function withSet<T>(proto: ScalarProto<T>): ScalarProto<T> & SettableProto<T> & { readonly [SettableBrand]: true } {
   return {
     ...proto,
-    set(this: { _delegate: Delegate }, value: ExtractProtoType<P>) {
+    set(this: { _delegate: Delegate }, value: T) {
       this._delegate.set(value);
     },
-  } as P & SettableProto<ExtractProtoType<P>> & { readonly [SettableBrand]: true };
+  } as ScalarProto<T> & SettableProto<T> & { readonly [SettableBrand]: true };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -370,13 +436,13 @@ type DeleteHandler = (item: Delegate) => Result<URL>;
 type CreateHandler = (collection: Delegate, properties: Record<string, any>) => Result<URL>;
 
 // Moveable proto interface
-interface MoveableProto<Item> {
+interface MoveableProto<Item extends Proto> {
   move<C extends CollectionProto<Item>>(to: Res<C>): Result<Res<Item>>;
 }
 
 // Composer: adds move() with optional custom handler
-function withMove<Item extends object>(itemProto: Item, handler?: MoveHandler) {
-  return function<P extends BaseProtoType<any>>(proto: P): P & MoveableProto<Item> & { readonly [MoveableBrand]: true } {
+function withMove<Item extends Proto>(itemProto: Item, handler?: MoveHandler) {
+  return function<P extends Proto>(proto: P): P & MoveableProto<Item> & { readonly [MoveableBrand]: true } {
     const result = {
       ...proto,
       move<C extends CollectionProto<Item>>(this: { _delegate: Delegate }, to: Res<C>): Result<Res<Item>> {
@@ -402,7 +468,7 @@ interface DeleteableProto {
 
 // Composer: adds delete() with optional custom handler
 function withDelete(handler?: DeleteHandler) {
-  return function<P extends BaseProtoType<any>>(proto: P): P & DeleteableProto & { readonly [DeleteableBrand]: true } {
+  return function<P extends Proto>(proto: P): P & DeleteableProto & { readonly [DeleteableBrand]: true } {
     return {
       ...proto,
       delete(this: { _delegate: Delegate }): Result<URL> {
@@ -415,13 +481,13 @@ function withDelete(handler?: DeleteHandler) {
 }
 
 // Createable proto interface (for collections)
-interface CreateableProto<Item> {
+interface CreateableProto<Item extends Proto> {
   create(properties: Partial<Item>): Result<Res<Item>>;
 }
 
 // Composer: adds create() with optional custom handler
-function withCreate<Item extends object>(itemProto: Item, handler?: CreateHandler) {
-  return function<P extends BaseProtoType<any>>(proto: P): P & CreateableProto<Item> & { readonly [CreateableBrand]: true } {
+function withCreate<Item extends Proto>(itemProto: Item, handler?: CreateHandler) {
+  return function<P extends Proto>(proto: P): P & CreateableProto<Item> & { readonly [CreateableBrand]: true } {
     return {
       ...proto,
       create(this: { _delegate: Delegate }, properties: Partial<Item>): Result<Res<Item>> {
@@ -469,23 +535,19 @@ function getJxaName(proto: object): string | undefined {
 
 // A computed property transforms the raw value from the delegate
 function computed<T>(transform: (raw: any) => T): BaseProtoType<T> {
+  const computedStrategy: ResolutionStrategy = (delegate) => {
+    const raw = delegate._jxa();
+    return transform(raw);
+  };
+
   return {
+    resolutionStrategy: computedStrategy,
+    exists: existsImpl,
     resolve(this: { _delegate: Delegate }): T {
       const raw = this._delegate._jxa();
       return transform(raw);
     },
-    exists(this: { _delegate: Delegate }): boolean {
-      try {
-        this._delegate._jxa();
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    specifier(this: { _delegate: Delegate }): Specifier {
-      return { uri: this._delegate.uri() };
-    },
-  };
+  } as BaseProtoType<T>;  // Type assertion adds Proto brand
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -495,22 +557,31 @@ function computed<T>(transform: (raw: any) => T): BaseProtoType<T> {
 // computedNav is for properties that require multiple delegate operations to navigate.
 // For simple property navigation (including jxaName mapping), use withJxaName instead.
 
-declare const ComputedNavBrand: unique symbol;
-
 type NavigationFn = (d: Delegate) => Delegate;
-
-const computedNavMap = new WeakMap<object, { navigate: NavigationFn; targetProto: object }>();
 
 type ComputedNavProto<P> = P & { readonly [ComputedNavBrand]: true };
 
-function computedNav<P extends object>(
+function computedNav<P extends BaseProtoType<any>>(
   navigate: NavigationFn,
   targetProto: P
 ): ComputedNavProto<P> {
-  // Create a proto that has the base methods (resolve, exists, specifier) using the navigated delegate
+  // Create a strategy that navigates first, then uses target's strategy
+  const navStrategy: ResolutionStrategy = (delegate, proto, res) => {
+    const targetDelegate = navigate(delegate);
+    return targetProto.resolutionStrategy(targetDelegate, targetProto, res);
+  };
+
+  // Create a navigation strategy that applies the custom navigation
+  const navNavigation: NavigationStrategy = (delegate) => navigate(delegate);
+
   const navProto = {
+    ...targetProto,
+    resolutionStrategy: navStrategy,
+    navigationStrategy: navNavigation,
+    _computedNav: { navigate, targetProto },  // Store for URI resolution
     resolve(this: { _delegate: Delegate }) {
-      return navigate(this._delegate)._jxa();
+      const targetDelegate = navigate(this._delegate);
+      return targetProto.resolutionStrategy(targetDelegate, targetProto, this);
     },
     exists(this: { _delegate: Delegate }): boolean {
       try {
@@ -520,17 +591,19 @@ function computedNav<P extends object>(
         return false;
       }
     },
-    specifier(this: { _delegate: Delegate }): Specifier {
-      return { uri: navigate(this._delegate).uri() };
-    },
   } as unknown as ComputedNavProto<P>;
 
-  computedNavMap.set(navProto, { navigate, targetProto });
+  // Copy collection item proto if target is a collection
+  const itemProto = collectionItemProtos.get(targetProto);
+  if (itemProto) {
+    collectionItemProtos.set(navProto, itemProto);
+  }
+
   return navProto;
 }
 
 function getComputedNav(proto: object): { navigate: NavigationFn; targetProto: object } | undefined {
-  return computedNavMap.get(proto);
+  return (proto as any)._computedNav;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -543,45 +616,45 @@ function getComputedNav(proto: object): { navigate: NavigationFn; targetProto: o
 // 3. Has its own proto with the grouped properties
 // When resolved, a namespace gathers all its properties and returns them as an object
 
-declare const NamespaceBrand: unique symbol;
-const namespaceNavMap = new WeakMap<object, object>();
-
 type NamespaceProto<P> = P & { readonly [NamespaceBrand]: true };
 
 function namespaceNav<P extends object>(targetProto: P): NamespaceProto<P> {
-  // Custom resolve that gathers all properties from the target proto
-  const navProto = {
-    resolve(this: Res<any>): any {
-      const result: Record<string, any> = {};
-      // Get all property names from the target proto (excluding base methods)
-      const baseKeys = new Set(['resolve', 'exists', 'specifier', '_delegate']);
-      for (const key of Object.keys(targetProto)) {
-        if (baseKeys.has(key)) continue;
-        try {
-          // Navigate to the property and resolve it
-          const propRes = (this as any)[key];
-          if (propRes && typeof propRes.resolve === 'function') {
-            result[key] = propRes.resolve();
-          }
-        } catch {
-          // Skip properties that fail to resolve
+  // Custom strategy that gathers all properties from the target proto
+  const namespaceStrategy: ResolutionStrategy = (delegate, proto, res) => {
+    const result: Record<string, any> = {};
+    // Get all property names from the target proto (excluding base methods)
+    for (const key of Object.keys(targetProto)) {
+      if (isBaseKey(key)) continue;
+      try {
+        // Navigate to the property and resolve it
+        const propRes = (res as any)[key];
+        if (propRes && typeof propRes.resolve === 'function') {
+          result[key] = propRes.resolve();
         }
+      } catch {
+        // Skip properties that fail to resolve
       }
-      return result;
+    }
+    return result;
+  };
+
+  const navProto = {
+    resolutionStrategy: namespaceStrategy,
+    navigationStrategy: namespaceNavigation,
+    _namespaceTarget: targetProto,  // Store for property lookup
+    resolve(this: Res<any>): any {
+      return namespaceStrategy(this._delegate, navProto, this);
     },
     exists(this: Res<any>): boolean {
       return true; // Namespaces always exist
     },
-    specifier(this: Res<any>): Specifier {
-      return { uri: this._delegate.uri() };
-    },
   } as unknown as NamespaceProto<P>;
-  namespaceNavMap.set(navProto, targetProto);
+
   return navProto;
 }
 
 function getNamespaceNav(proto: object): object | undefined {
-  return namespaceNavMap.get(proto);
+  return (proto as any)._namespaceTarget;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -598,38 +671,43 @@ interface QueryableProto<T> extends BaseProtoType<any> {
 function withQuery<P extends BaseProtoType<any>>(proto: P): P & QueryableProto<any> {
   const itemProto = collectionItemProtos.get(proto);
 
-  return {
-    ...proto,
+  const queryStrategy: ResolutionStrategy = (delegate) => {
+    const raw = delegate._jxa();
+    if (!Array.isArray(raw)) {
+      throw new TypeError(`Query expected array, got ${typeof raw}`);
+    }
+    const query = delegate.queryState();
+    let results = applyQueryState(raw, query);
 
-    resolve(this: { _delegate: Delegate }) {
-      const raw = this._delegate._jxa();
-      if (!Array.isArray(raw)) {
-        throw new TypeError(`Query expected array, got ${typeof raw}`);
-      }
-      const query = this._delegate.queryState();
-      let results = applyQueryState(raw, query);
-
-      if (query.expand && query.expand.length > 0 && itemProto) {
-        results = results.map((item: any, idx: number) => {
-          const expanded = { ...item };
-          for (const field of query.expand!) {
-            const fieldProto = (itemProto as any)[field];
-            if (fieldProto && typeof fieldProto === 'object' && 'resolve' in fieldProto) {
-              try {
-                if (field in item && typeof item[field] === 'function') {
-                  expanded[field] = item[field]();
-                } else if (field in item) {
-                  expanded[field] = item[field];
-                }
-              } catch {
+    if (query.expand && query.expand.length > 0 && itemProto) {
+      results = results.map((item: any, idx: number) => {
+        const expanded = { ...item };
+        for (const field of query.expand!) {
+          const fieldProto = (itemProto as any)[field];
+          if (fieldProto && typeof fieldProto === 'object' && 'resolve' in fieldProto) {
+            try {
+              if (field in item && typeof item[field] === 'function') {
+                expanded[field] = item[field]();
+              } else if (field in item) {
+                expanded[field] = item[field];
               }
+            } catch {
             }
           }
-          return expanded;
-        });
-      }
+        }
+        return expanded;
+      });
+    }
 
-      return results;
+    return results;
+  };
+
+  const queryProto = {
+    ...proto,
+    resolutionStrategy: queryStrategy,
+
+    resolve(this: { _delegate: Delegate }) {
+      return queryStrategy(this._delegate, queryProto, this);
     },
 
     whose(this: { _delegate: Delegate }, filter: WhoseFilter) {
@@ -652,25 +730,13 @@ function withQuery<P extends BaseProtoType<any>>(proto: P): P & QueryableProto<a
       return createRes(newDelegate, withQuery(proto));
     },
   } as P & QueryableProto<any>;
+
+  // Copy collection item proto
+  if (itemProto) {
+    collectionItemProtos.set(queryProto, itemProto);
+  }
+
+  return queryProto;
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Proto Guards
-// ─────────────────────────────────────────────────────────────────────────────
-
-function hasByIndex(proto: object): proto is { byIndex: (n: number) => unknown } {
-  return 'byIndex' in proto && typeof (proto as any).byIndex === 'function';
-}
-
-function hasByName(proto: object): proto is { byName: (name: string) => unknown } {
-  return 'byName' in proto && typeof (proto as any).byName === 'function';
-}
-
-function hasById(proto: object): proto is { byId: (id: string | number) => unknown } {
-  return 'byId' in proto && typeof (proto as any).byId === 'function';
-}
-
-function isChildProto(value: unknown): value is BaseProtoType<any> {
-  return typeof value === 'object' && value !== null && 'resolve' in value && typeof (value as any).resolve === 'function';
-}

@@ -432,17 +432,12 @@ function testLazyCollections() {
     return;
   }
 
-  // Check if messages property is lazy
+  // Check that lazy properties are Res objects (laziness tested via resolve behavior below)
   const messagesRes = inbox.value.messages;
   assert('_delegate' in messagesRes, 'messages is a Res');
-  console.log(`  messages._isLazy: ${(messagesRes as any)._isLazy}`);
-  assert((messagesRes as any)._isLazy === true, 'messages should be lazy');
 
-  // Check if mailboxes property is lazy
   const mailboxesRes = inbox.value.mailboxes;
   assert('_delegate' in mailboxesRes, 'mailboxes is a Res');
-  console.log(`  mailboxes._isLazy: ${(mailboxesRes as any)._isLazy}`);
-  assert((mailboxesRes as any)._isLazy === true, 'mailboxes should be lazy');
 
   // Test that resolving inbox returns specifiers, not full data
   const resolved = inbox.value.resolve() as any;

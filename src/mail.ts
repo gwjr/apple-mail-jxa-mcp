@@ -92,7 +92,7 @@ const RuleConditionProto = {
 // Rule proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-const _RuleProtoBase = {
+const RuleProto = withDelete()({
   ...baseObject,
   name: t.string,
   enabled: withSet(t.boolean),
@@ -110,11 +110,8 @@ const _RuleProtoBase = {
   // copyMessage/moveMessage return the destination mailbox name (or null)
   copyMessage: computed<string | null>(extractMailboxName),
   moveMessage: computed<string | null>(extractMailboxName),
-  ruleConditions: pipe(baseCollection, withByIndex(RuleConditionProto)),
-};
-
-// RuleProto with delete operation (uses default JXA delete)
-const RuleProto = pipe(_RuleProtoBase, withDelete());
+  ruleConditions: collection(RuleConditionProto, [Accessor.Index]),
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Signature proto
@@ -151,9 +148,6 @@ const AttachmentProto = {
 // Message proto
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Forward declaration for MessageProto type (used in collection types)
-type MessageProtoType = typeof _MessageProtoBase & MoveableProto<typeof _MessageProtoBase> & DeleteableProto;
-
 const _MessageProtoBase = {
   ...baseObject,
   id: t.number,
@@ -168,62 +162,48 @@ const _MessageProtoBase = {
   flaggedStatus: withSet(t.boolean),
   junkMailStatus: withSet(t.boolean),
   messageSize: t.number,
-  toRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
-  ccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
-  bccRecipients: pipe2(baseCollection, withByIndex(RecipientProto), withByName(RecipientProto)),
+  toRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
+  ccRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
+  bccRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
   attachments: withJxaName(
-    pipe3(baseCollection, withByIndex(AttachmentProto), withByName(AttachmentProto), withById(AttachmentProto)),
+    collection(AttachmentProto, [Accessor.Index, Accessor.Name, Accessor.Id]),
     'mailAttachments'
   ),
 };
 
 // MessageProto with move and delete operations
-const MessageProto = pipe2(
-  _MessageProtoBase,
-  withMove(_MessageProtoBase, messageMoveHandler),
-  withDelete(messageDeleteHandler)
+const MessageProto = withDelete(messageDeleteHandler)(
+  withMove(_MessageProtoBase, messageMoveHandler)(_MessageProtoBase)
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mailbox proto (recursive - interface required for self-reference)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Messages collection - uses legacy composers from legacy.ts
-const messagesCollectionProto = pipe2(
-  baseCollection,
-  withByIndex(MessageProto),
-  withById(MessageProto)
-);
+// Messages collection proto (used in MailboxProto and for type reference)
+const MessagesProto = collection(MessageProto, [Accessor.Index, Accessor.Id]);
 
-// Lazy version for use in mailbox (returns specifier when parent is resolved)
-const lazyMessagesProto = lazy(messagesCollectionProto);
+// Mailbox is self-referential (contains mailboxes), so needs forward declaration
+// We define the collection proto separately to allow the self-reference
+const MailboxesProto = collection(null as unknown as MailboxProtoType, [Accessor.Index, Accessor.Name]);
 
-// Mailboxes collection for account-level (eager, since we enumerate accounts)
-// Uses null as any - forward reference workaround for self-referential MailboxProto
-const mailboxesCollectionProto = pipe2(
-  baseCollection,
-  withByIndex<MailboxProtoType>(null as any),  // Proto set after MailboxProto defined
-  withByName<MailboxProtoType>(null as any)
-);
-
-// Lazy version for nested mailboxes in a mailbox
-const lazyMailboxesProto = lazy(mailboxesCollectionProto);
-
-// Mailbox is self-referential (contains mailboxes), so needs interface declaration
-interface MailboxProtoType extends BaseProtoType {
+interface MailboxProtoType extends BaseProtoType<any> {
   name: typeof t.string;
   unreadCount: typeof t.number;
-  messages: typeof lazyMessagesProto;
-  mailboxes: typeof lazyMailboxesProto;
+  messages: typeof MessagesProto & { readonly [LazyBrand]: true };
+  mailboxes: typeof MailboxesProto & { readonly [LazyBrand]: true };
 }
 
 const MailboxProto: MailboxProtoType = {
   ...baseObject,
   name: t.string,
   unreadCount: t.number,
-  messages: lazyMessagesProto,
-  mailboxes: lazyMailboxesProto,
+  messages: lazy(MessagesProto),
+  mailboxes: lazy(MailboxesProto),
 };
+
+// Now fix up the self-reference in MailboxesProto
+collectionItemProtos.set(MailboxesProto, MailboxProto);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Account proto
@@ -235,7 +215,7 @@ const MailAccountProto = {
   name: t.string,
   fullName: t.string,
   emailAddresses: t.stringArray,
-  mailboxes: pipe2(baseCollection, withByIndex(MailboxProto), withByName(MailboxProto)),
+  mailboxes: collection(MailboxProto, [Accessor.Index, Accessor.Name]),
   // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
   // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
   inbox: computedNav((d) => {
@@ -331,9 +311,9 @@ const MailApplicationProto = {
   ...passthrough,
   name: t.string,
   version: t.string,
-  accounts: pipe3(baseCollection, withByIndex(MailAccountProto), withByName(MailAccountProto), withById(MailAccountProto)),
-  rules: pipe2(baseCollection, withByIndex(RuleProto), withByName(RuleProto)),
-  signatures: pipe2(baseCollection, withByIndex(SignatureProto), withByName(SignatureProto)),
+  accounts: collection(MailAccountProto, [Accessor.Index, Accessor.Name, Accessor.Id]),
+  rules: collection(RuleProto, [Accessor.Index, Accessor.Name]),
+  signatures: collection(SignatureProto, [Accessor.Index, Accessor.Name]),
   // Standard mailboxes - simple property access with jxaName mapping
   inbox: MailboxProto,
   drafts: withJxaName(MailboxProto, 'draftsMailbox'),

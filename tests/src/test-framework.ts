@@ -424,8 +424,9 @@ function testObjectResolution() {
     assert(typeof resolved === 'object', 'Mailbox resolves to object');
     assertEqual(resolved.name, 'INBOX', 'Resolved mailbox has name property');
     assertEqual(resolved.unreadCount, 5, 'Resolved mailbox has unreadCount property');
-    assert(Array.isArray(resolved.messages), 'Resolved mailbox has messages array');
-    assert(Array.isArray(resolved.mailboxes), 'Resolved mailbox has mailboxes array');
+    // Lazy collections return Specifiers when resolved as part of parent
+    assert(typeof resolved.messages === 'object' && 'uri' in resolved.messages, 'Resolved mailbox has messages specifier');
+    assert(typeof resolved.mailboxes === 'object' && 'uri' in resolved.mailboxes, 'Resolved mailbox has mailboxes specifier');
   }
 
   // Message uses baseScalar - resolve() should also return object with properties
