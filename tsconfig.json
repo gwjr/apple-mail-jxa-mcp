@@ -3,31 +3,16 @@
     "target": "ES2022",
     "module": "None",
     "lib": ["ES2023", "DOM"],
-    "outFile": "dist/mail.js",
+    "outFile": "dist/editor-check.js",
     "strict": true,
     "noImplicitAny": true,
     "strictNullChecks": true,
-    "noEmitOnError": true,
+    "noEmit": true,
     "declaration": false,
-    "removeComments": false,
-    "esModuleInterop": false,
     "skipLibCheck": true
   },
-  "files": [
-    "src/types/jxa.d.ts",
-    "src/types/mcp.d.ts",
-    "src/jxa-polyfill.ts",
-    "src/core/mcp-server.ts",
-    "src/framework/delegate.ts",
-    "src/framework/filter-query.ts",
-    "src/framework/schematic.ts",
-    "src/framework/specifier.ts",
-    "src/framework/uri.ts",
-    "src/framework/legacy.ts",
-    "src/jxa-delegate.ts",
-    "src/mail.ts",
-    "src/resources.ts",
-    "src/tools.ts",
-    "src/main.ts"
+  "include": [
+    "src/**/*.ts",
+    "tests/src/**/*.ts"
   ]
 }
