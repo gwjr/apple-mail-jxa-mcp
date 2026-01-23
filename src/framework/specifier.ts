@@ -8,10 +8,15 @@
 // Specifier Type
 // ─────────────────────────────────────────────────────────────────────────────
 
-type Specifier<P> = P & {
+// Transform proto properties: when accessed through Specifier, proto children become Specifiers
+type SpecifierProps<P> = {
+  [K in keyof P]: P[K] extends Proto<any> ? Specifier<P[K]> : P[K];
+};
+
+type Specifier<P> = SpecifierProps<P> & {
   _delegate: Delegate;
   uri: URL;
-  resolve(): unknown;  // Return type varies by proto kind
+  resolve(): Resolved<P>;  // Type-safe: extracts resolution type from proto's brand
   toJSON(): { uri: string };
 };
 

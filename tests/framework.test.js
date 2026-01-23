@@ -228,6 +228,7 @@ function optional(validator) {
 // Scalar Factories
 // ─────────────────────────────────────────────────────────────────────────────
 // Typed scalar factory with runtime validation
+// T must be MCP-returnable (enforced by ScalarProto<T>)
 function scalar(validate) {
     const validatingStrategy = (delegate) => {
         const raw = delegate._jxa();
@@ -236,18 +237,13 @@ function scalar(validate) {
     return {
         resolutionStrategy: validatingStrategy,
         exists: existsImpl,
-        resolve() {
-            return validatingStrategy(this._delegate, null, null);
-        },
     }; // Type assertion adds Proto brand
 }
-// Passthrough scalar - no validation, for untyped content
+// Passthrough scalar - no validation, returns any (use sparingly)
+// Note: 'any' satisfies MCPReturnableValue at compile time; runtime values must be serializable
 const passthrough = {
     resolutionStrategy: scalarStrategy,
     exists: existsImpl,
-    resolve() {
-        return this._delegate._jxa();
-    },
 };
 // Primitive type scalars with runtime validation
 const t = {
@@ -259,12 +255,10 @@ const t = {
     any: passthrough,
 };
 // Base object for complex types that need property gathering
+// Resolves to a record of child properties (MCPReturnableValue via objectStrategy)
 const baseObject = {
     resolutionStrategy: objectStrategy,
     exists: existsImpl,
-    resolve() {
-        return objectStrategy(this._delegate, baseObject, this);
-    },
 };
 // ─────────────────────────────────────────────────────────────────────────────
 // Collection Item Proto Tracking
@@ -305,10 +299,6 @@ function collection(itemProto, by) {
     const proto = {
         resolutionStrategy: collectionStrategy,
         exists: existsImpl,
-        // resolve() returns URIs for each item
-        resolve() {
-            return collectionStrategy(this._delegate, proto, this);
-        },
     };
     if (by.includes(Accessor.Index)) {
         proto.byIndex = function (n) {
@@ -413,6 +403,7 @@ function getJxaName(proto) {
 // Computed Properties
 // ─────────────────────────────────────────────────────────────────────────────
 // A computed property transforms the raw value from the delegate
+// T must be MCP-returnable (enforced by ComputedProto<T>)
 function computed(transform) {
     const computedStrategy = (delegate) => {
         const raw = delegate._jxa();
@@ -421,15 +412,11 @@ function computed(transform) {
     return {
         resolutionStrategy: computedStrategy,
         exists: existsImpl,
-        resolve() {
-            const raw = this._delegate._jxa();
-            return transform(raw);
-        },
-    }; // Type assertion adds Proto brand
+    };
 }
 function computedNav(navigate, targetProto) {
     // Create a strategy that navigates first, then uses target's strategy
-    const navStrategy = (delegate, proto, res) => {
+    const navStrategy = (delegate, _proto, res) => {
         const targetDelegate = navigate(delegate);
         return targetProto.resolutionStrategy(targetDelegate, targetProto, res);
     };
@@ -440,10 +427,6 @@ function computedNav(navigate, targetProto) {
         resolutionStrategy: navStrategy,
         navigationStrategy: navNavigation,
         _computedNav: { navigate, targetProto }, // Store for URI resolution
-        resolve() {
-            const targetDelegate = navigate(this._delegate);
-            return targetProto.resolutionStrategy(targetDelegate, targetProto, this);
-        },
         exists() {
             try {
                 navigate(this._delegate)._jxa();
@@ -466,7 +449,7 @@ function getComputedNav(proto) {
 }
 function namespaceNav(targetProto) {
     // Custom strategy that gathers all properties from the target proto
-    const namespaceStrategy = (delegate, proto, res) => {
+    const namespaceStrategy = (_delegate, _proto, res) => {
         const result = {};
         // Get all property names from the target proto (excluding base methods)
         for (const key of Object.keys(targetProto)) {
@@ -489,9 +472,6 @@ function namespaceNav(targetProto) {
         resolutionStrategy: namespaceStrategy,
         navigationStrategy: namespaceNavigation,
         _namespaceTarget: targetProto, // Store for property lookup
-        resolve() {
-            return namespaceStrategy(this._delegate, navProto, this);
-        },
         exists() {
             return true; // Namespaces always exist
         },
@@ -511,11 +491,11 @@ function withQuery(proto) {
         const query = delegate.queryState();
         let results = applyQueryState(raw, query);
         if (query.expand && query.expand.length > 0 && itemProto) {
-            results = results.map((item, idx) => {
+            results = results.map((item) => {
                 const expanded = { ...item };
                 for (const field of query.expand) {
                     const fieldProto = itemProto[field];
-                    if (fieldProto && typeof fieldProto === 'object' && 'resolve' in fieldProto) {
+                    if (fieldProto && typeof fieldProto === 'object' && 'resolutionStrategy' in fieldProto) {
                         try {
                             if (field in item && typeof item[field] === 'function') {
                                 expanded[field] = item[field]();
@@ -536,9 +516,6 @@ function withQuery(proto) {
     const queryProto = {
         ...proto,
         resolutionStrategy: queryStrategy,
-        resolve() {
-            return queryStrategy(this._delegate, queryProto, this);
-        },
         whose(filter) {
             const newDelegate = this._delegate.withFilter(filter);
             return createSpecifier(newDelegate, withQuery(proto));
@@ -734,7 +711,7 @@ function hasById(proto) {
     return 'byId' in proto && typeof proto.byId === 'function';
 }
 function isChildProto(value) {
-    return typeof value === 'object' && value !== null && 'resolve' in value && typeof value.resolve === 'function';
+    return typeof value === 'object' && value !== null && 'resolutionStrategy' in value && typeof value.resolutionStrategy === 'function';
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // URI Lexer

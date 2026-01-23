@@ -4,16 +4,33 @@
 // live together - the DSL specifies the schema by building the proto.
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MCP Return Type Constraint
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Values that can be returned from MCP tools (must be JSON-serializable)
+// All Proto resolutions must satisfy this constraint.
+type MCPReturnableValue =
+  | string
+  | number
+  | boolean
+  | null
+  | Date           // has toJSON() → ISO string
+  | URL            // has toJSON() → string
+  | MCPReturnableValue[]
+  | { [key: string]: MCPReturnableValue };
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Brands (compile-time only)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Proto brand - marks types that exist in the JXA object graph
-// Used to constrain Specifier<P> to only accept JXA-world types
+// Parameterized by T: what this proto resolves to (must be MCP-returnable)
 declare const ProtoBrand: unique symbol;
-type Proto = { readonly [ProtoBrand]: void };
+type Proto<T extends MCPReturnableValue = MCPReturnableValue> = { readonly [ProtoBrand]: T };
 
 declare const ScalarBrand: unique symbol;
 declare const CollectionBrand: unique symbol;
+declare const ComputedBrand: unique symbol;
 declare const LazyBrand: unique symbol;
 declare const EagerBrand: unique symbol;
 declare const SettableBrand: unique symbol;
@@ -117,7 +134,7 @@ const namespaceNavigation: NavigationStrategy = (delegate, key) => delegate.name
 // Specifier Type
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Specifier type is now defined in specifier.ts and re-exported via legacy.ts as Res<P>
+// Specifier type is now defined in specifier.ts and re-exported via legacy.ts as Specifier<P>
 // The Specifier<P> type is the unified navigable reference type for all JXA objects.
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,40 +154,63 @@ type ExtractItem<T> = T extends { readonly [CollectionBrand]: infer I } ? I : ne
 type IsLazy<T> = T extends { readonly [LazyBrand]: true } ? true : false;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Resolved<P> - What a proto resolves to
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helper to detect 'any' type
+type IsAny<T> = 0 extends (1 & T) ? true : false;
+
+// Extract the resolution type from a proto's brand
+// Priority: any check > Scalar > Computed > Collection > Proto brand > fallback
+// When P is 'any' (untyped), we return 'any' for practical usability
+type Resolved<P> =
+  IsAny<P> extends true ? any :  // 'any' proto → 'any' resolution (untyped code path)
+  P extends { readonly [ScalarBrand]: infer T } ? T :
+  P extends { readonly [ComputedBrand]: infer T } ? T :
+  P extends { readonly [CollectionBrand]: any } ? CollectionResolveResult :
+  P extends Proto<infer T> ? T :
+  MCPReturnableValue;  // Typed fallback: all resolutions are MCP-returnable
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Base Prototype Types
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Base proto interface - common methods for all protos
-// Includes Proto brand to mark as JXA-world type
-interface BaseProtoType<T> extends Proto {
+// T = the type this proto resolves to (must be MCP-returnable)
+// The Specifier proxy intercepts resolve() and calls resolutionStrategy
+interface BaseProtoType<T extends MCPReturnableValue> extends Proto<T> {
   exists(): boolean;
-  resolve(): T;
   resolutionStrategy: ResolutionStrategy;
   navigationStrategy?: NavigationStrategy;
 }
 
 // Scalar proto: has ScalarBrand for discrimination
-type ScalarProto<T> = BaseProtoType<T> & {
+type ScalarProto<T extends MCPReturnableValue> = BaseProtoType<T> & {
    readonly [ScalarBrand]: T;
+};
+
+// Computed proto: transforms raw JXA value to T
+type ComputedProto<T extends MCPReturnableValue> = BaseProtoType<T> & {
+  readonly [ComputedBrand]: T;
 };
 
 // Accessor interfaces for collections - return Specifier for deferred resolution
 // Item = the proto of elements in the collection (what accessors yield)
-interface IndexAccessor<Item extends Proto> {
+interface IndexAccessor<Item extends Proto<any>> {
   byIndex(n: number): Specifier<Item>;
 }
 
-interface NameAccessor<Item extends Proto> {
+interface NameAccessor<Item extends Proto<any>> {
   byName(name: string): Specifier<Item>;
 }
 
-interface IdAccessor<Item extends Proto> {
+interface IdAccessor<Item extends Proto<any>> {
   byId(id: string | number): Specifier<Item>;
 }
 
 // Collection proto with at least one accessor
 // Item = the element proto (what you get when you access by index/name/id)
-type CollectionProto<Item extends Proto> = BaseProtoType<CollectionResolveResult> & {
+type CollectionProto<Item extends Proto<any>> = BaseProtoType<CollectionResolveResult> & {
   readonly [CollectionBrand]: Item;
 } & (IndexAccessor<Item> | NameAccessor<Item> | IdAccessor<Item>);
 
@@ -241,7 +281,8 @@ function optional<T>(validator: Validator<T>): Validator<T | null> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Typed scalar factory with runtime validation
-function scalar<T>(validate: Validator<T>): ScalarProto<T> {
+// T must be MCP-returnable (enforced by ScalarProto<T>)
+function scalar<T extends MCPReturnableValue>(validate: Validator<T>): ScalarProto<T> {
   const validatingStrategy: ResolutionStrategy = (delegate) => {
     const raw = delegate._jxa();
     return validate(raw);
@@ -250,20 +291,15 @@ function scalar<T>(validate: Validator<T>): ScalarProto<T> {
   return {
     resolutionStrategy: validatingStrategy,
     exists: existsImpl,
-    resolve(this: { _delegate: Delegate }): T {
-      return validatingStrategy(this._delegate, null, null) as T;
-    },
   } as ScalarProto<T>;  // Type assertion adds Proto brand
 }
 
-// Passthrough scalar - no validation, for untyped content
-const passthrough: ScalarProto<unknown> = {
+// Passthrough scalar - no validation, returns any (use sparingly)
+// Note: 'any' satisfies MCPReturnableValue at compile time; runtime values must be serializable
+const passthrough: ScalarProto<any> = {
   resolutionStrategy: scalarStrategy,
   exists: existsImpl,
-  resolve(this: { _delegate: Delegate }): unknown {
-    return this._delegate._jxa();
-  },
-} as ScalarProto<unknown>;
+} as ScalarProto<any>;
 
 // Primitive type scalars with runtime validation
 const t = {
@@ -276,13 +312,11 @@ const t = {
 };
 
 // Base object for complex types that need property gathering
-const baseObject: BaseProtoType<any> = {
+// Resolves to a record of child properties (MCPReturnableValue via objectStrategy)
+const baseObject: BaseProtoType<{ [key: string]: MCPReturnableValue }> = {
   resolutionStrategy: objectStrategy,
   exists: existsImpl,
-  resolve(this: Res<any>): any {
-    return objectStrategy(this._delegate, baseObject, this);
-  },
-} as BaseProtoType<any>;
+} as BaseProtoType<{ [key: string]: MCPReturnableValue }>;
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,7 +335,7 @@ function getItemProto(collectionProto: object): object | undefined {
 
 // lazy: marks a property as "lazy" - when resolved as part of a parent object,
 // returns a specifier (URL) instead of the actual value. Direct resolution returns the value.
-function lazy<P extends BaseProtoType<any>>(proto: P): P & { readonly [LazyBrand]: true } {
+function lazy<P extends BaseProtoType<MCPReturnableValue>>(proto: P): P & { readonly [LazyBrand]: true } {
   const lazyProto = {
     ...proto,
     resolveFromParent: LazyResolutionFromParentStrategy,
@@ -340,12 +374,12 @@ type AccessorsFor<Ks extends readonly Accessor[], Item extends Proto> =
     : {};
 
 // Base collection type (without accessors)
-type BaseCollection<Item extends Proto> = BaseProtoType<CollectionResolveResult> & {
+type BaseCollection<Item extends Proto<any>> = BaseProtoType<CollectionResolveResult> & {
   readonly [CollectionBrand]: Item;
 };
 
 // Collection factory - accessors determined by the 'by' tuple
-function collection<Item extends Proto, const K extends readonly Accessor[]>(
+function collection<Item extends Proto<any>, const K extends readonly Accessor[]>(
   itemProto: Item,
   by: K
 ): BaseCollection<Item> & AccessorsFor<K, Item> {
@@ -353,10 +387,6 @@ function collection<Item extends Proto, const K extends readonly Accessor[]>(
   const proto: any = {
     resolutionStrategy: collectionStrategy,
     exists: existsImpl,
-    // resolve() returns URIs for each item
-    resolve(this: { _delegate: Delegate }): CollectionResolveResult {
-      return collectionStrategy(this._delegate, proto, this) as CollectionResolveResult;
-    },
   };
 
   if (by.includes(Accessor.Index)) {
@@ -391,7 +421,7 @@ interface SettableProto<T> {
 }
 
 // withSet works on scalar protos - adds a set() method for the scalar's value type
-function withSet<T>(proto: ScalarProto<T>): ScalarProto<T> & SettableProto<T> & { readonly [SettableBrand]: true } {
+function withSet<T extends MCPReturnableValue>(proto: ScalarProto<T>): ScalarProto<T> & SettableProto<T> & { readonly [SettableBrand]: true } {
   return {
     ...proto,
     set(this: { _delegate: Delegate }, value: T) {
@@ -411,7 +441,7 @@ type CreateHandler = (collection: Delegate, properties: Record<string, any>) => 
 
 // Moveable proto interface
 interface MoveableProto<Item extends Proto> {
-  move<C extends CollectionProto<Item>>(to: Res<C>): Result<Res<Item>>;
+  move<C extends CollectionProto<Item>>(to: Specifier<C>): Result<Specifier<Item>>;
 }
 
 // Composer: adds move() with optional custom handler
@@ -419,7 +449,7 @@ function withMove<Item extends Proto>(itemProto: Item, handler?: MoveHandler) {
   return function<P extends Proto>(proto: P): P & MoveableProto<Item> & { readonly [MoveableBrand]: true } {
     const result = {
       ...proto,
-      move<C extends CollectionProto<Item>>(this: { _delegate: Delegate }, to: Res<C>): Result<Res<Item>> {
+      move<C extends CollectionProto<Item>>(this: { _delegate: Delegate }, to: Specifier<C>): Result<Specifier<Item>> {
         const urlResult = handler
           ? handler(this._delegate, to._delegate)
           : this._delegate.moveTo(to._delegate);
@@ -428,7 +458,7 @@ function withMove<Item extends Proto>(itemProto: Item, handler?: MoveHandler) {
         // Resolve URL to Res for caller
         const resolveResult = resolveURI(urlResult.value.href);
         if (!resolveResult.ok) return resolveResult;
-        return { ok: true, value: resolveResult.value as Res<Item> };
+        return { ok: true, value: resolveResult.value as Specifier<Item> };
       },
     };
     return result as P & MoveableProto<Item> & { readonly [MoveableBrand]: true };
@@ -456,7 +486,7 @@ function withDelete(handler?: DeleteHandler) {
 
 // Createable proto interface (for collections)
 interface CreateableProto<Item extends Proto> {
-  create(properties: Partial<Item>): Result<Res<Item>>;
+  create(properties: Partial<Item>): Result<Specifier<Item>>;
 }
 
 // Composer: adds create() with optional custom handler
@@ -464,7 +494,7 @@ function withCreate<Item extends Proto>(itemProto: Item, handler?: CreateHandler
   return function<P extends Proto>(proto: P): P & CreateableProto<Item> & { readonly [CreateableBrand]: true } {
     return {
       ...proto,
-      create(this: { _delegate: Delegate }, properties: Partial<Item>): Result<Res<Item>> {
+      create(this: { _delegate: Delegate }, properties: Partial<Item>): Result<Specifier<Item>> {
         const urlResult = handler
           ? handler(this._delegate, properties as Record<string, any>)
           : this._delegate.create(properties as Record<string, any>);
@@ -472,7 +502,7 @@ function withCreate<Item extends Proto>(itemProto: Item, handler?: CreateHandler
         if (!urlResult.ok) return urlResult;
         const resolveResult = resolveURI(urlResult.value.href);
         if (!resolveResult.ok) return resolveResult;
-        return { ok: true, value: resolveResult.value as Res<Item> };
+        return { ok: true, value: resolveResult.value as Specifier<Item> };
       },
     } as P & CreateableProto<Item> & { readonly [CreateableBrand]: true };
   };
@@ -508,7 +538,8 @@ function getJxaName(proto: object): string | undefined {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // A computed property transforms the raw value from the delegate
-function computed<T>(transform: (raw: any) => T): BaseProtoType<T> {
+// T must be MCP-returnable (enforced by ComputedProto<T>)
+function computed<T extends MCPReturnableValue>(transform: (raw: any) => T): ComputedProto<T> {
   const computedStrategy: ResolutionStrategy = (delegate) => {
     const raw = delegate._jxa();
     return transform(raw);
@@ -517,11 +548,7 @@ function computed<T>(transform: (raw: any) => T): BaseProtoType<T> {
   return {
     resolutionStrategy: computedStrategy,
     exists: existsImpl,
-    resolve(this: { _delegate: Delegate }): T {
-      const raw = this._delegate._jxa();
-      return transform(raw);
-    },
-  } as BaseProtoType<T>;  // Type assertion adds Proto brand
+  } as ComputedProto<T>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -535,12 +562,12 @@ type NavigationFn = (d: Delegate) => Delegate;
 
 type ComputedNavProto<P> = P & { readonly [ComputedNavBrand]: true };
 
-function computedNav<P extends BaseProtoType<any>>(
+function computedNav<P extends BaseProtoType<MCPReturnableValue>>(
   navigate: NavigationFn,
   targetProto: P
 ): ComputedNavProto<P> {
   // Create a strategy that navigates first, then uses target's strategy
-  const navStrategy: ResolutionStrategy = (delegate, proto, res) => {
+  const navStrategy: ResolutionStrategy = (delegate, _proto, res) => {
     const targetDelegate = navigate(delegate);
     return targetProto.resolutionStrategy(targetDelegate, targetProto, res);
   };
@@ -553,10 +580,6 @@ function computedNav<P extends BaseProtoType<any>>(
     resolutionStrategy: navStrategy,
     navigationStrategy: navNavigation,
     _computedNav: { navigate, targetProto },  // Store for URI resolution
-    resolve(this: { _delegate: Delegate }) {
-      const targetDelegate = navigate(this._delegate);
-      return targetProto.resolutionStrategy(targetDelegate, targetProto, this);
-    },
     exists(this: { _delegate: Delegate }): boolean {
       try {
         navigate(this._delegate)._jxa();
@@ -594,7 +617,7 @@ type NamespaceProto<P> = P & { readonly [NamespaceBrand]: true };
 
 function namespaceNav<P extends object>(targetProto: P): NamespaceProto<P> {
   // Custom strategy that gathers all properties from the target proto
-  const namespaceStrategy: ResolutionStrategy = (delegate, proto, res) => {
+  const namespaceStrategy: ResolutionStrategy = (_delegate, _proto, res) => {
     const result: Record<string, any> = {};
     // Get all property names from the target proto (excluding base methods)
     for (const key of Object.keys(targetProto)) {
@@ -616,10 +639,7 @@ function namespaceNav<P extends object>(targetProto: P): NamespaceProto<P> {
     resolutionStrategy: namespaceStrategy,
     navigationStrategy: namespaceNavigation,
     _namespaceTarget: targetProto,  // Store for property lookup
-    resolve(this: Res<any>): any {
-      return namespaceStrategy(this._delegate, navProto, this);
-    },
-    exists(this: Res<any>): boolean {
+    exists(this: Specifier<any>): boolean {
       return true; // Namespaces always exist
     },
   } as unknown as NamespaceProto<P>;
@@ -635,14 +655,14 @@ function getNamespaceNav(proto: object): object | undefined {
 // Query Composer
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface QueryableProto<T> extends BaseProtoType<any> {
-  whose(filter: WhoseFilter): Res<QueryableProto<T> & BaseProtoType<any>>;
-  sortBy(spec: SortSpec<T>): Res<QueryableProto<T> & BaseProtoType<any>>;
-  paginate(spec: PaginationSpec): Res<QueryableProto<T> & BaseProtoType<any>>;
-  expand(fields: string[]): Res<QueryableProto<T> & BaseProtoType<any>>;
+interface QueryableProto<T> extends BaseProtoType<MCPReturnableValue> {
+  whose(filter: WhoseFilter): Specifier<QueryableProto<T> & BaseProtoType<MCPReturnableValue>>;
+  sortBy(spec: SortSpec<T>): Specifier<QueryableProto<T> & BaseProtoType<MCPReturnableValue>>;
+  paginate(spec: PaginationSpec): Specifier<QueryableProto<T> & BaseProtoType<MCPReturnableValue>>;
+  expand(fields: string[]): Specifier<QueryableProto<T> & BaseProtoType<MCPReturnableValue>>;
 }
 
-function withQuery<P extends BaseProtoType<any>>(proto: P): P & QueryableProto<any> {
+function withQuery<P extends BaseProtoType<MCPReturnableValue>>(proto: P): P & QueryableProto<any> {
   const itemProto = collectionItemProtos.get(proto);
 
   const queryStrategy: ResolutionStrategy = (delegate) => {
@@ -654,11 +674,11 @@ function withQuery<P extends BaseProtoType<any>>(proto: P): P & QueryableProto<a
     let results = applyQueryState(raw, query);
 
     if (query.expand && query.expand.length > 0 && itemProto) {
-      results = results.map((item: any, idx: number) => {
+      results = results.map((item: any) => {
         const expanded = { ...item };
         for (const field of query.expand!) {
           const fieldProto = (itemProto as any)[field];
-          if (fieldProto && typeof fieldProto === 'object' && 'resolve' in fieldProto) {
+          if (fieldProto && typeof fieldProto === 'object' && 'resolutionStrategy' in fieldProto) {
             try {
               if (field in item && typeof item[field] === 'function') {
                 expanded[field] = item[field]();
@@ -679,10 +699,6 @@ function withQuery<P extends BaseProtoType<any>>(proto: P): P & QueryableProto<a
   const queryProto = {
     ...proto,
     resolutionStrategy: queryStrategy,
-
-    resolve(this: { _delegate: Delegate }) {
-      return queryStrategy(this._delegate, queryProto, this);
-    },
 
     whose(this: { _delegate: Delegate }, filter: WhoseFilter) {
       const newDelegate = this._delegate.withFilter(filter);

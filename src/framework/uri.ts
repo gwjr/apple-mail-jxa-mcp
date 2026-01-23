@@ -118,8 +118,8 @@ function hasById(proto: object): proto is { byId: (id: string | number) => unkno
   return 'byId' in proto && typeof (proto as any).byId === 'function';
 }
 
-function isChildProto(value: unknown): value is BaseProtoType<any> {
-  return typeof value === 'object' && value !== null && 'resolve' in value && typeof (value as any).resolve === 'function';
+function isChildProto(value: unknown): value is BaseProtoType<MCPReturnableValue> {
+  return typeof value === 'object' && value !== null && 'resolutionStrategy' in value && typeof (value as any).resolutionStrategy === 'function';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
