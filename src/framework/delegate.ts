@@ -68,9 +68,9 @@ interface FilterOperator<T> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface Delegate {
-  _jxa(): unknown;
+  unwrap(): unknown;
   prop(key: string): Delegate;
-  propWithAlias(jxaName: string, uriName: string): Delegate;
+  propWithAlias(backendName: string, uriName: string): Delegate;
   byIndex(n: number): Delegate;
   byName(name: string): Delegate;
   byId(id: string | number): Delegate;
@@ -92,7 +92,7 @@ interface Delegate {
   withExpand(fields: string[]): Delegate;
   queryState(): QueryState;
 
-  // Create a delegate from arbitrary JXA ref with explicit path
+  // Create a delegate from arbitrary raw backend value with explicit path
   // Used for computed navigations that can't be expressed as delegate operations
-  fromJxa?(jxaRef: any, path: PathSegment[]): Delegate;
+  fromRaw?(raw: any, path: PathSegment[]): Delegate;
 }

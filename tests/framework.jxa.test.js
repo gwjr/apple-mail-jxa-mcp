@@ -199,8 +199,8 @@ const BASE_KEYS = new Set(['resolve', 'exists', 'uri', '_delegate', 'resolutionS
 function isBaseKey(key) {
     return BASE_KEYS.has(key);
 }
-// Scalar strategy: just call _jxa() and return the raw value
-const scalarStrategy = (delegate) => delegate._jxa();
+// Scalar strategy: just call unwrap() and return the raw value
+const scalarStrategy = (delegate) => delegate.unwrap();
 // Object strategy: gather properties recursively
 const objectStrategy = (_delegate, proto, res) => {
     const result = {};
@@ -232,7 +232,7 @@ const objectStrategy = (_delegate, proto, res) => {
 };
 // Collection strategy: return array of URIs for each item
 const collectionStrategy = (delegate) => {
-    const raw = delegate._jxa();
+    const raw = delegate.unwrap();
     if (!Array.isArray(raw)) {
         throw new TypeError(`Collection expected array, got ${typeof raw}`);
     }
@@ -254,7 +254,7 @@ const namespaceNavigation = (delegate, key) => delegate.namespace(key);
 // ─────────────────────────────────────────────────────────────────────────────
 function existsImpl() {
     try {
-        const result = this._delegate._jxa();
+        const result = this._delegate.unwrap();
         return result !== undefined && result !== null;
     }
     catch {
@@ -311,7 +311,7 @@ function optional(validator) {
 // T must be MCP-returnable (enforced by ScalarProto<T>)
 function scalar(validate) {
     const validatingStrategy = (delegate) => {
-        const raw = delegate._jxa();
+        const raw = delegate.unwrap();
         return validate(raw);
     };
     return {
@@ -453,18 +453,18 @@ function withCreate(itemProto, handler) {
         };
     };
 }
-function withJxaName(proto, jxaName) {
-    // Create a new object with navigationStrategy that uses the jxaName
-    const named = {
+function withAlias(proto, backendName) {
+    // Create a new object with navigationStrategy that uses the backendName
+    const aliased = {
         ...proto,
-        navigationStrategy: ((delegate, schemaKey) => delegate.propWithAlias(jxaName, schemaKey)),
+        navigationStrategy: ((delegate, schemaKey) => delegate.propWithAlias(backendName, schemaKey)),
     };
     // Also copy over the item proto if this is a collection
     const itemProto = proto._itemProto;
     if (itemProto) {
-        named._itemProto = itemProto;
+        aliased._itemProto = itemProto;
     }
-    return named;
+    return aliased;
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Computed Properties
@@ -473,7 +473,7 @@ function withJxaName(proto, jxaName) {
 // T must be MCP-returnable (enforced by ComputedProto<T>)
 function computed(transform) {
     const computedStrategy = (delegate) => {
-        const raw = delegate._jxa();
+        const raw = delegate.unwrap();
         return transform(raw);
     };
     return {
@@ -496,7 +496,7 @@ function computedNav(navigate, targetProto) {
         _computedNav: { navigate, targetProto }, // Store for URI resolution
         exists() {
             try {
-                navigate(this._delegate)._jxa();
+                navigate(this._delegate).unwrap();
                 return true;
             }
             catch {
@@ -551,7 +551,7 @@ function getNamespaceNav(proto) {
 function withQuery(proto) {
     const itemProto = proto._itemProto;
     const queryStrategy = (delegate) => {
-        const raw = delegate._jxa();
+        const raw = delegate.unwrap();
         if (!Array.isArray(raw)) {
             throw new TypeError(`Query expected array, got ${typeof raw}`);
         }
@@ -1106,7 +1106,7 @@ class JXADelegate {
         this._parentDelegate = _parentDelegate;
         this._query = _query;
     }
-    _jxa() {
+    unwrap() {
         // If we have a parent and key, call as property getter
         if (this._jxaParent && this._key) {
             return this._jxaParent[this._key]();
@@ -1121,10 +1121,10 @@ class JXADelegate {
         const newPath = [...this._path, { kind: 'prop', name: key }];
         return new JXADelegate(this._jxaRef[key], newPath, this._jxaRef, key, this);
     }
-    propWithAlias(jxaName, uriName) {
-        // Navigate JXA using jxaName, but track uriName in path
+    propWithAlias(backendName, uriName) {
+        // Navigate backend using backendName, but track uriName in path
         const newPath = [...this._path, { kind: 'prop', name: uriName }];
-        return new JXADelegate(this._jxaRef[jxaName], newPath, this._jxaRef, jxaName, this);
+        return new JXADelegate(this._jxaRef[backendName], newPath, this._jxaRef, backendName, this);
     }
     namespace(name) {
         // A namespace adds a URI segment but keeps the same JXA ref (no navigation)
@@ -1269,9 +1269,9 @@ class JXADelegate {
     queryState() {
         return this._query;
     }
-    // Create a delegate from arbitrary JXA ref with explicit path
-    fromJxa(jxaRef, path) {
-        return new JXADelegate(jxaRef, path, undefined, undefined, this);
+    // Create a delegate from arbitrary raw backend value with explicit path
+    fromRaw(raw, path) {
+        return new JXADelegate(raw, path, undefined, undefined, this);
     }
 }
 // Convert WhoseFilter to JXA filter format
@@ -1303,7 +1303,7 @@ const messageMoveHandler = (msgDelegate, destCollectionDelegate) => {
         return { ok: false, error: 'Cannot determine destination mailbox' };
     }
     const destMailbox = destMailboxOrRoot;
-    // For JXA: message.mailbox = destMailbox._jxa()
+    // For JXA: message.mailbox = destMailbox.unwrap()
     // For Mock: move data from one array to another
     const moveResult = msgDelegate.moveTo(destCollectionDelegate);
     if (!moveResult.ok)
@@ -1312,7 +1312,7 @@ const messageMoveHandler = (msgDelegate, destCollectionDelegate) => {
     const destMailboxUri = destMailbox.uri();
     // Get the message's RFC messageId (stable across moves)
     try {
-        const rfcMessageId = msgDelegate.prop('messageId')._jxa();
+        const rfcMessageId = msgDelegate.prop('messageId').unwrap();
         const newUrl = new URL(`${destMailboxUri.href}/messages/${encodeURIComponent(rfcMessageId)}`);
         return { ok: true, value: newUrl };
     }
@@ -1433,7 +1433,7 @@ const _MessageProtoBase = {
     toRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
     ccRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
     bccRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
-    attachments: withJxaName(collection(AttachmentProto, [Accessor.Index, Accessor.Name, Accessor.Id]), 'mailAttachments'),
+    attachments: withAlias(collection(AttachmentProto, [Accessor.Index, Accessor.Name, Accessor.Id]), 'mailAttachments'),
 };
 // MessageProto with move and delete operations
 const MessageProto = withDelete(messageDeleteHandler)(withMove(_MessageProtoBase, messageMoveHandler)(_MessageProtoBase));
@@ -1467,12 +1467,12 @@ const MailAccountProto = {
     // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
     // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
     inbox: computedNav((d) => {
-        if (!d.fromJxa) {
+        if (!d.fromRaw) {
             // Mock delegate: fall back to mailboxes.byName('INBOX')
             return d.prop('mailboxes').byName('INBOX');
         }
         // JXA: Find inbox mailbox by matching account ID
-        const jxaAccount = d._jxa();
+        const jxaAccount = d.unwrap();
         const accountId = jxaAccount.id();
         const Mail = Application('Mail');
         const inboxMailboxes = Mail.inbox.mailboxes();
@@ -1488,7 +1488,7 @@ const MailAccountProto = {
         // Parse into segments: e.g., "accounts[0]" -> [{root}, {prop: accounts}, {index: 0}]
         const pathSegments = parsePathToSegments('mail', decodedPath);
         pathSegments.push({ kind: 'prop', name: 'inbox' });
-        return d.fromJxa(accountInbox, pathSegments);
+        return d.fromRaw(accountInbox, pathSegments);
     }, MailboxProto),
 };
 // Helper to parse a path string into PathSegment array
@@ -1558,13 +1558,13 @@ const MailApplicationProto = {
     accounts: collection(MailAccountProto, [Accessor.Index, Accessor.Name, Accessor.Id]),
     rules: collection(RuleProto, [Accessor.Index, Accessor.Name]),
     signatures: collection(SignatureProto, [Accessor.Index, Accessor.Name]),
-    // Standard mailboxes - simple property access with jxaName mapping
+    // Standard mailboxes - simple property access with backend name aliasing
     inbox: MailboxProto,
-    drafts: withJxaName(MailboxProto, 'draftsMailbox'),
-    junk: withJxaName(MailboxProto, 'junkMailbox'),
+    drafts: withAlias(MailboxProto, 'draftsMailbox'),
+    junk: withAlias(MailboxProto, 'junkMailbox'),
     outbox: MailboxProto,
-    sent: withJxaName(MailboxProto, 'sentMailbox'),
-    trash: withJxaName(MailboxProto, 'trashMailbox'),
+    sent: withAlias(MailboxProto, 'sentMailbox'),
+    trash: withAlias(MailboxProto, 'trashMailbox'),
     // Settings namespace - virtual grouping of app-level preferences
     settings: namespaceNav(MailSettingsProto),
 };

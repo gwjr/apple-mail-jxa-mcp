@@ -20,7 +20,7 @@ class JXADelegate implements Delegate {
     private _query: QueryState = {}
   ) {}
 
-  _jxa(): any {
+  unwrap(): any {
     // If we have a parent and key, call as property getter
     if (this._jxaParent && this._key) {
       return this._jxaParent[this._key]();
@@ -37,10 +37,10 @@ class JXADelegate implements Delegate {
     return new JXADelegate(this._jxaRef[key], newPath, this._jxaRef, key, this);
   }
 
-  propWithAlias(jxaName: string, uriName: string): JXADelegate {
-    // Navigate JXA using jxaName, but track uriName in path
+  propWithAlias(backendName: string, uriName: string): JXADelegate {
+    // Navigate backend using backendName, but track uriName in path
     const newPath = [...this._path, { kind: 'prop' as const, name: uriName }];
-    return new JXADelegate(this._jxaRef[jxaName], newPath, this._jxaRef, jxaName, this);
+    return new JXADelegate(this._jxaRef[backendName], newPath, this._jxaRef, backendName, this);
   }
 
   namespace(name: string): JXADelegate {
@@ -192,9 +192,9 @@ class JXADelegate implements Delegate {
     return this._query;
   }
 
-  // Create a delegate from arbitrary JXA ref with explicit path
-  fromJxa(jxaRef: any, path: PathSegment[]): JXADelegate {
-    return new JXADelegate(jxaRef, path, undefined, undefined, this);
+  // Create a delegate from arbitrary raw backend value with explicit path
+  fromRaw(raw: any, path: PathSegment[]): JXADelegate {
+    return new JXADelegate(raw, path, undefined, undefined, this);
   }
 }
 

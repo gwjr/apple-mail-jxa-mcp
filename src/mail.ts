@@ -22,7 +22,7 @@ const messageMoveHandler: MoveHandler = (msgDelegate, destCollectionDelegate): R
   }
   const destMailbox = destMailboxOrRoot;
 
-  // For JXA: message.mailbox = destMailbox._jxa()
+  // For JXA: message.mailbox = destMailbox.unwrap()
   // For Mock: move data from one array to another
   const moveResult = msgDelegate.moveTo(destCollectionDelegate);
   if (!moveResult.ok) return moveResult;
@@ -31,7 +31,7 @@ const messageMoveHandler: MoveHandler = (msgDelegate, destCollectionDelegate): R
   const destMailboxUri = destMailbox.uri();
   // Get the message's RFC messageId (stable across moves)
   try {
-    const rfcMessageId = msgDelegate.prop('messageId')._jxa() as string;
+    const rfcMessageId = msgDelegate.prop('messageId').unwrap() as string;
     const newUrl = new URL(`${destMailboxUri.href}/messages/${encodeURIComponent(rfcMessageId)}`);
     return { ok: true, value: newUrl };
   } catch {
@@ -165,7 +165,7 @@ const _MessageProtoBase = {
   toRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
   ccRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
   bccRecipients: collection(RecipientProto, [Accessor.Index, Accessor.Name]),
-  attachments: withJxaName(
+  attachments: withAlias(
     collection(AttachmentProto, [Accessor.Index, Accessor.Name, Accessor.Id]),
     'mailAttachments'
   ),
@@ -219,12 +219,12 @@ const MailAccountProto = {
   // Account inbox: find this account's mailbox in Mail.inbox.mailboxes()
   // (Can't use simple byName because inbox name varies: "INBOX", "Inbox", etc.)
   inbox: computedNav((d) => {
-    if (!d.fromJxa) {
+    if (!d.fromRaw) {
       // Mock delegate: fall back to mailboxes.byName('INBOX')
       return d.prop('mailboxes').byName('INBOX');
     }
     // JXA: Find inbox mailbox by matching account ID
-    const jxaAccount = d._jxa() as { id(): string };
+    const jxaAccount = d.unwrap() as { id(): string };
     const accountId = jxaAccount.id();
     const Mail = Application('Mail');
     const inboxMailboxes = Mail.inbox.mailboxes();
@@ -240,7 +240,7 @@ const MailAccountProto = {
     // Parse into segments: e.g., "accounts[0]" -> [{root}, {prop: accounts}, {index: 0}]
     const pathSegments = parsePathToSegments('mail', decodedPath);
     pathSegments.push({ kind: 'prop' as const, name: 'inbox' });
-    return d.fromJxa(accountInbox, pathSegments);
+    return d.fromRaw(accountInbox, pathSegments);
   }, MailboxProto),
 };
 
@@ -314,13 +314,13 @@ const MailApplicationProto = {
   accounts: collection(MailAccountProto, [Accessor.Index, Accessor.Name, Accessor.Id]),
   rules: collection(RuleProto, [Accessor.Index, Accessor.Name]),
   signatures: collection(SignatureProto, [Accessor.Index, Accessor.Name]),
-  // Standard mailboxes - simple property access with jxaName mapping
+  // Standard mailboxes - simple property access with backend name aliasing
   inbox: MailboxProto,
-  drafts: withJxaName(MailboxProto, 'draftsMailbox'),
-  junk: withJxaName(MailboxProto, 'junkMailbox'),
+  drafts: withAlias(MailboxProto, 'draftsMailbox'),
+  junk: withAlias(MailboxProto, 'junkMailbox'),
   outbox: MailboxProto,
-  sent: withJxaName(MailboxProto, 'sentMailbox'),
-  trash: withJxaName(MailboxProto, 'trashMailbox'),
+  sent: withAlias(MailboxProto, 'sentMailbox'),
+  trash: withAlias(MailboxProto, 'trashMailbox'),
   // Settings namespace - virtual grouping of app-level preferences
   settings: namespaceNav(MailSettingsProto),
 };

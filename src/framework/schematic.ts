@@ -33,7 +33,7 @@ declare const CollectionBrand: unique symbol;
 declare const ComputedBrand: unique symbol;
 declare const LazyBrand: unique symbol;
 declare const SettableBrand: unique symbol;
-declare const JxaNameBrand: unique symbol;
+declare const AliasBrand: unique symbol;
 declare const MoveableBrand: unique symbol;
 declare const DeleteableBrand: unique symbol;
 declare const CreateableBrand: unique symbol;
@@ -78,8 +78,8 @@ function isBaseKey(key: string): boolean {
   return BASE_KEYS.has(key);
 }
 
-// Scalar strategy: just call _jxa() and return the raw value
-const scalarStrategy: ResolutionStrategy = (delegate) => delegate._jxa();
+// Scalar strategy: just call unwrap() and return the raw value
+const scalarStrategy: ResolutionStrategy = (delegate) => delegate.unwrap();
 
 // Object strategy: gather properties recursively
 const objectStrategy: ResolutionStrategy = (_delegate, proto, res) => {
@@ -113,7 +113,7 @@ const objectStrategy: ResolutionStrategy = (_delegate, proto, res) => {
 
 // Collection strategy: return array of URIs for each item
 const collectionStrategy: ResolutionStrategy = (delegate) => {
-  const raw = delegate._jxa();
+  const raw = delegate.unwrap();
   if (!Array.isArray(raw)) {
     throw new TypeError(`Collection expected array, got ${typeof raw}`);
   }
@@ -224,7 +224,7 @@ type CollectionProto<Item extends Proto<any>> = BaseProtoType<CollectionResolveR
 
 function existsImpl(this: { _delegate: Delegate }): boolean {
   try {
-    const result = this._delegate._jxa();
+    const result = this._delegate.unwrap();
     return result !== undefined && result !== null;
   } catch {
     return false;
@@ -288,7 +288,7 @@ function optional<T>(validator: Validator<T>): Validator<T | null> {
 // T must be MCP-returnable (enforced by ScalarProto<T>)
 function scalar<T extends MCPReturnableValue>(validate: Validator<T>): ScalarProto<T> {
   const validatingStrategy: ResolutionStrategy = (delegate) => {
-    const raw = delegate._jxa();
+    const raw = delegate.unwrap();
     return validate(raw);
   };
 
@@ -504,24 +504,24 @@ function withCreate<Item extends Proto>(itemProto: Item, handler?: CreateHandler
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// JXA Name Mapping
+// Backend Name Aliasing
 // ─────────────────────────────────────────────────────────────────────────────
 
-type JxaNamedProto<P> = P & { readonly [JxaNameBrand]: string };
+type AliasedProto<P> = P & { readonly [AliasBrand]: string };
 
-function withJxaName<P extends object>(proto: P, jxaName: string): JxaNamedProto<P> {
-  // Create a new object with navigationStrategy that uses the jxaName
-  const named = {
+function withAlias<P extends object>(proto: P, backendName: string): AliasedProto<P> {
+  // Create a new object with navigationStrategy that uses the backendName
+  const aliased = {
     ...proto,
     navigationStrategy: ((delegate: Delegate, schemaKey: string) =>
-      delegate.propWithAlias(jxaName, schemaKey)) as NavigationStrategy,
-  } as unknown as JxaNamedProto<P>;
+      delegate.propWithAlias(backendName, schemaKey)) as NavigationStrategy,
+  } as unknown as AliasedProto<P>;
   // Also copy over the item proto if this is a collection
   const itemProto = (proto as any)._itemProto;
   if (itemProto) {
-    (named as any)._itemProto = itemProto;
+    (aliased as any)._itemProto = itemProto;
   }
-  return named;
+  return aliased;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -532,7 +532,7 @@ function withJxaName<P extends object>(proto: P, jxaName: string): JxaNamedProto
 // T must be MCP-returnable (enforced by ComputedProto<T>)
 function computed<T extends MCPReturnableValue>(transform: (raw: any) => T): ComputedProto<T> {
   const computedStrategy: ResolutionStrategy = (delegate) => {
-    const raw = delegate._jxa();
+    const raw = delegate.unwrap();
     return transform(raw);
   };
 
@@ -547,7 +547,7 @@ function computed<T extends MCPReturnableValue>(transform: (raw: any) => T): Com
 // ─────────────────────────────────────────────────────────────────────────────
 
 // computedNav is for properties that require multiple delegate operations to navigate.
-// For simple property navigation (including jxaName mapping), use withJxaName instead.
+// For simple property navigation (including alias mapping), use withAlias instead.
 
 type NavigationFn = (d: Delegate) => Delegate;
 
@@ -573,7 +573,7 @@ function computedNav<P extends BaseProtoType<MCPReturnableValue>>(
     _computedNav: { navigate, targetProto },  // Store for URI resolution
     exists(this: { _delegate: Delegate }): boolean {
       try {
-        navigate(this._delegate)._jxa();
+        navigate(this._delegate).unwrap();
         return true;
       } catch {
         return false;
@@ -657,7 +657,7 @@ function withQuery<P extends BaseProtoType<MCPReturnableValue>>(proto: P): P & Q
   const itemProto = (proto as any)._itemProto;
 
   const queryStrategy: ResolutionStrategy = (delegate) => {
-    const raw = delegate._jxa();
+    const raw = delegate.unwrap();
     if (!Array.isArray(raw)) {
       throw new TypeError(`Query expected array, got ${typeof raw}`);
     }

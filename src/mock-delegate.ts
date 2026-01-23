@@ -24,7 +24,7 @@ class MockDelegate implements Delegate {
     private _query: QueryState = {}
   ) {}
 
-  _jxa(): any {
+  unwrap(): any {
     // Return raw data - query state is applied by the proto layer (withQuery.resolve())
     return this._data;
   }
@@ -35,15 +35,15 @@ class MockDelegate implements Delegate {
     return new MockDelegate(newData, newPath, this._root, this, null, null);
   }
 
-  propWithAlias(jxaName: string, uriName: string): MockDelegate {
-    // Navigate data using JXA name, but track URI name in path
+  propWithAlias(backendName: string, uriName: string): MockDelegate {
+    // Navigate data using backend name, but track URI name in path
     const newPath = [...this._path, { kind: 'prop' as const, name: uriName }];
-    const newData = this._data ? this._data[jxaName] : undefined;
+    const newData = this._data ? this._data[backendName] : undefined;
     return new MockDelegate(newData, newPath, this._root, this, null, null);
   }
 
   namespace(name: string): MockDelegate {
-    // A namespace adds a URI segment but keeps the same data (no JXA navigation)
+    // A namespace adds a URI segment but keeps the same data (no backend navigation)
     const newPath = [...this._path, { kind: 'prop' as const, name }];
     return new MockDelegate(this._data, newPath, this._root, this, null, null);  // Same data!
   }
@@ -195,9 +195,9 @@ class MockDelegate implements Delegate {
     return this._query;
   }
 
-  // Create a delegate from arbitrary data with explicit path
-  fromJxa(data: any, path: PathSegment[]): MockDelegate {
-    return new MockDelegate(data, path, this._root, this, null, null);
+  // Create a delegate from arbitrary raw data with explicit path
+  fromRaw(raw: any, path: PathSegment[]): MockDelegate {
+    return new MockDelegate(raw, path, this._root, this, null, null);
   }
 }
 
